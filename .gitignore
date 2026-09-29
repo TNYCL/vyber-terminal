@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.vyber/
+*.log
+
+/.vyber-tools/
+/Vyber.lnk
+/.vyber-build.jsonl
+/.vyber-metadata.json
+
+# Internal working notes, kept out of the public repository
+/PLAN.md
+/VALIDATION.md
