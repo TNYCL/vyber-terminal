@@ -61,12 +61,63 @@ pub struct FileEntry {
     pub repository: bool,
 }
 
+const SCAN_LIMIT: usize = 30_000;
+
+#[cfg(test)]
 pub fn scan_files(root: &Path) -> Vec<FileEntry> {
+    scan_files_with(root, &[])
+}
+
+/// Like [`scan_files`], and also lists `include` folders inside `root` that
+/// its `.gitignore` hides, such as a playground's own repositories or a
+/// worktree under `.worktree/`. Each is walked with its own ignore rules.
+pub fn scan_files_with(root: &Path, include: &[PathBuf]) -> Vec<FileEntry> {
     let mut entries = Vec::new();
-    for entry in ignore::WalkBuilder::new(root)
+    walk_into(root, root, false, &mut entries);
+    let mut known: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.relative.clone()).collect();
+    for folder in include {
+        let Ok(relative) = folder.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_empty() || known.contains(&relative) || !folder.is_dir() {
+            continue;
+        }
+        // Parent folders the main walk skipped, such as `.worktree`.
+        let mut parent = String::new();
+        let parts: Vec<&str> = relative.split('/').collect();
+        for (depth, part) in parts.iter().enumerate() {
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
+            if known.insert(parent.clone()) {
+                entries.push(FileEntry {
+                    path: root.join(&parent),
+                    relative: parent.clone(),
+                    depth,
+                    directory: true,
+                    repository: depth + 1 == parts.len() && folder.join(".git").exists(),
+                });
+            }
+        }
+        let start = entries.len();
+        walk_into(root, folder, true, &mut entries);
+        known.extend(entries[start..].iter().map(|e| e.relative.clone()));
+    }
+    entries.sort_by(tree_order);
+    entries
+}
+
+/// Walks `folder` (inside `root`) and appends its entries with paths relative
+/// to `root`. `own_rules` ignores `.gitignore` files above `folder`.
+fn walk_into(root: &Path, folder: &Path, own_rules: bool, entries: &mut Vec<FileEntry>) {
+    for entry in ignore::WalkBuilder::new(folder)
         .hidden(false)
         .git_ignore(true)
         .git_exclude(true)
+        .parents(!own_rules)
         .filter_entry(|e| {
             !e.path().components().any(|c| {
                 matches!(
@@ -79,11 +130,11 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
         .build()
         .flatten()
     {
-        if entries.len() >= 30_000 {
+        if entries.len() >= SCAN_LIMIT {
             break;
         }
         let path = entry.path();
-        if path == root
+        if path == folder
             || path.components().any(|c| {
                 c.as_os_str() == ".git"
                     || c.as_os_str() == "target"
@@ -103,7 +154,7 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        let depth = entry.depth().saturating_sub(1);
+        let depth = relative.matches('/').count();
         entries.push(FileEntry {
             path: path.to_owned(),
             repository: kind.is_dir() && depth < 3 && path.join(".git").exists(),
@@ -112,8 +163,6 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
             directory: kind.is_dir(),
         });
     }
-    entries.sort_by(tree_order);
-    entries
 }
 
 /// Depth-first tree order: folders before files at every level, then natural
@@ -246,6 +295,30 @@ pub fn status(root: &Path) -> Result<Vec<Change>> {
     Ok(result)
 }
 
+/// Git status of `root` and of each repository folder in `nested`, with
+/// nested paths made relative to `root`.
+pub fn status_with(root: &Path, nested: &[PathBuf]) -> Result<Vec<Change>> {
+    let mut changes = status(root).unwrap_or_default();
+    let mut found = !changes.is_empty() || git_text(root, &["rev-parse", "--git-dir"]).is_ok();
+    for folder in nested {
+        let Ok(relative) = folder.strip_prefix(root) else {
+            continue;
+        };
+        let prefix = relative.to_string_lossy().replace('\\', "/");
+        if let Ok(inner) = status(folder) {
+            found = true;
+            changes.extend(inner.into_iter().map(|mut c| {
+                c.path = format!("{prefix}/{}", c.path);
+                c
+            }));
+        }
+    }
+    if !found {
+        bail!("Not a Git workspace");
+    }
+    Ok(changes)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DiffLine {
     pub old: Option<usize>,
@@ -264,8 +337,10 @@ pub fn diff_lines_context(old: &[u8], new: &[u8], context: usize) -> Vec<DiffLin
             ..Default::default()
         }];
     }
-    let old = String::from_utf8_lossy(old);
-    let new = String::from_utf8_lossy(new);
+    // Compare lines regardless of CRLF/LF so a checkout with autocrlf does not
+    // show every line as changed; line numbers are the same either way.
+    let old = String::from_utf8_lossy(old).replace("\r\n", "\n");
+    let new = String::from_utf8_lossy(new).replace("\r\n", "\n");
     let diff = similar::TextDiff::configure()
         .timeout(std::time::Duration::from_secs(2))
         .diff_lines(&old, &new);
@@ -335,8 +410,18 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// Snapshots the working tree of `root`'s repository, including the
+    /// project's repositories inside it.
     pub fn capture(root: &Path, label: &str) -> Result<Self> {
         let root = repository_root(root).context("Checkpoints require a Git repository")?;
+        let nested = crate::project::nested_folders(&root);
+        Self::capture_with(&root, label, &nested)
+    }
+
+    /// [`Checkpoint::capture`] of the repository at `root` with the
+    /// repositories in `nested` folded in.
+    pub fn capture_with(root: &Path, label: &str, nested: &[PathBuf]) -> Result<Self> {
+        let root = root.to_owned();
         let id = format!(
             "{}-{}",
             chrono::Utc::now().timestamp_millis(),
@@ -395,22 +480,50 @@ impl Checkpoint {
                 bail!("Cannot enumerate snapshot index");
             }
             let mut entries = Vec::new();
-            let mut names = Vec::new();
+            // Repositories inside this one: project source folders (usually
+            // ignored by it) and embedded repositories Git lists as gitlinks.
+            // Their files join the snapshot under their folder.
+            let mut nested: Vec<String> = nested
+                .iter()
+                .filter(|f| crate::project::is_repository(f))
+                .filter_map(|f| f.strip_prefix(&root).ok())
+                .map(|f| f.to_string_lossy().replace('\\', "/"))
+                .collect();
             for entry in listed.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
                 let tab = entry
                     .iter()
                     .position(|b| *b == b'\t')
                     .context("Invalid index entry")?;
                 let mode = std::str::from_utf8(&entry[..6])?.to_owned();
-                if mode != "100644" && mode != "100755" {
-                    bail!(
-                        "Snapshot contains a symlink or submodule; manual Git review remains available"
-                    );
-                }
                 let path = std::str::from_utf8(&entry[tab + 1..])?.to_owned();
-                names.extend(serde_json::to_string(&path)?.as_bytes());
-                names.push(b'\n');
+                if mode == "160000" {
+                    if root.join(&path).join(".git").exists() {
+                        nested.push(path);
+                    }
+                    continue;
+                }
+                if mode != "100644" && mode != "100755" {
+                    bail!("Snapshot contains a symlink; manual Git review remains available");
+                }
                 entries.push((mode, path));
+            }
+            nested.sort();
+            nested.dedup();
+            if !nested.is_empty() {
+                entries.retain(|(_, path)| {
+                    !nested.iter().any(|n| path.starts_with(&format!("{n}/")))
+                });
+                for folder in &nested {
+                    entries.extend(nested_entries(&root, folder)?);
+                }
+                // Start the snapshot index over so no gitlink is left in it.
+                let _ = fs::remove_file(&index);
+                run(&["read-tree", "--empty"])?;
+            }
+            let mut names = Vec::new();
+            for (_, path) in &entries {
+                names.extend(serde_json::to_string(path)?.as_bytes());
+                names.push(b'\n');
             }
             let run_input = |args: &[&str], input: Vec<u8>| -> Result<Vec<u8>> {
                 use std::io::Write;
@@ -597,6 +710,40 @@ impl Checkpoint {
         }
         Ok(())
     }
+}
+
+/// Snapshot entries (mode, path under `root`) for the tracked and untracked,
+/// not ignored, regular files of the repository at `root/folder`.
+fn nested_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>> {
+    let dir = root.join(folder);
+    let is_file = |relative: &str| {
+        fs::symlink_metadata(dir.join(relative)).is_ok_and(|m| m.file_type().is_file())
+    };
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    let staged = git(&dir, &["ls-files", "--stage", "-z"])?;
+    if !staged.status.success() {
+        bail!("Cannot list files of {folder}");
+    }
+    for entry in staged.stdout.split(|b| *b == 0).filter(|p| p.len() > 7) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let mode = String::from_utf8_lossy(&entry[..6]).into_owned();
+        let path = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
+        // Conflicted files list up to three stages; one entry is enough.
+        if (mode == "100644" || mode == "100755") && is_file(&path) && seen.insert(path.clone()) {
+            out.push((mode, format!("{folder}/{path}")));
+        }
+    }
+    let others = git(&dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in others.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = String::from_utf8_lossy(path).into_owned();
+        if is_file(&path) && seen.insert(path.clone()) {
+            out.push(("100644".into(), format!("{folder}/{path}")));
+        }
+    }
+    Ok(out)
 }
 
 /// Keeps a copy of a file's current bytes under `recovery/` before Vyber
@@ -815,6 +962,87 @@ mod tests {
         fs::write(root.join("sub/file.txt"), "working\n")?;
         let sub = root.join("sub");
         assert_eq!(status(&sub)?[0].path, "file.txt");
+        Ok(())
+    }
+    fn init(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+        git_text(path, &["init", "-q", "-b", "main"])?;
+        git_text(path, &["config", "core.autocrlf", "false"])?;
+        git_text(path, &["config", "user.email", "test@example.com"])?;
+        git_text(path, &["config", "user.name", "Test"])?;
+        Ok(())
+    }
+    /// A playground repository that ignores `api/` (its own repository) and
+    /// embeds `lib/` without ignoring it.
+    fn playground() -> Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        init(root)?;
+        fs::write(root.join(".gitignore"), "/api/\n/.worktree/\n")?;
+        fs::write(root.join("notes.md"), "notes\n")?;
+        init(&root.join("api"))?;
+        fs::write(root.join("api/.gitignore"), "target/\n")?;
+        fs::create_dir_all(root.join("api/src"))?;
+        fs::write(root.join("api/src/main.rs"), "fn main() {}\n")?;
+        git_text(&root.join("api"), &["add", "."])?;
+        git_text(&root.join("api"), &["commit", "-q", "-m", "api"])?;
+        fs::create_dir_all(root.join("api/target"))?;
+        fs::write(root.join("api/target/out.bin"), "built")?;
+        init(&root.join("lib"))?;
+        fs::write(root.join("lib/lib.rs"), "pub fn a() {}\n")?;
+        git_text(&root.join("lib"), &["add", "."])?;
+        git_text(&root.join("lib"), &["commit", "-q", "-m", "lib"])?;
+        Ok(dir)
+    }
+    #[test]
+    fn scan_includes_ignored_source_folders_with_their_own_rules() -> Result<()> {
+        let dir = playground()?;
+        let root = dir.path();
+        let plain: Vec<_> = scan_files(root).into_iter().map(|e| e.relative).collect();
+        assert!(!plain.iter().any(|p| p.starts_with("api")));
+        let entries = scan_files_with(root, &[root.join("api")]);
+        let paths: Vec<_> = entries.iter().map(|e| e.relative.as_str()).collect();
+        assert!(paths.contains(&"api/src/main.rs"));
+        assert!(!paths.iter().any(|p| p.starts_with("api/target")));
+        let api = entries.iter().find(|e| e.relative == "api").unwrap();
+        assert!(api.repository && api.directory && api.depth == 0);
+        let main = entries.iter().find(|e| e.relative == "api/src/main.rs").unwrap();
+        assert_eq!(main.depth, 2);
+        // Tree order keeps the folder's children right after it.
+        let at = paths.iter().position(|p| *p == "api").unwrap();
+        assert_eq!(paths[at + 1], "api/src");
+        fs::write(root.join("api/src/main.rs"), "fn main() { run() }\n")?;
+        let changes = status_with(root, &[root.join("api")])?;
+        assert!(changes.iter().any(|c| c.path == "api/src/main.rs" && c.letter() == 'M'));
+        Ok(())
+    }
+    #[test]
+    fn snapshots_fold_in_nested_repositories() -> Result<()> {
+        let dir = playground()?;
+        let root = dir.path();
+        let nested = [root.join("api")];
+        let before = Checkpoint::capture_with(root, "start", &nested)?;
+        fs::write(root.join("api/src/main.rs"), "fn main() { run() }\n")?;
+        fs::write(root.join("api/src/new.rs"), "new\n")?;
+        fs::write(root.join("lib/lib.rs"), "pub fn b() {}\n")?;
+        fs::write(root.join("api/target/out.bin"), "rebuilt")?;
+        let after = Checkpoint::capture_with(root, "end", &nested)?;
+        let mut paths: Vec<_> = before
+            .changes_to(&after)?
+            .into_iter()
+            .map(|c| (c.path, c.status))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                ("api/src/main.rs".to_string(), "M".to_string()),
+                ("api/src/new.rs".to_string(), "A".to_string()),
+                ("lib/lib.rs".to_string(), "M".to_string()),
+            ]
+        );
+        before.restore_file(&after, "api/src/main.rs")?;
+        assert_eq!(fs::read_to_string(root.join("api/src/main.rs"))?, "fn main() {}\n");
         Ok(())
     }
     #[test]

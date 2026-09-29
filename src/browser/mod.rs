@@ -2,10 +2,13 @@
 //! previews on the file side, and a Review tab for Git and task changes.
 mod document;
 mod review;
+mod scm;
+mod scm_ui;
 mod tree;
 
 use crate::{
     changeset::{self, Commit, FileChange, FileDiff},
+    git::{self as vcs, ops},
     tasks::TaskReview,
     theme::{self, BORDER, PANEL},
     workspace::{self, Change, Checkpoint, FileEntry},
@@ -27,7 +30,8 @@ use std::{
 
 const NOTICE_TIME: Duration = Duration::from_secs(4);
 const SIDEBAR_MIN: f32 = 190.;
-const SIDEBAR_MAX: f32 = 460.;
+/// Widest sidebar of each view: files, review, Git.
+const SIDEBAR_MAX: [f32; 3] = [460., 460., 600.];
 const TEXT_LIMIT: usize = 8 * 1024 * 1024;
 const READ_LIMIT: u64 = 32 * 1024 * 1024;
 
@@ -46,11 +50,20 @@ pub struct BrowserState {
     /// Panel width as a share of the window.
     #[serde(default)]
     pub panel_width: Option<f32>,
-    /// Sidebar widths and hidden flags: `[files, review]`.
+    /// Sidebar widths and hidden flags: `[files, review, git]`.
     #[serde(default)]
-    pub sidebar_widths: Option<[f32; 2]>,
+    pub sidebar_widths: Option<Vec<f32>>,
     #[serde(default)]
-    pub hidden_sidebars: [bool; 2],
+    pub hidden_sidebars: Vec<bool>,
+    /// The panel shows the Git view.
+    #[serde(default)]
+    pub git: bool,
+    #[serde(default)]
+    pub git_repo: Option<PathBuf>,
+    #[serde(default)]
+    pub git_split: Option<f32>,
+    #[serde(default)]
+    pub git_graph: Option<bool>,
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SavedDocument {
@@ -110,13 +123,31 @@ enum Message {
     ReviewDone(u64),
     ReviewError(u64, String),
     Commits(Result<Vec<Commit>, String>),
-    /// A revert finished; the message is shown and the review reloads.
+    /// A revert or staging change finished; the message is shown and the
+    /// review reloads.
     Reverted(String),
+    GitRepos(Vec<vcs::Repo>),
+    GitStatuses(Vec<(PathBuf, Result<vcs::Status, String>)>),
+    /// Generation, repository, whether it appends, the page size asked, and
+    /// the commits with the incoming and outgoing hashes.
+    #[allow(clippy::type_complexity)]
+    GitGraph(
+        u64,
+        PathBuf,
+        bool,
+        usize,
+        Result<(Vec<vcs::Commit>, Vec<String>, Vec<String>), String>,
+    ),
+    GitCommitInfo(String, Result<vcs::CommitInfo, String>),
+    GitRefs(PathBuf, Vec<vcs::Ref>, Vec<vcs::Stash>),
+    /// A Git command finished: repository, whether it showed as busy, result.
+    GitDone(PathBuf, bool, ops::Outcome<scm::After>, scm::OnError),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Files,
     Review,
+    Git,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
@@ -129,6 +160,12 @@ enum Menu {
 pub enum BrowserEvent {
     /// A review comment to type into this terminal's input.
     Comment(String),
+    /// Open a new terminal tab in this folder.
+    OpenFolder(PathBuf),
+    /// Type this command into the terminal without running it.
+    RunInTerminal(String),
+    /// Edit (or create) the project of this folder.
+    EditProject(PathBuf),
 }
 impl EventEmitter<BrowserEvent> for Browser {}
 
@@ -141,7 +178,7 @@ impl Render for SidebarResize {
     }
 }
 
-/// The sidebar sliding open or closed for one view (0 files, 1 review).
+/// The sidebar sliding open or closed for one view (0 files, 1 review, 2 Git).
 #[derive(Clone, Copy)]
 struct Slide {
     view: usize,
@@ -175,9 +212,12 @@ pub struct Browser {
     pub wide: bool,
     /// Panel width as a share of the window; `None` is the default.
     pub panel_width: Option<f32>,
-    sidebar_width: [f32; 2],
-    sidebar_hidden: [bool; 2],
+    sidebar_width: [f32; 3],
+    sidebar_hidden: [bool; 3],
     sidebar_slide: Option<Slide>,
+    /// When the view last changed, for the crossfade.
+    view_serial: u64,
+    shown_view: Option<View>,
     pub branch: String,
     pub tasks: Vec<TaskReview>,
     files: Vec<FileEntry>,
@@ -192,6 +232,9 @@ pub struct Browser {
     filter: Entity<InputState>,
     view: View,
     review: review::ReviewState,
+    /// The review of the other view (Review tab or Git view), kept aside.
+    parked: review::ReviewState,
+    git: scm::GitState,
     checkpoint: Option<Checkpoint>,
     follow: bool,
     pinned: bool,
@@ -217,6 +260,7 @@ pub struct Browser {
     receiver: mpsc::Receiver<Message>,
     sender: mpsc::Sender<Message>,
     stop: Arc<AtomicBool>,
+    scope: Scope,
     _subscriptions: Vec<Subscription>,
 }
 impl Drop for Browser {
@@ -229,7 +273,8 @@ impl Browser {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        start_watcher(root.clone(), sender.clone(), stop.clone());
+        let scope = Scope::default();
+        start_watcher(root.clone(), sender.clone(), stop.clone(), scope.clone());
         let filter = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Filter files…")
@@ -260,17 +305,21 @@ impl Browser {
             }
         })
         .detach();
-        let (review, review_subscriptions) = review::ReviewState::new(window, cx);
+        let (review, review_subscriptions) = review::ReviewState::new(false, window, cx);
+        let (parked, parked_subscriptions) = review::ReviewState::new(true, window, cx);
         let mut subscriptions = vec![subscription];
         subscriptions.extend(review_subscriptions);
+        subscriptions.extend(parked_subscriptions);
         Self {
             root,
             visible: false,
             wide: false,
             panel_width: None,
-            sidebar_width: [260., 250.],
-            sidebar_hidden: [false, false],
+            sidebar_width: [260., 250., 340.],
+            sidebar_hidden: [false; 3],
             sidebar_slide: None,
+            view_serial: 0,
+            shown_view: None,
             branch: String::new(),
             tasks: vec![],
             files: vec![],
@@ -285,6 +334,8 @@ impl Browser {
             filter,
             view: View::Files,
             review,
+            parked,
+            git: scm::GitState::new(),
             checkpoint: None,
             follow: false,
             pinned: false,
@@ -308,6 +359,7 @@ impl Browser {
             receiver,
             sender,
             stop,
+            scope,
             _subscriptions: subscriptions,
         }
     }
@@ -361,8 +413,12 @@ impl Browser {
             wide: self.wide,
             tree_root: self.tree_root.clone(),
             panel_width: self.panel_width,
-            sidebar_widths: Some(self.sidebar_width),
-            hidden_sidebars: self.sidebar_hidden,
+            sidebar_widths: Some(self.sidebar_width.to_vec()),
+            hidden_sidebars: self.sidebar_hidden.to_vec(),
+            git: self.view == View::Git,
+            git_repo: self.git.selected.clone(),
+            git_split: Some(self.git.split),
+            git_graph: Some(self.git.graph_open),
             docs: self
                 .docs
                 .iter()
@@ -389,9 +445,24 @@ impl Browser {
         self.tree_root = state.tree_root;
         self.panel_width = state.panel_width.filter(|w| (0.2..=1.).contains(w));
         if let Some(widths) = state.sidebar_widths {
-            self.sidebar_width = widths.map(|w| w.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+            for (i, width) in widths.into_iter().enumerate().take(3) {
+                self.sidebar_width[i] = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX[i]);
+            }
         }
-        self.sidebar_hidden = state.hidden_sidebars;
+        for (i, hidden) in state.hidden_sidebars.into_iter().enumerate().take(3) {
+            self.sidebar_hidden[i] = hidden;
+        }
+        if state.git {
+            self.view = View::Git;
+            self.view_changed();
+        }
+        self.git.selected = state.git_repo;
+        if let Some(split) = state.git_split {
+            self.git.split = split.clamp(0.15, 0.85);
+        }
+        if let Some(open) = state.git_graph {
+            self.git.graph_open = open;
+        }
         self.restore_docs = state.docs;
         let paths = self
             .restore_docs
@@ -448,10 +519,12 @@ impl Browser {
         self.expanded.clear();
         self.tasks.clear();
         self.reset_review();
+        self.git = scm::GitState::new();
         self.tree_root = None;
         self.tree_selected = None;
         self.loading = true;
-        start_watcher(root, self.sender.clone(), self.stop.clone());
+        self.scope = Scope::default();
+        start_watcher(root, self.sender.clone(), self.stop.clone(), self.scope.clone());
         cx.notify();
     }
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -478,10 +551,12 @@ impl Browser {
                     }
                     self.branch = branch;
                     self.loading = false;
-                    if let Some(root) = &self.tree_root {
-                        if !self.files.iter().any(|f| &f.relative == root) {
-                            self.tree_root = None;
-                        }
+                    self.git.stale = true;
+                    if let Some(root) = &self.tree_root
+                        && !self.files.iter().any(|f| &f.relative == root)
+                        && !self.root.join(root).is_dir()
+                    {
+                        self.tree_root = None;
                     }
                 }
                 Message::Loaded(path, result, size, pinned) => {
@@ -518,16 +593,34 @@ impl Browser {
                     }
                     Err(e) => self.say(e),
                 },
-                Message::ReviewList(generation, root, base, files) => {
-                    self.review_listed(generation, root, base, files)
+                Message::ReviewList(generation, root, base, files) => self
+                    .with_review_of(generation, |this| {
+                        this.review_listed(generation, root, base, files)
+                    }),
+                Message::ReviewDiffs(generation, diffs) => {
+                    self.with_review_of(generation, |this| this.review_diffs(generation, diffs))
                 }
-                Message::ReviewDiffs(generation, diffs) => self.review_diffs(generation, diffs),
-                Message::ReviewDone(generation) => self.review_done(generation),
-                Message::ReviewError(generation, error) => self.review_failed(generation, error),
+                Message::ReviewDone(generation) => {
+                    self.with_review_of(generation, |this| this.review_done(generation))
+                }
+                Message::ReviewError(generation, error) => {
+                    self.with_review_of(generation, |this| this.review_failed(generation, error))
+                }
                 Message::Commits(commits) => self.review_commits(commits),
                 Message::Reverted(message) => {
                     self.say(message);
                     self.review_reload_now();
+                    self.git.stale = true;
+                }
+                Message::GitRepos(repos) => self.git_repos_loaded(repos, window, cx),
+                Message::GitStatuses(results) => self.git_statuses_loaded(results),
+                Message::GitGraph(generation, repo, more, count, result) => {
+                    self.git_graph_loaded(generation, repo, more, count, result)
+                }
+                Message::GitCommitInfo(hash, info) => self.git.info = Some((hash, info)),
+                Message::GitRefs(repo, refs, stashes) => self.git_refs_loaded(repo, refs, stashes),
+                Message::GitDone(repo, busy, result, on_error) => {
+                    self.git_done(repo, busy, result, on_error, window, cx)
                 }
                 Message::Notice(message) => self.say(message),
                 Message::Saved(path, bytes, value, result) => match result {
@@ -556,7 +649,9 @@ impl Browser {
                 }
             }
         }
+        self.view_changed();
         changed |= self.review_tick(cx);
+        self.git_tick();
         if self.follow
             && !self.pinned
             && !self
@@ -883,7 +978,24 @@ impl Browser {
         });
     }
     fn sidebar_index(&self) -> usize {
-        usize::from(self.view == View::Review)
+        match self.view {
+            View::Files => 0,
+            View::Review => 1,
+            View::Git => scm::SIDEBAR,
+        }
+    }
+    /// Runs `f` with the review that started load `generation` as
+    /// `self.review`, whichever view is showing.
+    fn with_review_of(&mut self, generation: u64, f: impl FnOnce(&mut Self)) {
+        let parked = self.parked.generation.load(Ordering::Relaxed) == generation
+            && self.review.generation.load(Ordering::Relaxed) != generation;
+        if parked {
+            std::mem::swap(&mut self.review, &mut self.parked);
+        }
+        f(self);
+        if parked {
+            std::mem::swap(&mut self.review, &mut self.parked);
+        }
     }
     /// Whether the current view's sidebar (file tree or changed files) is open.
     pub(super) fn sidebar_open(&self) -> bool {
@@ -898,9 +1010,15 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.view_changed();
+        if self.shown_view != Some(self.view) {
+            self.shown_view = Some(self.view);
+            self.view_serial += 1;
+        }
         let content = match self.view {
             View::Review => self.review_content(window, cx),
             View::Files => self.document_content(window, cx),
+            View::Git => self.git_content(window, cx),
         };
         let side = self.sidebar_index();
         let wanted = self.sidebar_open();
@@ -924,6 +1042,7 @@ impl Render for Browser {
         let sidebar = (shown > 0.001 && !self.quick_look).then(|| match self.view {
             View::Review => self.review_sidebar(window, cx),
             View::Files => self.files_sidebar(window, cx),
+            View::Git => self.git_sidebar(window, cx),
         });
         let main = if !self.quick_look {
             div()
@@ -955,9 +1074,14 @@ impl Render for Browser {
                 })
                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
                     this.sidebar_width[side] = f32::from(e.bounds.right() - e.event.position.x)
-                        .clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                        .clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
                     cx.notify();
                 }))
+                .with_animation(
+                    ("browser-view", self.view_serial),
+                    Animation::new(Duration::from_millis(140)),
+                    |el, t| el.opacity(0.35 + 0.65 * t),
+                )
                 .into_any_element()
         } else {
             div()
@@ -980,8 +1104,13 @@ impl Render for Browser {
             .flex_col()
             .bg(rgb(PANEL))
             .text_color(rgb(theme::TEXT))
-            .child(self.tab_strip(cx))
+            .child(if self.view == View::Git {
+                self.git_strip(cx)
+            } else {
+                self.tab_strip(cx).into_any_element()
+            })
             .child(div().flex_1().min_h_0().child(main))
+            .when(self.view == View::Git, |s| s.children(self.git_overlays(window, cx)))
             .when(!self.notice.is_empty(), |s| {
                 s.child(
                     div()
@@ -1018,7 +1147,37 @@ fn is_image(path: &Path) -> bool {
     })
 }
 
-fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicBool>) {
+/// Folders the tree lists besides what `root`'s `.gitignore` allows: the
+/// project's source folders inside `root` and the worktree picked as tree root.
+#[derive(Clone, Default)]
+struct Scope {
+    extra: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    rescan: Arc<AtomicBool>,
+}
+impl Scope {
+    /// Every folder to list, and those among them that are repositories of
+    /// their own (whose status is read separately).
+    fn folders(&self, root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut all = crate::project::nested_folders(root);
+        for extra in self.extra.lock().unwrap().iter() {
+            if !all.contains(extra) {
+                all.push(extra.clone());
+            }
+        }
+        let repos = all
+            .iter()
+            .filter(|f| crate::project::is_repository(f))
+            .cloned()
+            .collect();
+        (all, repos)
+    }
+    fn set_extra(&self, folders: Vec<PathBuf>) {
+        *self.extra.lock().unwrap() = folders;
+        self.rescan.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicBool>, scope: Scope) {
     std::thread::spawn(move || {
         let _ = sender.send(Message::Tasks(crate::tasks::history(&root)));
         let (event_tx, event_rx) = mpsc::channel();
@@ -1039,7 +1198,15 @@ fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicB
         let mut refresh = true;
         let mut last = Instant::now() - fallback;
         let mut paths = BTreeSet::new();
+        let mut revision = crate::project::revision();
         while !stop.load(Ordering::Relaxed) {
+            if scope.rescan.swap(false, Ordering::Relaxed)
+                || revision != crate::project::revision()
+            {
+                revision = crate::project::revision();
+                refresh = true;
+                last = Instant::now() - fallback;
+            }
             for event in event_rx.try_iter().flatten() {
                 for path in event.paths {
                     if path
@@ -1077,8 +1244,9 @@ fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicB
                         let _ = sender.send(Message::Changed(path, bytes));
                     }
                 }
-                let files = workspace::scan_files(&root);
-                let changes = workspace::status(&root).unwrap_or_default();
+                let (folders, repos) = scope.folders(&root);
+                let files = workspace::scan_files_with(&root, &folders);
+                let changes = workspace::status_with(&root, &repos).unwrap_or_default();
                 let branch =
                     workspace::git_text(&root, &["branch", "--show-current"]).unwrap_or_default();
                 if sender.send(Message::Index(files, changes, branch)).is_err() {

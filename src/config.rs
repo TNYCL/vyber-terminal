@@ -12,6 +12,8 @@ pub struct Config {
     pub restore_workspace: bool,
     pub task_history_days: u64,
     pub task_history_limit: usize,
+    /// Fetch every few minutes while the Git panel is open.
+    pub git_autofetch: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -25,6 +27,7 @@ impl Default for Config {
             restore_workspace: true,
             task_history_days: 14,
             task_history_limit: 200,
+            git_autofetch: true,
         }
     }
 }

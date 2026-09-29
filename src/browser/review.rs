@@ -103,10 +103,14 @@ enum Submenu {
 }
 
 pub(super) struct ReviewState {
-    source: Option<Source>,
+    /// The Git view's review (the other one is the Review tab's).
+    pub(super) git: bool,
+    /// Repository the Git view compares; `None` is the workspace root.
+    pub(super) repo: Option<PathBuf>,
+    pub(super) source: Option<Source>,
     /// Switch to each new agent turn as it starts.
     follow_last: bool,
-    generation: Arc<AtomicU64>,
+    pub(super) generation: Arc<AtomicU64>,
     loading: bool,
     error: Option<String>,
     base: String,
@@ -114,7 +118,7 @@ pub(super) struct ReviewState {
     root: PathBuf,
     files: Rc<Vec<ReviewFile>>,
     rows: Rc<Vec<Row>>,
-    rows_dirty: bool,
+    pub(super) rows_dirty: bool,
     list: ListState,
     /// Collapsed files, by path.
     collapsed: HashSet<String>,
@@ -134,15 +138,18 @@ pub(super) struct ReviewState {
     commits: Option<Result<Vec<Commit>, String>>,
     submenu: Option<Submenu>,
     /// A load is due: `true` starts over, `false` refreshes in place.
-    pending: Option<bool>,
+    pub(super) pending: Option<bool>,
     reload_at: Option<Instant>,
     reload_first: Option<Instant>,
     confirm_revert: Option<Instant>,
     tree_scroll: UniformListScrollHandle,
+    /// A file to scroll to once it is listed.
+    pub(super) reveal_path: Option<String>,
 }
 
 impl ReviewState {
     pub(super) fn new(
+        git: bool,
         window: &mut Window,
         cx: &mut Context<Browser>,
     ) -> (Self, Vec<Subscription>) {
@@ -183,9 +190,12 @@ impl ReviewState {
             }),
         ];
         let state = Self {
+            git,
+            repo: None,
             source: None,
             follow_last: true,
-            generation: Arc::new(AtomicU64::new(0)),
+            // Loads of the two reviews never share a generation number.
+            generation: Arc::new(AtomicU64::new(if git { 1 << 40 } else { 0 })),
             loading: false,
             error: None,
             base: String::new(),
@@ -214,6 +224,7 @@ impl ReviewState {
             reload_first: None,
             confirm_revert: None,
             tree_scroll: UniformListScrollHandle::new(),
+            reveal_path: None,
         };
         (state, subscriptions)
     }
@@ -247,6 +258,11 @@ impl Browser {
         self.tasks.iter().rev().find(|t| t.agent != "Manual")
     }
 
+    /// Folder the review's Git sources read from.
+    pub(super) fn review_root(&self) -> PathBuf {
+        self.review.repo.clone().unwrap_or_else(|| self.root.clone())
+    }
+
     fn shown_task(&self) -> Option<&TaskReview> {
         match &self.review.source {
             Some(Source::Turn(id)) => self.tasks.iter().find(|t| &t.id == id),
@@ -255,6 +271,9 @@ impl Browser {
     }
 
     fn default_source(&self) -> Source {
+        if self.review.git {
+            return Source::Uncommitted;
+        }
         self.latest_turn()
             .map(|t| Source::Turn(t.id.clone()))
             .unwrap_or(Source::Uncommitted)
@@ -264,6 +283,7 @@ impl Browser {
     /// first time.
     pub fn show_review(&mut self, cx: &mut Context<Self>) {
         self.view = View::Review;
+        self.view_changed();
         self.menu = None;
         if self.review.source.is_none() {
             self.review.source = Some(self.default_source());
@@ -279,6 +299,7 @@ impl Browser {
         self.upsert_task(task);
         let latest = self.latest_turn().is_some_and(|t| t.id == id);
         self.view = View::Review;
+        self.view_changed();
         self.set_source(Source::Turn(id), latest, cx);
     }
 
@@ -300,6 +321,11 @@ impl Browser {
         let id = task.id.clone();
         let starts = task.active && task.after.is_none();
         let new = self.upsert_task(task);
+        // Turns belong to the Review tab's review, even while the Git view shows.
+        let swap = self.review.git;
+        if swap {
+            std::mem::swap(&mut self.review, &mut self.parked);
+        }
         let shown = matches!(&self.review.source, Some(Source::Turn(s)) if *s == id);
         if new && starts && self.review.follow_last && self.review.source.is_some() {
             self.review.source = Some(Source::Turn(id));
@@ -307,10 +333,13 @@ impl Browser {
         } else if shown {
             self.schedule_reload();
         }
+        if swap {
+            std::mem::swap(&mut self.review, &mut self.parked);
+        }
         cx.notify();
     }
 
-    fn set_source(&mut self, source: Source, follow_last: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_source(&mut self, source: Source, follow_last: bool, cx: &mut Context<Self>) {
         self.review.source = Some(source);
         self.review.follow_last = follow_last;
         self.review.pending = Some(true);
@@ -353,7 +382,7 @@ impl Browser {
             self.review.confirm_revert = None;
             changed = true;
         }
-        if !self.visible || self.view != View::Review {
+        if !self.visible || !matches!(self.view, View::Review | View::Git) {
             return changed;
         }
         let due = self
@@ -398,7 +427,10 @@ impl Browser {
         self.review.error = None;
         self.review.loading = true;
         let task = self.shown_task().cloned();
-        let root = self.root.clone();
+        let root = self.review_root();
+        if let Source::Commit { hash, .. } = &source {
+            self.load_commit_info(root.clone(), hash.clone());
+        }
         let sender = self.sender.clone();
         let current = self.review.generation.clone();
         let theme = Theme::global(cx).highlight_theme.clone();
@@ -528,7 +560,7 @@ impl Browser {
     }
 
     fn load_commits(&mut self) {
-        let root = self.root.clone();
+        let root = self.review_root();
         let sender = self.sender.clone();
         self.review.commits = None;
         std::thread::spawn(move || {
@@ -627,6 +659,16 @@ impl Browser {
         }
         self.review.rows = Rc::new(rows);
         self.update_matches(cx);
+        if let Some(path) = self.review.reveal_path.clone()
+            && let Some(file) = self.review.files.iter().position(|f| f.change.path == path)
+            && let Some(row) = self.review.rows.iter().position(|r| *r == Row::Header(file))
+        {
+            self.review.reveal_path = None;
+            self.review.list.scroll_to(ListOffset {
+                item_ix: row,
+                offset_in_item: px(0.),
+            });
+        }
     }
 
     fn row_texts(&self, row: Row) -> [Option<&str>; 2] {
@@ -944,6 +986,57 @@ impl Browser {
         cx.notify();
     }
 
+    // ---- Staging ------------------------------------------------------------------
+
+    /// Stages (or unstages) one hunk of a modified file by writing the index
+    /// content with only that hunk changed.
+    fn stage_hunk(&mut self, index: usize, hunk: usize, stage: bool, cx: &mut Context<Self>) {
+        let Some(file) = self.review.files.get(index).cloned() else {
+            return;
+        };
+        let Some(diff) = file.diff.clone() else {
+            return;
+        };
+        let Some(hunk) = diff.hunks.get(hunk).cloned() else {
+            return;
+        };
+        let root = self.review.root.clone();
+        let done = if stage { "Change staged" } else { "Change unstaged" };
+        self.run_revert(done.into(), move || {
+            let (top, path) = changeset::repository_path(&root, &file.change.path)?;
+            let before = diff.before.bytes().unwrap_or_default();
+            let after = diff.after.bytes().unwrap_or_default();
+            if stage {
+                let bytes = changeset::apply_hunk(before, after, &hunk)?;
+                crate::git::ops::write_index(&top, &path, Some(before), &bytes)?;
+            } else {
+                let bytes = changeset::revert_hunk(before, after, &hunk)?;
+                crate::git::ops::write_index(&top, &path, Some(after), &bytes)?;
+            }
+            Ok(())
+        });
+        cx.notify();
+    }
+
+    pub(super) fn stage_file(&mut self, index: usize, stage: bool, cx: &mut Context<Self>) {
+        let Some(file) = self.review.files.get(index).cloned() else {
+            return;
+        };
+        let root = self.review.root.clone();
+        let name = file.change.path.rsplit('/').next().unwrap_or_default().to_string();
+        let done = format!("{} {name}", if stage { "Staged" } else { "Unstaged" });
+        self.run_revert(done, move || {
+            let (top, path) = changeset::repository_path(&root, &file.change.path)?;
+            if stage {
+                crate::git::ops::stage(&top, &[path])?;
+            } else {
+                crate::git::ops::unstage(&top, &[path])?;
+            }
+            Ok(())
+        });
+        cx.notify();
+    }
+
     fn copy_patch(&mut self, cx: &mut Context<Self>) {
         let files: Vec<_> = self
             .review
@@ -962,7 +1055,7 @@ impl Browser {
         let Some(before) = self.checkpoint.clone() else {
             return;
         };
-        let root = self.root.clone();
+        let root = self.review_root();
         self.menu = None;
         self.say("Comparing with checkpoint…");
         cx.spawn(async move |entity, cx| {
@@ -1332,7 +1425,7 @@ impl Browser {
             _ => (
                 "No uncommitted changes",
                 "The working tree matches HEAD",
-                (self.tasks.is_empty()).then_some(
+                (self.tasks.is_empty() && !self.review.git).then_some(
                     "Agent turns appear here when Claude or Codex starts a request in this folder",
                 ),
             ),
@@ -1351,6 +1444,7 @@ impl Browser {
         } else {
             self.review_list(cx)
         };
+        let card = self.commit_card(cx);
         div()
             .relative()
             .flex()
@@ -1358,6 +1452,7 @@ impl Browser {
             .size_full()
             .child(bar)
             .children(banner)
+            .children(card)
             .child(div().flex_1().min_h_0().child(body))
             .when(self.menu == Some(Menu::Source), |s| s.child(self.source_menu(cx)))
             .when(self.menu == Some(Menu::More), |s| s.child(self.more_menu(cx)))
@@ -1370,6 +1465,12 @@ impl Browser {
             .source
             .as_ref()
             .is_some_and(Source::editable);
+        let (stage_files, stage_hunks) = match self.review.source {
+            Some(Source::Unstaged) => (Some(true), Some(true)),
+            Some(Source::Uncommitted) => (Some(true), None),
+            Some(Source::Staged) => (Some(false), Some(false)),
+            _ => (None, None),
+        };
         let context = Rc::new(RowContext {
             rows: self.review.rows.clone(),
             files: self.review.files.clone(),
@@ -1377,6 +1478,8 @@ impl Browser {
             collapsed: self.review.collapsed.clone(),
             wrap: self.review.wrap,
             editable,
+            stage_files,
+            stage_hunks,
             query: if self.review.find_open {
                 self.review.find.read(cx).value().trim().to_ascii_lowercase()
             } else {
@@ -1398,7 +1501,10 @@ impl Browser {
         let turn_count = self.tasks.len();
         let is = |s: &Source| source.as_ref() == Some(s);
         let last_checked = follow && latest.as_ref().is_some_and(|t| is(&Source::Turn(t.id.clone())));
+        // Agent turns belong to the terminal, not to a repository of the Git view.
+        let turns = !self.review.git;
         let mut menu = menu_panel("review-source-menu").w(px(250.));
+        if turns {
         menu = menu.child(
             menu_item(
                 "source-last",
@@ -1437,6 +1543,7 @@ impl Browser {
             );
         }
         menu = menu.child(separator());
+        }
         for (id, label, value) in [
             ("source-uncommitted", "Uncommitted", Source::Uncommitted),
             ("source-unstaged", "Unstaged", Source::Unstaged),
@@ -1480,7 +1587,11 @@ impl Browser {
             );
         // Open each submenu level with the item that opened it.
         let turns_row = 44.;
-        let commits_row = turns_row + if turn_count > 1 { 30. } else { 0. } + 9. + 90. + 9.;
+        let commits_row = if turns {
+            turns_row + if turn_count > 1 { 30. } else { 0. } + 9. + 90. + 9.
+        } else {
+            4. + 90. + 9.
+        };
         let submenu = match self.review.submenu {
             Some(Submenu::Turns) => Some(div().mt(px(turns_row)).child(self.turns_menu(cx))),
             Some(Submenu::Commits) => Some(div().mt(px(commits_row)).child(self.commits_menu(cx))),
@@ -1602,6 +1713,7 @@ impl Browser {
             "Revert all changes".to_string()
         };
         let has_checkpoint = self.checkpoint.is_some();
+        let checkpoints = !self.review.git;
         div()
             .id("review-more-menus")
             .absolute()
@@ -1629,8 +1741,8 @@ impl Browser {
                             s.on_click(cx.listener(|this, _, _, cx| this.revert_all(cx)))
                         }),
                     )
-                    .child(separator())
-                    .child(
+                    .when(checkpoints, |s| s.child(separator()))
+                    .when(checkpoints, |s| s.child(
                         menu_item(
                             "more-checkpoint",
                             "Take checkpoint",
@@ -1643,8 +1755,8 @@ impl Browser {
                             this.menu = None;
                             this.checkpoint(cx);
                         })),
-                    )
-                    .child(
+                    ))
+                    .when(checkpoints, |s| s.child(
                         menu_item(
                             "more-since",
                             "Review since checkpoint",
@@ -1658,7 +1770,7 @@ impl Browser {
                                 cx.listener(|this, _, _, cx| this.review_since_checkpoint(cx)),
                             )
                         }),
-                    ),
+                    )),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.dismiss_menu();
@@ -1820,6 +1932,10 @@ struct RowContext {
     collapsed: HashSet<String>,
     wrap: bool,
     editable: bool,
+    /// Files can be staged (`true`) or unstaged (`false`) from this source.
+    stage_files: Option<bool>,
+    /// The same for single hunks of modified files.
+    stage_hunks: Option<bool>,
     query: String,
     comment_input: Entity<InputState>,
 }
@@ -1977,6 +2093,20 @@ fn header_row(ix: usize, index: usize, context: &RowContext) -> AnyElement {
                         });
                     },
                 ),
+            )
+        })
+        .when_some(context.stage_files, |s, stage| {
+            let entity = context.entity.clone();
+            s.child(
+                icon_button(
+                    ("review-stage", ix),
+                    if stage { "plus" } else { "minus" },
+                    if stage { "Stage file" } else { "Unstage file" },
+                )
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    entity.update(cx, |view, cx| view.stage_file(index, stage, cx));
+                }),
             )
         })
         .when(context.editable, |s| {
@@ -2190,9 +2320,45 @@ fn comment_button(ix: usize, file: usize, line: usize, context: &RowContext) -> 
         })
 }
 
-/// The hover button that reverts the change a line belongs to.
+/// A small text button that appears on a hovered line of a hunk.
+fn hunk_action(
+    id: (&'static str, usize),
+    name: &str,
+    label: &'static str,
+    on_click: impl Fn(&mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(18.))
+        .px_1p5()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded(px(4.))
+        .bg(rgb(0x262626))
+        .border_1()
+        .border_color(rgb(0x3a3a3a))
+        .font_family(ui_font())
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .text_color(rgb(TEXT_2))
+        .hover(|s| s.bg(rgb(0x303030)).text_color(rgb(TEXT)))
+        .cursor_pointer()
+        .child(icon(ui(name), TEXT_2, 11.))
+        .child(label)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            on_click(cx);
+        })
+}
+
+/// The hover buttons that stage, unstage or revert the change a line
+/// belongs to.
 fn hunk_button(ix: usize, file: usize, line: usize, context: &RowContext) -> Option<AnyElement> {
-    if !context.editable {
+    let stage = context
+        .stage_hunks
+        .filter(|_| context.files[file].change.letter == 'M');
+    if !context.editable && stage.is_none() {
         return None;
     }
     let diff = context.files[file].diff.as_ref()?;
@@ -2200,35 +2366,38 @@ fn hunk_button(ix: usize, file: usize, line: usize, context: &RowContext) -> Opt
     if !diff.hunks[position].lines.contains(&line) {
         return None;
     }
-    let entity = context.entity.clone();
+    let stage_entity = context.entity.clone();
+    let revert_entity = context.entity.clone();
     Some(
         div()
-            .id(("review-revert-hunk", ix))
             .absolute()
             .right(px(10.))
             .top(px(1.))
-            .h(px(18.))
-            .px_1p5()
             .flex()
-            .items_center()
             .gap_1()
-            .rounded(px(4.))
-            .bg(rgb(0x262626))
-            .border_1()
-            .border_color(rgb(0x3a3a3a))
-            .font_family(ui_font())
-            .text_size(px(11.))
-            .line_height(px(16.))
-            .text_color(rgb(TEXT_2))
             .opacity(0.)
             .group_hover("review-line", |s| s.opacity(1.))
-            .hover(|s| s.bg(rgb(0x303030)).text_color(rgb(TEXT)))
-            .cursor_pointer()
-            .child(icon(ui("rotate-ccw"), TEXT_2, 11.))
-            .child("Revert")
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                entity.update(cx, |view, cx| view.revert_hunk(file, position, cx));
+            .when_some(stage, |s, stage| {
+                s.child(hunk_action(
+                    ("review-stage-hunk", ix),
+                    if stage { "plus" } else { "minus" },
+                    if stage { "Stage" } else { "Unstage" },
+                    move |cx| {
+                        stage_entity.update(cx, |view, cx| {
+                            view.stage_hunk(file, position, stage, cx)
+                        })
+                    },
+                ))
+            })
+            .when(context.editable, |s| {
+                s.child(hunk_action(
+                    ("review-revert-hunk", ix),
+                    "rotate-ccw",
+                    "Revert",
+                    move |cx| {
+                        revert_entity.update(cx, |view, cx| view.revert_hunk(file, position, cx))
+                    },
+                ))
             })
             .into_any_element(),
     )
@@ -2522,7 +2691,7 @@ fn tool(id: &'static str, name: &str, tooltip: &'static str, on: bool) -> Statef
         .when(on, |s| s.bg(rgb(SELECTED)))
 }
 
-fn menu_panel(id: &'static str) -> Stateful<Div> {
+pub(super) fn menu_panel(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .p_1()
@@ -2535,7 +2704,7 @@ fn menu_panel(id: &'static str) -> Stateful<Div> {
         .shadow_xl()
 }
 
-fn separator() -> Div {
+pub(super) fn separator() -> Div {
     div().h(px(1.)).mx_1().my_1().bg(rgb(BORDER))
 }
 
@@ -2549,7 +2718,7 @@ fn menu_note(text: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn menu_item(
+pub(super) fn menu_item(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     detail: Option<String>,

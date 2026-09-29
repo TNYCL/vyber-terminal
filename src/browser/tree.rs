@@ -259,7 +259,9 @@ impl Browser {
             .filter(|f| f.repository)
             .map(|f| f.relative.clone())
             .collect::<Vec<_>>();
-        let can_switch = !repositories.is_empty();
+        let can_switch = !repositories.is_empty()
+            || self.git.repos.iter().any(|r| r.repo.is_worktree())
+            || crate::project::for_path(&self.root).is_some_and(|p| p.folders.len() > 1);
         let showing_search = !query.is_empty() && query == self.search_query;
         let body = if showing_search {
             self.search_list(cx)
@@ -301,6 +303,10 @@ impl Browser {
                                     .hover(|s| s.bg(rgb(HOVER)))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_menu(Menu::Root);
+                                        // Worktrees come from the repositories' Git data.
+                                        if !this.git.discovered {
+                                            this.load_repos();
+                                        }
                                         cx.notify();
                                     }))
                             })
@@ -390,13 +396,112 @@ impl Browser {
                     cx.notify();
                 }))
         };
-        let mut items = vec![item(0, workspace_name, None, None)];
+        let mut items = vec![item(0, workspace_name, None, None).into_any_element()];
         for (i, relative) in repositories.into_iter().enumerate() {
             let (parent, name) = match relative.rsplit_once('/') {
                 Some((parent, name)) => (Some(parent.to_string()), name.to_string()),
                 None => (None, relative.clone()),
             };
-            items.push(item(i + 1, name, parent, Some(relative)));
+            items.push(item(i + 1, name, parent, Some(relative)).into_any_element());
+        }
+        // Worktrees and project folders outside this folder: those inside it
+        // become the tree root, the others open in a new tab.
+        let heading = |text: &'static str| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(MUTED))
+                .child(text)
+                .into_any_element()
+        };
+        let link = |id: usize, name: &'static str, label: String, detail: String, path: PathBuf| {
+            let relative = path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .filter(|r| !r.is_empty());
+            let checked = relative.is_some() && current == relative;
+            div()
+                .id(("root-link", id))
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(icon(ui(name), TEXT_2, 14.))
+                .child(div().min_w_0().truncate().child(label))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(if relative.is_some() {
+                            detail
+                        } else {
+                            format!("{detail} · opens in a new tab")
+                        }),
+                )
+                .child(div().flex_1())
+                .when(checked, |s| s.child(icon(ui("check"), TEXT, 14.)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.menu = None;
+                    match &relative {
+                        Some(relative) => {
+                            this.scope.set_extra(vec![path.clone()]);
+                            this.tree_root = Some(relative.clone());
+                            this.expanded.insert(relative.clone());
+                            this.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        }
+                        None => cx.emit(super::BrowserEvent::OpenFolder(path.clone())),
+                    }
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let worktrees: Vec<_> = self
+            .git
+            .repos
+            .iter()
+            .filter(|r| r.repo.is_worktree())
+            .map(|r| {
+                let owner = r
+                    .repo
+                    .worktree_of
+                    .as_deref()
+                    .map(crate::project::folder_name)
+                    .unwrap_or_default();
+                (super::scm::repo_label(&r.repo, r.status()), format!("worktree of {owner}"), r.repo.path.clone())
+            })
+            .collect();
+        if !worktrees.is_empty() {
+            items.push(heading("WORKTREES"));
+            for (i, (label, detail, path)) in worktrees.into_iter().enumerate() {
+                items.push(link(i, "git-fork", label, detail, path));
+            }
+        }
+        let outside: Vec<PathBuf> = crate::project::for_path(&self.root)
+            .map(|p| {
+                p.folders
+                    .into_iter()
+                    .filter(|f| !crate::tasks::matches_root(f, &self.root))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !outside.is_empty() {
+            items.push(heading("PROJECT"));
+            for (i, path) in outside.into_iter().enumerate() {
+                let name = crate::project::folder_name(&path);
+                items.push(link(1000 + i, "folder-git-2", name, "project folder".into(), path));
+            }
         }
         div()
             .id("root-menu")

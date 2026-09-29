@@ -1,6 +1,7 @@
 use crate::{
     browser::{Browser, BrowserEvent},
     layout::{self, DropEdge, Layout},
+    project_dialog::{ProjectDialog, ProjectDialogEvent},
     tasks::{Monitor, TaskReview},
     terminal::{Terminal, TerminalEvent, TurnBadge},
     theme::{self, chip},
@@ -42,7 +43,9 @@ actions!(
         Settings,
         TerminalZoomIn,
         TerminalZoomOut,
-        TerminalZoomReset
+        TerminalZoomReset,
+        ToggleGit,
+        EditProject
     ]
 );
 
@@ -165,6 +168,7 @@ pub struct Vyber {
     drop_hint: Option<DropHint>,
     font_size: Option<f32>,
     panel: Option<PanelMotion>,
+    project_dialog: Option<(Entity<ProjectDialog>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -227,6 +231,7 @@ impl Vyber {
             drop_hint: None,
             font_size: None,
             panel: None,
+            project_dialog: None,
             _subscriptions: vec![],
         };
         let saved = if std::env::args_os().nth(1).is_none()
@@ -336,15 +341,33 @@ impl Vyber {
                 TerminalEvent::OpenTurn(task) => this.open_turn(id, task.clone(), cx),
             }
         });
-        let comments = cx.subscribe(&browser, move |this, _, event: &BrowserEvent, cx| {
-            match event {
+        let comments = cx.subscribe_in(
+            &browser,
+            window,
+            move |this, _, event: &BrowserEvent, window, cx| match event {
                 BrowserEvent::Comment(text) => {
                     if let Some(slot) = this.slots.get(&id) {
                         slot.terminal.update(cx, |t, _| t.insert_comment(text));
                     }
                 }
-            }
-        });
+                BrowserEvent::RunInTerminal(command) => {
+                    if let Some(slot) = this.slots.get(&id) {
+                        slot.terminal.update(cx, |t, _| t.paste(command));
+                        let focus = slot.terminal.read(cx).focus.clone();
+                        window.focus(&focus, cx);
+                    }
+                }
+                BrowserEvent::OpenFolder(path) => {
+                    if path.is_dir() {
+                        this.add_terminal(path.clone(), false, false, window, cx);
+                    } else {
+                        this.notice = format!("{} doesn't exist anymore", path.display());
+                        cx.notify();
+                    }
+                }
+                BrowserEvent::EditProject(root) => this.open_project(root.clone(), window, cx),
+            },
+        );
         self.slots.insert(
             id,
             Slot {
@@ -583,11 +606,60 @@ impl Vyber {
     fn toggle_files(&mut self, _: &ToggleFiles, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(slot) = self.slots.get(&self.active) {
             slot.browser.update(cx, |b, cx| {
-                b.visible = !b.visible;
+                if b.git_open() {
+                    // Switching from Git keeps the panel where it is.
+                    b.show_files(cx);
+                } else {
+                    b.visible = !b.visible;
+                }
                 cx.notify();
             });
         }
         self.persist(cx);
+        cx.notify();
+    }
+    fn toggle_git(&mut self, _: &ToggleGit, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(slot) = self.slots.get(&self.active) {
+            slot.browser.update(cx, |b, cx| {
+                if b.git_open() {
+                    b.visible = false;
+                } else {
+                    b.show_git(cx);
+                }
+                cx.notify();
+            });
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+    fn edit_project(&mut self, _: &EditProject, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.current_root(cx);
+        self.open_project(root, window, cx);
+    }
+    /// Shows the project dialog for the project of `root` (or a new one).
+    fn open_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_shortcuts = false;
+        let dialog = cx.new(|cx| ProjectDialog::new(&root, window, cx));
+        let subscription = cx.subscribe_in(
+            &dialog,
+            window,
+            |this, _, event: &ProjectDialogEvent, window, cx| match event {
+                ProjectDialogEvent::Close(changed) => {
+                    this.project_dialog = None;
+                    if *changed {
+                        for slot in this.slots.values() {
+                            slot.browser.update(cx, |b, cx| b.project_changed(cx));
+                        }
+                    }
+                    if let Some(slot) = this.slots.get(&this.active) {
+                        let focus = slot.terminal.read(cx).focus.clone();
+                        window.focus(&focus, cx);
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        self.project_dialog = Some((dialog, subscription));
         cx.notify();
     }
     fn save(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -785,13 +857,19 @@ impl Vyber {
             prompt: Some("Open in Vyber".into()),
         });
         cx.spawn_in(window, async move |entity, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                if let Some(path) = paths.first() {
-                    let path = path.clone();
-                    let _ = entity.update_in(cx, |this, window, cx| {
-                        this.add_terminal(path, false, false, window, cx)
-                    });
-                }
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.first()
+            {
+                let path = path.clone();
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    this.add_terminal(path.clone(), false, false, window, cx);
+                    // A folder of repositories is worth a project; offer one.
+                    if crate::project::for_path(&path).is_none()
+                        && !crate::project::discover(&path).is_empty()
+                    {
+                        this.open_project(path, window, cx);
+                    }
+                });
             }
         })
         .detach();
@@ -1235,6 +1313,8 @@ impl Render for Vyber {
             .unwrap_or_else(|| div().into_any_element());
         let browser = self.slots.get(&self.active).map(|s| s.browser.clone());
         let visible = browser.as_ref().is_some_and(|b| b.read(cx).visible);
+        let git_open = browser.as_ref().is_some_and(|b| b.read(cx).git_open());
+        let changes = browser.as_ref().map_or(0, |b| b.read(cx).change_count());
         let wide = browser.as_ref().is_some_and(|b| b.read(cx).wide);
         let fraction = browser
             .as_ref()
@@ -1379,6 +1459,19 @@ impl Render for Vyber {
                 )),
             )
             .child(
+                chip("menu-git", "Source control     Ctrl+Shift+G").on_click(cx.listener(
+                    |this, _, w, cx| {
+                        this.show_shortcuts = false;
+                        this.toggle_git(&ToggleGit, w, cx);
+                    },
+                )),
+            )
+            .child(
+                chip("menu-project", "Edit project…").on_click(cx.listener(|this, _, w, cx| {
+                    this.edit_project(&EditProject, w, cx);
+                })),
+            )
+            .child(
                 chip("menu-settings", "Settings     Ctrl+Shift+, / ⌘,").on_click(cx.listener(
                     |this, _, w, cx| {
                         this.show_shortcuts = false;
@@ -1430,6 +1523,8 @@ impl Render for Vyber {
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::toggle_files))
+            .on_action(cx.listener(Self::toggle_git))
+            .on_action(cx.listener(Self::edit_project))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::checkpoint))
             .on_action(cx.listener(Self::quick_open))
@@ -1507,13 +1602,61 @@ impl Render for Vyber {
                                     })),
                             )
                             .child(
+                                bar_button("git-toggle", "")
+                                    .relative()
+                                    .child(theme::icon(
+                                        theme::ui("git-branch"),
+                                        if git_open { 0xffffff } else { 0x9b9b9b },
+                                        16.,
+                                    ))
+                                    .when(changes > 0, |s| {
+                                        s.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(3.))
+                                                .right(px(0.))
+                                                .min_w(px(14.))
+                                                .h(px(14.))
+                                                .px(px(3.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(7.))
+                                                .bg(rgb(0x2f2f2f))
+                                                .text_size(px(9.5))
+                                                .text_color(rgb(0xd6d6d6))
+                                                .child(if changes > 99 {
+                                                    "99+".to_string()
+                                                } else {
+                                                    changes.to_string()
+                                                }),
+                                        )
+                                    })
+                                    .when(git_open, |s| s.bg(rgb(0x1d1d1d)))
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Source control  (Ctrl+Shift+G)",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.toggle_git(&ToggleGit, w, cx)
+                                    })),
+                            )
+                            .child(
                                 bar_button("files-toggle", "")
                                     .child(theme::icon(
                                         theme::ui("panel-right"),
-                                        if visible { 0xffffff } else { 0x9b9b9b },
+                                        if visible && !git_open { 0xffffff } else { 0x9b9b9b },
                                         16.,
                                     ))
-                                    .when(visible, |s| s.bg(rgb(0x1d1d1d)))
+                                    .when(visible && !git_open, |s| s.bg(rgb(0x1d1d1d)))
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Files and review  (Ctrl+Shift+B)",
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.toggle_files(&ToggleFiles, w, cx)
                                     })),
@@ -1522,6 +1665,7 @@ impl Render for Vyber {
             )
             .child(div().flex_1().min_h_0().child(body))
             .when(self.show_shortcuts, |s| s.child(menu))
+            .when_some(self.project_dialog.as_ref(), |s, (dialog, _)| s.child(dialog.clone()))
             .when(!self.notice.is_empty(), |s| {
                 s.child(
                     div()
@@ -1561,6 +1705,15 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new(&format!("{prefix}-e"), SplitDown, None),
         KeyBinding::new(&format!("{prefix}-b"), ToggleFiles, None),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-shift-g"
+            } else {
+                "ctrl-shift-g"
+            },
+            ToggleGit,
+            None,
+        ),
         KeyBinding::new(&format!("{prefix}-p"), QuickOpen, None),
         KeyBinding::new(&format!("{prefix}-k"), Checkpoint, None),
         KeyBinding::new(&format!("{prefix}-o"), OpenFolder, None),

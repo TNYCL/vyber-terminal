@@ -429,6 +429,18 @@ impl Plan {
     }
 }
 
+/// The repository around `root` and `relative`'s path inside it, for
+/// commands that take repository paths (the index, `git add`).
+pub fn repository_path(root: &Path, relative: &str) -> Result<(PathBuf, String)> {
+    let git = Git {
+        dir: root.to_owned(),
+        env: vec![],
+    };
+    let top = PathBuf::from(git.text(&["rev-parse", "--show-toplevel"])?);
+    let prefix = git.text(&["rev-parse", "--show-prefix"])?;
+    Ok((top, format!("{prefix}{relative}")))
+}
+
 /// Merge base of HEAD with the default branch, and that branch's name.
 fn branch_base(git: &Git, head: Option<&str>) -> Result<(String, String)> {
     let head = head.context("Branch review needs at least one commit")?;
@@ -589,7 +601,13 @@ pub fn file_diff(path: &str, before: Blob, after: Blob, theme: Option<&Highlight
         expand_tabs(line);
     }
     let hunks = hunks(&lines);
-    let note = lines.is_empty().then(|| "No content changes".to_string());
+    let note = lines.is_empty().then(|| {
+        if old != new && !old.is_empty() && !new.is_empty() {
+            "Only line endings changed".to_string()
+        } else {
+            "No content changes".to_string()
+        }
+    });
     FileDiff {
         lines,
         hunks,
@@ -715,23 +733,64 @@ pub fn hunks(lines: &[DiffLine]) -> Vec<Hunk> {
     result
 }
 
-/// The after bytes with one hunk put back to its before lines. Line endings
-/// and every other byte are kept exactly.
+/// The after bytes with one hunk put back to its before lines. Every other
+/// byte is kept; the restored lines take the file's line ending.
 pub fn revert_hunk(before: &[u8], after: &[u8], hunk: &Hunk) -> Result<Vec<u8>> {
     let old: Vec<&[u8]> = before.split_inclusive(|b| *b == b'\n').collect();
-    let new: Vec<&[u8]> = after.split_inclusive(|b| *b == b'\n').collect();
-    if hunk.old.end > old.len() || hunk.new.end > new.len() {
+    if hunk.old.end > old.len() {
         bail!("This change no longer matches the file. Refresh and try again.");
     }
-    let mut out = Vec::with_capacity(after.len());
-    for line in new[..hunk.new.start]
-        .iter()
-        .chain(&old[hunk.old.clone()])
-        .chain(&new[hunk.new.end..])
-    {
-        out.extend_from_slice(line);
+    splice_lines(after, hunk.new.clone(), &old[hunk.old.clone()])
+}
+
+/// The before bytes with one hunk's after lines applied, as staging a hunk
+/// writes it into the index.
+pub fn apply_hunk(before: &[u8], after: &[u8], hunk: &Hunk) -> Result<Vec<u8>> {
+    let new: Vec<&[u8]> = after.split_inclusive(|b| *b == b'\n').collect();
+    if hunk.new.end > new.len() {
+        bail!("This change no longer matches the file. Refresh and try again.");
     }
-    Ok(out)
+    splice_lines(before, hunk.old.clone(), &new[hunk.new.clone()])
+}
+
+/// The line ending most lines use, if any line has one.
+fn line_ending(lines: &[&[u8]]) -> Option<&'static [u8]> {
+    let crlf = lines.iter().filter(|l| l.ends_with(b"\r\n")).count();
+    let lf = lines.iter().filter(|l| l.ends_with(b"\n")).count() - crlf;
+    match (crlf, lf) {
+        (0, 0) => None,
+        (crlf, lf) if crlf > lf => Some(b"\r\n"),
+        _ => Some(b"\n"),
+    }
+}
+
+/// `target` with its lines `range` replaced by `lines`. Inserted lines take
+/// `target`'s line ending, and every line but the last keeps one.
+pub fn splice_lines(target: &[u8], range: Range<usize>, lines: &[&[u8]]) -> Result<Vec<u8>> {
+    let old: Vec<&[u8]> = target.split_inclusive(|b| *b == b'\n').collect();
+    if range.end > old.len() || range.start > range.end {
+        bail!("This change no longer matches the file. Refresh and try again.");
+    }
+    let ending = line_ending(&old).or_else(|| line_ending(lines));
+    let convert = |line: &[u8]| -> Vec<u8> {
+        let body = line
+            .strip_suffix(b"\r\n")
+            .or_else(|| line.strip_suffix(b"\n"));
+        match (body, ending) {
+            (Some(body), Some(ending)) => [body, ending].concat(),
+            _ => line.to_vec(),
+        }
+    };
+    let mut pieces: Vec<Vec<u8>> = old[..range.start].iter().map(|l| l.to_vec()).collect();
+    pieces.extend(lines.iter().map(|l| convert(l)));
+    pieces.extend(old[range.end..].iter().map(|l| l.to_vec()));
+    let count = pieces.len();
+    for piece in pieces.iter_mut().take(count.saturating_sub(1)) {
+        if !piece.ends_with(b"\n") {
+            piece.extend_from_slice(ending.unwrap_or(b"\n"));
+        }
+    }
+    Ok(pieces.concat())
 }
 
 /// One file to put back: it must still hold `expected`, and gets `target`.
