@@ -105,11 +105,7 @@ impl Browser {
                                 .child(change_count.to_string()),
                         )
                     })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.view = View::Review;
-                        this.menu = None;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.show_review(cx))),
             )
             .when(!self.docs.is_empty(), |s| {
                 s.child(div().w(px(1.)).h(px(18.)).mx_0p5().bg(rgb(BORDER)))
@@ -131,6 +127,18 @@ impl Browser {
                 ),
             )
             .child(div().flex_1().min_w(px(8.)))
+            .child({
+                let open = self.sidebar_open();
+                let label = match (self.view, open) {
+                    (View::Review, true) => "Hide changed files",
+                    (View::Review, false) => "Show changed files",
+                    (_, true) => "Hide file tree",
+                    (_, false) => "Show file tree",
+                };
+                icon_button("sidebar", "panel-right", label)
+                    .when(open, |s| s.bg(rgb(SELECTED)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+            })
             .child(
                 icon_button(
                     "panel-width",
@@ -180,7 +188,7 @@ impl Browser {
                 })),
             )
             .child(
-                icon_button("close-panel", "panel-right-close", "Close panel  (Ctrl+Shift+B)")
+                icon_button("close-panel", "x", "Close panel  (Ctrl+Shift+B)")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.visible = false;
                         this.menu = None;

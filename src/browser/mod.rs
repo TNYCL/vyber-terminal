@@ -5,15 +5,13 @@ mod review;
 mod tree;
 
 use crate::{
+    changeset::{self, Commit, FileChange, FileDiff},
     tasks::TaskReview,
     theme::{self, BORDER, PANEL},
-    workspace::{self, Change, Checkpoint, DiffLine, DiffScope, FileEntry},
+    workspace::{self, Change, Checkpoint, FileEntry},
 };
 use gpui::{prelude::*, *};
-use gpui_kit::component::{
-    input::{EditorState, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel},
-};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState};
 use notify::Watcher;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -28,6 +26,8 @@ use std::{
 };
 
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+const SIDEBAR_MIN: f32 = 190.;
+const SIDEBAR_MAX: f32 = 460.;
 const TEXT_LIMIT: usize = 8 * 1024 * 1024;
 const READ_LIMIT: u64 = 32 * 1024 * 1024;
 
@@ -43,6 +43,14 @@ pub struct BrowserState {
     pub wide: bool,
     #[serde(default)]
     pub tree_root: Option<String>,
+    /// Panel width as a share of the window.
+    #[serde(default)]
+    pub panel_width: Option<f32>,
+    /// Sidebar widths and hidden flags: `[files, review]`.
+    #[serde(default)]
+    pub sidebar_widths: Option<[f32; 2]>,
+    #[serde(default)]
+    pub hidden_sidebars: [bool; 2],
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SavedDocument {
@@ -90,12 +98,20 @@ enum Message {
     Index(Vec<FileEntry>, Vec<Change>, String),
     Loaded(PathBuf, Result<Vec<u8>, String>, u64, bool),
     Changed(PathBuf, Option<Vec<u8>>),
-    Diff(u64, String, Vec<DiffLine>, Option<Vec<u8>>, Option<Vec<u8>>),
     Checkpoint(Result<Checkpoint, String>),
     Notice(String),
     Saved(PathBuf, Vec<u8>, SharedString, Result<(), String>),
     Search(String, Vec<(PathBuf, usize, String)>),
     Tasks(Vec<TaskReview>),
+    /// A review load: its file list (root, base, files), diffs in chunks,
+    /// then the end, or an error. The first number is the load generation.
+    ReviewList(u64, PathBuf, String, Vec<FileChange>),
+    ReviewDiffs(u64, Vec<(usize, Arc<FileDiff>)>),
+    ReviewDone(u64),
+    ReviewError(u64, String),
+    Commits(Result<Vec<Commit>, String>),
+    /// A revert finished; the message is shown and the review reloads.
+    Reverted(String),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -103,14 +119,53 @@ enum View {
     Review,
 }
 #[derive(Clone, Copy, PartialEq)]
-enum ReviewMode {
-    Changes,
-    Tasks,
-}
-#[derive(Clone, Copy, PartialEq)]
 enum Menu {
     Root,
     Open,
+    Source,
+    More,
+}
+
+pub enum BrowserEvent {
+    /// A review comment to type into this terminal's input.
+    Comment(String),
+}
+impl EventEmitter<BrowserEvent> for Browser {}
+
+/// Dragging the sidebar's left edge.
+#[derive(Clone)]
+struct SidebarResize;
+impl Render for SidebarResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// The sidebar sliding open or closed for one view (0 files, 1 review).
+#[derive(Clone, Copy)]
+struct Slide {
+    view: usize,
+    shown: bool,
+    from: f32,
+    start: Instant,
+}
+impl Slide {
+    const DURATION: f32 = 0.24;
+    fn settled(view: usize, shown: bool) -> Self {
+        Self {
+            view,
+            shown,
+            from: f32::from(u8::from(shown)),
+            start: Instant::now() - Duration::from_secs(1),
+        }
+    }
+    fn progress(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() / Self::DURATION).min(1.)
+    }
+    fn value(&self) -> f32 {
+        let to = f32::from(u8::from(self.shown));
+        self.from + (to - self.from) * theme::ease_out(self.progress())
+    }
 }
 
 pub struct Browser {
@@ -118,6 +173,11 @@ pub struct Browser {
     pub visible: bool,
     /// Panel covers the whole terminal area instead of the right side.
     pub wide: bool,
+    /// Panel width as a share of the window; `None` is the default.
+    pub panel_width: Option<f32>,
+    sidebar_width: [f32; 2],
+    sidebar_hidden: [bool; 2],
+    sidebar_slide: Option<Slide>,
     pub branch: String,
     pub tasks: Vec<TaskReview>,
     files: Vec<FileEntry>,
@@ -131,19 +191,10 @@ pub struct Browser {
     active_doc: usize,
     filter: Entity<InputState>,
     view: View,
-    review_mode: ReviewMode,
-    scope: DiffScope,
-    review: Option<(String, Vec<DiffLine>, Option<Vec<u8>>, Option<Vec<u8>>)>,
-    selected_task: Option<usize>,
+    review: review::ReviewState,
     checkpoint: Option<Checkpoint>,
     follow: bool,
     pinned: bool,
-    split_diff: bool,
-    full_diff: bool,
-    wide_diff: bool,
-    diff_scroll: UniformListScrollHandle,
-    diff_hunk: usize,
-    diff_request: u64,
     notice: String,
     notice_at: Instant,
     notice_serial: u64,
@@ -209,10 +260,17 @@ impl Browser {
             }
         })
         .detach();
+        let (review, review_subscriptions) = review::ReviewState::new(window, cx);
+        let mut subscriptions = vec![subscription];
+        subscriptions.extend(review_subscriptions);
         Self {
             root,
             visible: false,
             wide: false,
+            panel_width: None,
+            sidebar_width: [260., 250.],
+            sidebar_hidden: [false, false],
+            sidebar_slide: None,
             branch: String::new(),
             tasks: vec![],
             files: vec![],
@@ -226,19 +284,10 @@ impl Browser {
             active_doc: 0,
             filter,
             view: View::Files,
-            review_mode: ReviewMode::Changes,
-            scope: DiffScope::All,
-            review: None,
-            selected_task: None,
+            review,
             checkpoint: None,
             follow: false,
             pinned: false,
-            split_diff: true,
-            full_diff: false,
-            wide_diff: false,
-            diff_scroll: UniformListScrollHandle::new(),
-            diff_hunk: 0,
-            diff_request: 0,
             notice: String::new(),
             notice_at: Instant::now(),
             notice_serial: 0,
@@ -259,7 +308,7 @@ impl Browser {
             receiver,
             sender,
             stop,
-            _subscriptions: vec![subscription],
+            _subscriptions: subscriptions,
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -294,23 +343,6 @@ impl Browser {
         self.docs.get(self.active_doc)
     }
 
-    pub fn update_task(&mut self, review: TaskReview, cx: &mut Context<Self>) {
-        let selected = self
-            .selected_task
-            .and_then(|i| self.tasks.get(i))
-            .is_some_and(|t| t.id == review.id);
-        if let Some(old) = self.tasks.iter_mut().find(|t| t.id == review.id) {
-            *old = review;
-        } else {
-            self.tasks.push(review);
-        }
-        if selected {
-            if let Some((path, _, _, _)) = &self.review {
-                self.request_diff(path.clone(), cx);
-            }
-        }
-        cx.notify();
-    }
     pub fn has_dirty(&self) -> bool {
         self.docs.iter().any(|d| d.dirty)
     }
@@ -328,6 +360,9 @@ impl Browser {
             pinned: self.pinned,
             wide: self.wide,
             tree_root: self.tree_root.clone(),
+            panel_width: self.panel_width,
+            sidebar_widths: Some(self.sidebar_width),
+            hidden_sidebars: self.sidebar_hidden,
             docs: self
                 .docs
                 .iter()
@@ -352,6 +387,11 @@ impl Browser {
         self.pinned = state.pinned;
         self.wide = state.wide;
         self.tree_root = state.tree_root;
+        self.panel_width = state.panel_width.filter(|w| (0.2..=1.).contains(w));
+        if let Some(widths) = state.sidebar_widths {
+            self.sidebar_width = widths.map(|w| w.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+        }
+        self.sidebar_hidden = state.hidden_sidebars;
         self.restore_docs = state.docs;
         let paths = self
             .restore_docs
@@ -385,35 +425,6 @@ impl Browser {
             self.pending_line = Some((path, line));
         }
     }
-    fn restore_task(&mut self, cx: &mut Context<Self>) {
-        let Some(task) = self.selected_task.and_then(|i| self.tasks.get(i)).cloned() else {
-            return;
-        };
-        if task.active {
-            self.say("Wait for the task to end before restoring.");
-            return;
-        }
-        if self.has_dirty() {
-            self.say("Save your open editor changes before restoring a task.");
-            return;
-        }
-        let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let before = task.before.ok_or_else(|| anyhow::anyhow!("No baseline"))?;
-                let after = task
-                    .after
-                    .ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
-                before.restore_task(&after)
-            })();
-            let _ = sender.send(Message::Notice(match result {
-                Ok(()) => "Task restored · recovery copies saved".into(),
-                Err(e) => e.to_string(),
-            }));
-        });
-        cx.notify();
-    }
-
     pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         self.view = View::Files;
@@ -436,8 +447,7 @@ impl Browser {
         self.changed_dirs.clear();
         self.expanded.clear();
         self.tasks.clear();
-        self.review = None;
-        self.selected_task = None;
+        self.reset_review();
         self.tree_root = None;
         self.tree_selected = None;
         self.loading = true;
@@ -455,6 +465,7 @@ impl Browser {
                         self.files = files;
                     }
                     if self.changes != changes {
+                        self.review_worktree_changed(true);
                         self.statuses = changes
                             .iter()
                             .map(|c| (c.path.clone(), c.letter()))
@@ -477,6 +488,7 @@ impl Browser {
                     self.loaded(path, result, size, pinned, window, cx)
                 }
                 Message::Changed(path, bytes) => {
+                    self.review_worktree_changed(false);
                     if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
                         if doc.kind == Kind::Text && bytes.as_ref() != Some(&doc.baseline) {
                             if doc.dirty || bytes.is_none() {
@@ -497,21 +509,26 @@ impl Browser {
                     }
                     follow_path = Some(path);
                 }
-                Message::Diff(request, path, lines, before, after) => {
-                    if request == self.diff_request {
-                        self.review = Some((path, lines, before, after));
-                        self.diff_hunk = usize::MAX;
-                    }
-                }
                 Message::Checkpoint(result) => match result {
                     Ok(snapshot) => {
                         self.checkpoint = Some(snapshot);
-                        self.say("Checkpoint saved · changes from now can be reviewed");
-                        self.view = View::Review;
-                        self.review_mode = ReviewMode::Tasks;
+                        self.say(
+                            "Checkpoint saved · Review ▸ ··· ▸ Review since checkpoint shows what changes from now",
+                        );
                     }
                     Err(e) => self.say(e),
                 },
+                Message::ReviewList(generation, root, base, files) => {
+                    self.review_listed(generation, root, base, files)
+                }
+                Message::ReviewDiffs(generation, diffs) => self.review_diffs(generation, diffs),
+                Message::ReviewDone(generation) => self.review_done(generation),
+                Message::ReviewError(generation, error) => self.review_failed(generation, error),
+                Message::Commits(commits) => self.review_commits(commits),
+                Message::Reverted(message) => {
+                    self.say(message);
+                    self.review_reload_now();
+                }
                 Message::Notice(message) => self.say(message),
                 Message::Saved(path, bytes, value, result) => match result {
                     Ok(()) => {
@@ -539,6 +556,7 @@ impl Browser {
                 }
             }
         }
+        changed |= self.review_tick(cx);
         if self.follow
             && !self.pinned
             && !self
@@ -614,7 +632,7 @@ impl Browser {
             EditorState::new(window, cx)
                 .line_number(true)
                 .searchable(true)
-                .language(language(&path, &extension))
+                .language(changeset::language(&path))
                 .default_value(text.clone())
         });
         let watched_path = path.clone();
@@ -683,7 +701,6 @@ impl Browser {
         self.tab_scroll.scroll_to_item(self.active_doc);
     }
     pub fn open(&mut self, path: PathBuf, pinned: bool, cx: &mut Context<Self>) {
-        self.diff_request += 1;
         self.restore_active = None;
         self.view = View::Files;
         self.menu = None;
@@ -855,164 +872,6 @@ impl Browser {
         });
         cx.notify();
     }
-    fn request_diff(&mut self, path: String, cx: &mut Context<Self>) {
-        self.diff_request += 1;
-        let request = self.diff_request;
-        let sender = self.sender.clone();
-        let root = self.root.clone();
-        let scope = self.scope;
-        let full = self.full_diff;
-        let task = self.selected_task.and_then(|i| self.tasks.get(i)).cloned();
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<_> {
-                let (before, after) = if let Some(task) = task {
-                    let before = task
-                        .before
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("No task baseline"))?
-                        .checked_content(&path)?;
-                    let after = if let Some(after) = task.after.as_ref() {
-                        after.checked_content(&path)?
-                    } else {
-                        workspace::read_optional(&root.join(&path))?
-                    };
-                    (before, after)
-                } else {
-                    (
-                        workspace::before_content(&root, &path, scope)?,
-                        workspace::after_content(&root, &path, scope)?,
-                    )
-                };
-                let lines = workspace::diff_lines_context(
-                    before.as_deref().unwrap_or_default(),
-                    after.as_deref().unwrap_or_default(),
-                    if full { usize::MAX / 4 } else { 4 },
-                );
-                Ok(Message::Diff(request, path, lines, before, after))
-            })();
-            let _ = sender.send(result.unwrap_or_else(|e| Message::Notice(e.to_string())));
-        });
-        cx.notify();
-    }
-    fn review_checkpoint(&mut self, cx: &mut Context<Self>) {
-        let Some(before) = self.checkpoint.clone() else {
-            return;
-        };
-        let root = self.root.clone();
-        let sender = self.sender.clone();
-        self.say("Comparing with checkpoint…");
-        cx.spawn(async move |entity, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let after = Checkpoint::capture(&root, "Checkpoint comparison")?;
-                    let changes = before.changes_to(&after)?;
-                    let task = TaskReview {
-                        id: before.id.clone(),
-                        agent: "Manual".into(),
-                        label: "Since checkpoint".into(),
-                        root,
-                        before: Some(before),
-                        after: Some(after),
-                        changes,
-                        active: false,
-                        warning: "Includes all workspace edits since this checkpoint.".into(),
-                    };
-                    crate::tasks::persist(&task);
-                    anyhow::Ok(task)
-                })
-                .await;
-            let _ = entity.update(cx, |view, cx| match result {
-                Ok(task) => {
-                    view.tasks.push(task);
-                    view.selected_task = Some(view.tasks.len() - 1);
-                    view.say("Checkpoint review ready");
-                    cx.notify();
-                }
-                Err(e) => {
-                    let _ = sender.send(Message::Notice(e.to_string()));
-                }
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-    fn restore(&mut self, cx: &mut Context<Self>) {
-        let Some((path, _, before, after)) = self.review.clone() else {
-            return;
-        };
-        if self.has_dirty() {
-            self.say("Save your open editor changes before restoring.");
-            cx.notify();
-            return;
-        }
-        let task = self.selected_task.and_then(|i| self.tasks.get(i)).cloned();
-        if task.as_ref().is_some_and(|t| t.active) {
-            self.say("Wait for the task to finish before restoring.");
-            cx.notify();
-            return;
-        }
-        if task.is_none() && self.scope == DiffScope::Staged {
-            self.say("Staged is read-only. Choose Unstaged or All to restore the working file.");
-            cx.notify();
-            return;
-        }
-        let root = self.root.clone();
-        let sender = self.sender.clone();
-        let scope = self.scope;
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                if let Some(task) = task {
-                    let a = task.before.ok_or_else(|| anyhow::anyhow!("No baseline"))?;
-                    let b = task
-                        .after
-                        .ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
-                    a.restore_file(&b, &path)?;
-                } else {
-                    let target = workspace::safe_path(&root, &path)?;
-                    if workspace::read_optional(&target)? != after
-                        || workspace::before_content(&root, &path, scope)? != before
-                    {
-                        anyhow::bail!(
-                            "File or Git base changed since review. Refresh before restoring."
-                        );
-                    }
-                    let recovery = workspace::data_dir().join("recovery").join(
-                        chrono::Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
-                    fs::create_dir_all(&recovery)?;
-                    fs::write(
-                        recovery.join("path.txt"),
-                        target.to_string_lossy().as_bytes(),
-                    )?;
-                    if let Some(bytes) = &after {
-                        fs::write(recovery.join("content"), bytes)?;
-                    }
-                    match before {
-                        Some(bytes) => {
-                            if let Some(parent) = target.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::write(target, bytes)?;
-                        }
-                        None => {
-                            if after.is_some() {
-                                fs::remove_file(target)?;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            let _ = sender.send(Message::Notice(match result {
-                Ok(()) => "Restored · recovery copy saved".into(),
-                Err(e) => e.to_string(),
-            }));
-        });
-        cx.notify();
-    }
     /// Runs a blocking launcher off the UI thread and reports failures.
     fn launch(&mut self, run: fn(&Path) -> std::io::Result<()>, path: PathBuf) {
         self.menu = None;
@@ -1023,19 +882,84 @@ impl Browser {
             }
         });
     }
+    fn sidebar_index(&self) -> usize {
+        usize::from(self.view == View::Review)
+    }
+    /// Whether the current view's sidebar (file tree or changed files) is open.
+    pub(super) fn sidebar_open(&self) -> bool {
+        !self.sidebar_hidden[self.sidebar_index()]
+    }
+    pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        let index = self.sidebar_index();
+        self.sidebar_hidden[index] = !self.sidebar_hidden[index];
+        cx.notify();
+    }
 }
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.view {
-            View::Review => self.review_content(cx),
+            View::Review => self.review_content(window, cx),
             View::Files => self.document_content(window, cx),
         };
-        let sidebar = match self.view {
-            View::Review => self.review_sidebar(cx),
-            View::Files => self.files_sidebar(window, cx),
+        let side = self.sidebar_index();
+        let wanted = self.sidebar_open();
+        let slide = match self.sidebar_slide {
+            Some(s) if s.view == side && s.shown == wanted => s,
+            // The sidebar slides from wherever it is; switching views does not animate.
+            Some(s) if s.view == side && !cx.reduce_motion() => Slide {
+                view: side,
+                shown: wanted,
+                from: s.value(),
+                start: Instant::now(),
+            },
+            _ => Slide::settled(side, wanted),
         };
-        let main = if self.quick_look {
+        self.sidebar_slide = Some(slide);
+        if slide.progress() < 1. {
+            window.request_animation_frame();
+        }
+        let shown = slide.value();
+        let width = self.sidebar_width[side];
+        let sidebar = (shown > 0.001 && !self.quick_look).then(|| match self.view {
+            View::Review => self.review_sidebar(window, cx),
+            View::Files => self.files_sidebar(window, cx),
+        });
+        let main = if !self.quick_look {
+            div()
+                .id("browser-main")
+                .flex()
+                .size_full()
+                .child(div().flex_1().min_w_0().h_full().child(content))
+                .when_some(sidebar, |s, sidebar| {
+                    // The sidebar keeps its width and is revealed from the right
+                    // edge, so it slides instead of squeezing its contents.
+                    s.child(
+                        div()
+                            .relative()
+                            .h_full()
+                            .flex_shrink_0()
+                            .w(px(width * shown))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .w(px(width))
+                                    .child(sidebar),
+                            )
+                            .child(theme::resize_handle("sidebar-resize", SidebarResize).left_0()),
+                    )
+                })
+                .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
+                    this.sidebar_width[side] = f32::from(e.bounds.right() - e.event.position.x)
+                        .clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
             div()
                 .size_full()
                 .child(content)
@@ -1043,16 +967,6 @@ impl Render for Browser {
                     "quick-look",
                     Animation::new(Duration::from_millis(150)),
                     |el, t| el.opacity(t),
-                )
-                .into_any_element()
-        } else {
-            h_resizable("browser-split")
-                .child(resizable_panel().child(content))
-                .child(
-                    resizable_panel()
-                        .size(px(260.))
-                        .size_range(px(190.)..px(460.))
-                        .child(sidebar),
                 )
                 .into_any_element()
         };
@@ -1102,33 +1016,6 @@ fn is_image(path: &Path) -> bool {
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico"
         )
     })
-}
-fn language(path: &Path, extension: &str) -> &'static str {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "cargo.lock" | "pipfile" | "poetry.lock" => return "toml",
-        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" | "pkgbuild" => return "bash",
-        _ if name.starts_with(".env") => return "bash",
-        _ => {}
-    }
-    match extension {
-        "rs" => "rust",
-        "go" => "go",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "py" | "pyi" | "pyw" => "python",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "sh" | "bash" | "zsh" => "bash",
-        "md" | "markdown" | "mdx" => "markdown",
-        _ => "plain_text",
-    }
 }
 
 fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicBool>) {

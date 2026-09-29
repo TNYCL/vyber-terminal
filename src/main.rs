@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 mod app;
 mod browser;
+mod changeset;
 mod config;
 mod icons;
 mod layout;

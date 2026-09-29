@@ -1,8 +1,8 @@
 use crate::{
-    browser::Browser,
+    browser::{Browser, BrowserEvent},
     layout::{self, DropEdge, Layout},
-    tasks::Monitor,
-    terminal::Terminal,
+    tasks::{Monitor, TaskReview},
+    terminal::{Terminal, TerminalEvent, TurnBadge},
     theme::{self, chip},
     workspace,
 };
@@ -66,6 +66,31 @@ impl Render for TabDrag {
         drag_label(self.label.clone())
     }
 }
+/// Dragging the file panel's left edge.
+#[derive(Clone)]
+struct PanelResize;
+impl Render for PanelResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+/// The file panel never gets narrower than this.
+const PANEL_MIN: f32 = 480.;
+fn turn_badge(review: &TaskReview) -> TurnBadge {
+    let warning = review
+        .warning
+        .replace(crate::tasks::BASELINE_NOTE, "")
+        .trim()
+        .to_string();
+    TurnBadge {
+        id: review.id.clone(),
+        files: review.changes.len(),
+        additions: review.changes.iter().map(|c| c.additions).sum(),
+        deletions: review.changes.iter().map(|c| c.deletions).sum(),
+        active: review.active,
+        warning: (!warning.is_empty()).then_some(warning),
+    }
+}
 fn drag_label(label: String) -> impl IntoElement {
     div()
         .px_3()
@@ -100,7 +125,9 @@ fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> State
 struct Slot {
     terminal: Entity<Terminal>,
     browser: Entity<Browser>,
-    _focus: Subscription,
+    /// Latest agent turn that ran in this terminal.
+    turn: Option<TaskReview>,
+    _subscriptions: Vec<Subscription>,
 }
 #[derive(Serialize, Deserialize, Default)]
 struct SavedState {
@@ -128,6 +155,8 @@ pub struct Vyber {
     focus: FocusHandle,
     roots: Arc<Mutex<Vec<PathBuf>>>,
     monitor: Monitor,
+    /// Agent session → the terminal it runs in, learned from its first turn.
+    sessions: HashMap<String, usize>,
     notice: String,
     notifications: crate::notifications::Notifications,
     last_persist: std::time::Instant,
@@ -135,7 +164,46 @@ pub struct Vyber {
     show_shortcuts: bool,
     drop_hint: Option<DropHint>,
     font_size: Option<f32>,
+    panel: Option<PanelMotion>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The file panel's slide: `shown` fades and slides it in from the right,
+/// `wide` grows it to the full width. Values run from `from` to the target.
+#[derive(Clone, Copy)]
+struct PanelMotion {
+    slot: usize,
+    shown: bool,
+    wide: bool,
+    /// (shown, wide) as 0–1 when this motion started.
+    from: (f32, f32),
+    start: std::time::Instant,
+}
+impl PanelMotion {
+    const DURATION: f32 = 0.24;
+    fn settled(slot: usize, shown: bool, wide: bool) -> Self {
+        Self {
+            slot,
+            shown,
+            wide,
+            from: (f32::from(u8::from(shown)), f32::from(u8::from(wide))),
+            start: std::time::Instant::now() - Duration::from_secs(1),
+        }
+    }
+    fn progress(&self) -> f32 {
+        (self.start.elapsed().as_secs_f32() / Self::DURATION).min(1.)
+    }
+    fn running(&self) -> bool {
+        self.progress() < 1.
+    }
+    fn value(&self) -> (f32, f32) {
+        let t = theme::ease_out(self.progress());
+        let to = (f32::from(u8::from(self.shown)), f32::from(u8::from(self.wide)));
+        (
+            self.from.0 + (to.0 - self.from.0) * t,
+            self.from.1 + (to.1 - self.from.1) * t,
+        )
+    }
 }
 impl Vyber {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -150,6 +218,7 @@ impl Vyber {
             focus: cx.focus_handle(),
             roots,
             monitor,
+            sessions: HashMap::new(),
             notice: String::new(),
             notifications: crate::notifications::Notifications::new(),
             last_persist: std::time::Instant::now(),
@@ -157,6 +226,7 @@ impl Vyber {
             show_shortcuts: false,
             drop_hint: None,
             font_size: None,
+            panel: None,
             _subscriptions: vec![],
         };
         let saved = if std::env::args_os().nth(1).is_none()
@@ -251,7 +321,7 @@ impl Vyber {
         }
         let browser = cx.new(|cx| Browser::new(root.clone(), window, cx));
         let focus = terminal.read(cx).focus.clone();
-        let subscription = cx.on_focus(&focus, window, move |this, _, cx| {
+        let focused = cx.on_focus(&focus, window, move |this, _, cx| {
             this.active = id;
             for (i, layout) in this.tabs.iter().enumerate() {
                 if layout.contains(id) {
@@ -261,12 +331,27 @@ impl Vyber {
             }
             cx.notify();
         });
+        let badge = cx.subscribe(&terminal, move |this, _, event: &TerminalEvent, cx| {
+            match event {
+                TerminalEvent::OpenTurn(task) => this.open_turn(id, task.clone(), cx),
+            }
+        });
+        let comments = cx.subscribe(&browser, move |this, _, event: &BrowserEvent, cx| {
+            match event {
+                BrowserEvent::Comment(text) => {
+                    if let Some(slot) = this.slots.get(&id) {
+                        slot.terminal.update(cx, |t, _| t.insert_comment(text));
+                    }
+                }
+            }
+        });
         self.slots.insert(
             id,
             Slot {
                 terminal,
                 browser,
-                _focus: subscription,
+                turn: None,
+                _subscriptions: vec![focused, badge, comments],
             },
         );
         if split && !self.tabs.is_empty() {
@@ -287,6 +372,63 @@ impl Vyber {
             .values()
             .map(|s| s.terminal.read(cx).root.clone())
             .collect();
+        let slots = &self.slots;
+        self.sessions.retain(|_, id| slots.contains_key(id));
+    }
+    /// The terminal an agent turn runs in. A session is bound on its first
+    /// observed turn to the terminal in that folder where Enter was pressed
+    /// last (preferring one whose typed line matches the prompt), and stays
+    /// bound. Vyber does not inspect processes, so this is a best guess.
+    fn turn_terminal(&mut self, review: &TaskReview, cx: &App) -> Option<usize> {
+        if review.session.is_empty() {
+            return None;
+        }
+        if let Some(id) = self.sessions.get(&review.session)
+            && self.slots.contains_key(id)
+        {
+            return Some(*id);
+        }
+        if !review.active || review.after.is_some() {
+            return None;
+        }
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prompt = normalize(review.label.split_once(" · ").map_or("", |(_, p)| p));
+        let now = std::time::Instant::now();
+        let (_, _, id) = self
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let terminal = slot.terminal.read(cx);
+                let submitted = terminal.last_submit?;
+                if now.duration_since(submitted) > Duration::from_secs(45)
+                    || !crate::tasks::matches_root(&review.root, &terminal.root)
+                {
+                    return None;
+                }
+                let typed = normalize(&terminal.last_line);
+                let matched = typed.len() >= 3
+                    && prompt.len() >= 3
+                    && (prompt.starts_with(&typed) || typed.starts_with(&prompt));
+                Some((matched, submitted, *id))
+            })
+            .max_by_key(|(matched, submitted, _)| (*matched, *submitted))?;
+        self.sessions.insert(review.session.clone(), id);
+        Some(id)
+    }
+    fn open_turn(&mut self, id: usize, task: String, cx: &mut Context<Self>) {
+        let Some(slot) = self.slots.get(&id) else {
+            return;
+        };
+        let turn = slot.turn.clone().filter(|t| t.id == task);
+        slot.browser.update(cx, |b, cx| {
+            b.visible = true;
+            match turn {
+                Some(turn) => b.show_turn(turn, cx),
+                None => b.show_review(cx),
+            }
+        });
+        self.persist(cx);
+        cx.notify();
     }
     fn current_root(&self, cx: &App) -> PathBuf {
         self.slots
@@ -347,7 +489,8 @@ impl Vyber {
                 self.close_pane(id, window, cx);
             }
         }
-        for review in self.monitor.receiver.try_iter() {
+        let reviews: Vec<_> = self.monitor.receiver.try_iter().collect();
+        for review in reviews {
             for slot in self.slots.values() {
                 let root = &slot.browser.read(cx).root;
                 let path = root.to_string_lossy().replace('\\', "/").to_lowercase();
@@ -360,6 +503,19 @@ impl Vyber {
                     let review = review.clone();
                     slot.browser.update(cx, |b, cx| b.update_task(review, cx));
                 }
+            }
+            // A late update of an earlier turn must not replace a newer one.
+            if let Some(id) = self.turn_terminal(&review, cx)
+                && let Some(slot) = self.slots.get_mut(&id)
+                && slot
+                    .turn
+                    .as_ref()
+                    .is_none_or(|t| t.id == review.id || review.active)
+            {
+                let badge = turn_badge(&review);
+                slot.turn = Some(review);
+                slot.terminal
+                    .update(cx, |t, cx| t.set_badge(Some(badge), cx));
             }
             changed = true;
         }
@@ -1061,7 +1217,7 @@ impl Vyber {
     }
 }
 impl Render for Vyber {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() {
             self.drop_hint = None;
         }
@@ -1080,30 +1236,61 @@ impl Render for Vyber {
         let browser = self.slots.get(&self.active).map(|s| s.browser.clone());
         let visible = browser.as_ref().is_some_and(|b| b.read(cx).visible);
         let wide = browser.as_ref().is_some_and(|b| b.read(cx).wide);
+        let fraction = browser
+            .as_ref()
+            .and_then(|b| b.read(cx).panel_width)
+            .unwrap_or(0.61);
+        let motion = match self.panel {
+            Some(m) if m.slot == self.active && (m.shown, m.wide) == (visible, wide) => m,
+            // Opening, closing and resizing glide from wherever the panel is now.
+            Some(m) if m.slot == self.active && !cx.reduce_motion() => PanelMotion {
+                slot: self.active,
+                shown: visible,
+                wide,
+                from: m.value(),
+                start: std::time::Instant::now(),
+            },
+            // Another terminal's panel appears in place.
+            _ => PanelMotion::settled(self.active, visible, wide),
+        };
+        self.panel = Some(motion);
+        let (shown, wideness) = motion.value();
+        if motion.running() {
+            window.request_animation_frame();
+        }
         let mut body = div().relative().size_full().bg(rgb(0x000000)).child(layout);
-        if let Some(browser) = browser.filter(|_| visible) {
+        if let Some(browser) = browser.filter(|_| shown > 0.001) {
+            let full = f32::from(window.viewport_size().width);
+            let narrow = (full * fraction).max(PANEL_MIN).min(full - 8.);
+            let width = narrow + (full - 8. - narrow) * wideness;
+            // Hidden means slid entirely past the right edge, so opening and
+            // closing move the left edge like the full-width transition does.
+            let shift = (1. - shown) * (width + 8.);
             body = body.child(
                 div()
                     .absolute()
-                    .occlude()
+                    .when(visible, |s| s.occlude())
                     .top(px(4.))
                     .bottom(px(4.))
-                    .right(px(4.))
-                    .when(wide, |s| s.left(px(4.)))
-                    .when(!wide, |s| s.w(relative(0.61)).min_w(px(560.)))
+                    .right(px(4. - shift))
+                    .w(px(width))
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(theme::BORDER))
                     .shadow_xl()
                     .overflow_hidden()
                     .bg(rgb(theme::PANEL))
-                    .child(browser)
-                    .with_animation(
-                        ("preview-open", self.active),
-                        Animation::new(Duration::from_millis(150)),
-                        |el, t| el.opacity(t),
-                    ),
+                    .child(browser),
             );
+            // Drag the left edge to resize; the full-width panel has no edge to grab.
+            if visible && !wide && !motion.running() {
+                body = body.child(
+                    theme::resize_handle("panel-resize", PanelResize)
+                        .top(px(4.))
+                        .bottom(px(4.))
+                        .left(px(full - 4. - width - 4.)),
+                );
+            }
         }
         let tabs = self
             .tabs
@@ -1220,6 +1407,16 @@ impl Render for Vyber {
             .on_drag_move(cx.listener(|this, _: &DragMoveEvent<TabDrag>, _, _| {
                 // Capture runs parent-first: clear the old target before a matching child sets it.
                 this.drop_hint = None;
+            }))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<PanelResize>, window, cx| {
+                let full = f32::from(window.viewport_size().width);
+                let width = (full - 4. - f32::from(e.event.position.x))
+                    .clamp(PANEL_MIN.min(full - 8.), full - 8.);
+                if let Some(slot) = this.slots.get(&this.active) {
+                    slot.browser
+                        .update(cx, |b, _| b.panel_width = Some(width / full));
+                }
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CancelTabDrag, window, cx| {
                 if cx.stop_active_drag(window) {

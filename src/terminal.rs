@@ -7,7 +7,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags},
     tty,
-    vte::ansi::Color,
+    vte::ansi::{Color, NamedColor},
 };
 use gpui::{prelude::*, *};
 use gpui_kit::component::{
@@ -23,7 +23,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -59,6 +59,25 @@ impl Dimensions for Size {
 
 const TERMINAL_INSET: f32 = 3.;
 
+/// Summary of an agent turn that ran in this terminal, drawn as a badge
+/// above the agent's input box. Vyber only draws it: the program in the
+/// terminal never sees it, and the terminal size does not change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnBadge {
+    pub id: String,
+    pub files: usize,
+    pub additions: usize,
+    pub deletions: usize,
+    pub active: bool,
+    pub warning: Option<String>,
+}
+
+pub enum TerminalEvent {
+    /// The turn badge was clicked.
+    OpenTurn(String),
+}
+impl EventEmitter<TerminalEvent> for Terminal {}
+
 actions!(vyber_terminal, [TerminalTab, TerminalBackTab]);
 
 pub fn bind_keys(cx: &mut App) {
@@ -76,6 +95,12 @@ pub struct Terminal {
     pub bell: bool,
     pub notification: Option<String>,
     pub open_path: Option<(PathBuf, usize)>,
+    pub badge: Option<TurnBadge>,
+    badge_dismissed: Option<String>,
+    /// Text typed since the last Enter, and the line and time of that Enter.
+    typed: String,
+    pub last_line: String,
+    pub last_submit: Option<Instant>,
     font_family: String,
     pub focus: FocusHandle,
     pub term: Arc<FairMutex<Term<Proxy>>>,
@@ -243,6 +268,11 @@ impl Terminal {
             bell: false,
             notification: None,
             open_path: None,
+            badge: None,
+            badge_dismissed: None,
+            typed: String::new(),
+            last_line: String::new(),
+            last_submit: None,
             font_family: crate::config::Config::load().font_family,
             focus: cx.focus_handle(),
             term,
@@ -450,7 +480,26 @@ impl Terminal {
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
         let _ = self.sender.send(Msg::Input(Cow::Owned(bytes.into())));
     }
+    pub fn set_badge(&mut self, badge: Option<TurnBadge>, cx: &mut Context<Self>) {
+        if self.badge != badge {
+            self.badge = badge;
+            cx.notify();
+        }
+    }
+    /// Types a review comment into the program's input without submitting it.
+    /// With bracketed paste the comment ends on its own line; otherwise a
+    /// newline would act as Enter, so a space separates comments instead.
+    pub fn insert_comment(&mut self, text: &str) {
+        let bracket = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let line = text.replace(['\r', '\n'], " ");
+        self.paste(&if bracket {
+            format!("{line}\n")
+        } else {
+            format!("{line} ")
+        });
+    }
     pub fn paste(&mut self, text: &str) {
+        self.track_typing(text);
         let bracket = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         let text = text.replace('\x1b', "");
         self.send(
@@ -461,6 +510,11 @@ impl Terminal {
             }
             .into_bytes(),
         );
+    }
+    fn track_typing(&mut self, text: &str) {
+        if self.typed.len() < 4096 {
+            self.typed.push_str(text);
+        }
     }
     fn resize(&mut self, bounds: Bounds<Pixels>) {
         self.bounds = bounds;
@@ -541,6 +595,19 @@ impl Terminal {
                 let mut term = self.term.lock();
                 term.scroll_display(Scroll::Bottom);
                 term.selection = None;
+            }
+            let plain = !key.modifiers.shift && !key.modifiers.control && !key.modifiers.alt;
+            match key.key.as_str() {
+                "enter" if plain => {
+                    self.last_line = std::mem::take(&mut self.typed);
+                    self.last_submit = Some(Instant::now());
+                }
+                "backspace" => {
+                    self.typed.pop();
+                }
+                "escape" => self.typed.clear(),
+                "c" | "u" if key.modifiers.control => self.typed.clear(),
+                _ => {}
             }
             self.send(bytes);
             cx.stop_propagation();
@@ -694,9 +761,188 @@ impl Terminal {
         }
     }
 }
+impl Terminal {
+    /// The turn badge, placed on blank cells just above the agent's input box.
+    /// Hidden while scrolled back or when no input box is on screen.
+    fn badge_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::theme::{ADDED, DELETED, TEXT_2, WARNING, icon, ui};
+        let badge = self.badge.clone()?;
+        if badge.files == 0 || self.badge_dismissed.as_deref() == Some(badge.id.as_str()) {
+            return None;
+        }
+        let label = format!(
+            "{} {} changed",
+            badge.files,
+            if badge.files == 1 { "file" } else { "files" }
+        );
+        let counts = format!("+{} −{}", badge.additions, badge.deletions);
+        let width = 6.8 * (label.len() + counts.len()) as f32 + 52.;
+        let need = (width / self.cell_width.max(1.)).ceil() as usize + 1;
+        let (row, right) = {
+            let term = self.term.lock();
+            if term.grid().display_offset() != 0 {
+                return None;
+            }
+            let lines = term.screen_lines().min(self.rows);
+            let columns = term.columns().min(self.cols);
+            let first = lines.saturating_sub(24);
+            let screen = (first..lines)
+                .map(|row| {
+                    let line = &term.grid()[Line(row as i32)];
+                    (0..columns)
+                        .map(|column| {
+                            let cell = &line[Column(column)];
+                            (cell.c, cell.bg == Color::Named(NamedColor::Background))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let (row, right) = badge_spot(&screen, need)?;
+            (row + first, right)
+        };
+        let height = self.cell_height.clamp(16., 24.);
+        let top = TERMINAL_INSET + row as f32 * self.cell_height + (self.cell_height - height) / 2.;
+        let right = f32::from(self.bounds.size.width)
+            - (TERMINAL_INSET + (right + 1) as f32 * self.cell_width);
+        let open = badge.id.clone();
+        let dismiss = badge.id.clone();
+        let tooltip: SharedString = match &badge.warning {
+            Some(warning) => format!("Review this turn's changes · {warning}").into(),
+            None if badge.active => "Review changes so far · the agent is still working".into(),
+            None => "Review this turn's changes".into(),
+        };
+        let group: SharedString = "turn-badge".into();
+        Some(
+            div()
+                .id("turn-badge")
+                .group(group.clone())
+                .absolute()
+                .occlude()
+                .top(px(top))
+                .right(px(right.max(2.)))
+                .h(px(height))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .pl(px(9.))
+                .pr(px(4.))
+                .rounded_full()
+                .bg(rgb(0x1b1b1b))
+                .border_1()
+                .border_color(rgb(0x303030))
+                .text_size(px(11.5))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x232323)).border_color(rgb(0x3a3a3a)))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(TerminalEvent::OpenTurn(open.clone()));
+                }))
+                .when(badge.warning.is_some(), |s| {
+                    s.child(div().size(px(6.)).rounded_full().bg(rgb(WARNING)))
+                })
+                .when(badge.active && badge.warning.is_none(), |s| {
+                    s.child(
+                        div()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(rgb(TEXT_2))
+                            .with_animation(
+                                "turn-badge-active",
+                                Animation::new(Duration::from_millis(1400))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.25, 1.)),
+                                |el, t| el.opacity(t),
+                            ),
+                    )
+                })
+                .child(div().text_color(rgb(0xc4c4c4)).child(label))
+                .child(div().text_color(rgb(ADDED)).child(format!("+{}", badge.additions)))
+                .child(div().text_color(rgb(DELETED)).child(format!("−{}", badge.deletions)))
+                .child(
+                    div()
+                        .id("turn-badge-dismiss")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(15.))
+                        .rounded_full()
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .hover(|s| s.bg(rgb(0x363636)))
+                        .child(icon(ui("x"), TEXT_2, 10.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.badge_dismissed = Some(dismiss.clone());
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// Where a badge `need` cells wide fits above an agent's input box, as
+/// (row, last column) in `screen`. The input box is the lowest prompt line
+/// (`❯`, `›` or `>` at the start, optionally inside a `│` box) near the
+/// bottom, together with the rule or box border drawn above it. The badge
+/// goes on the closest row above whose cells under it are blank, right-aligned
+/// with the box; when none is blank it sits directly above the box.
+pub fn badge_spot(screen: &[Vec<(char, bool)>], need: usize) -> Option<(usize, usize)> {
+    let height = screen.len();
+    let width = screen.first()?.len();
+    if height < 2 || width < need + 4 {
+        return None;
+    }
+    let blank = |c: char| c == ' ' || c == '\0';
+    let is_prompt = |row: &[(char, bool)]| {
+        let Some(start) = row
+            .iter()
+            .position(|(c, _)| !blank(*c) && !matches!(c, '│' | '┃'))
+        else {
+            return false;
+        };
+        start <= 4
+            && matches!(row[start].0, '❯' | '›' | '>')
+            && row.get(start + 1).is_none_or(|(c, _)| blank(*c))
+    };
+    let is_rule = |row: &[(char, bool)]| {
+        let lines = row
+            .iter()
+            .filter(|(c, _)| matches!(c, '─' | '━' | '═' | '╌' | '┄' | '╭' | '╮' | '╰' | '╯'))
+            .count();
+        lines * 2 >= width
+    };
+    let prompt = (height.saturating_sub(16)..height)
+        .rev()
+        .find(|&r| is_prompt(&screen[r]))?;
+    let (top, right) = if prompt > 0 && is_rule(&screen[prompt - 1]) {
+        let rule = &screen[prompt - 1];
+        let end = rule.iter().rposition(|(c, _)| !blank(*c)).unwrap_or(width - 1);
+        (prompt - 1, end.min(width - 2))
+    } else {
+        (prompt, width - 2)
+    };
+    if right + 1 < need || top == 0 {
+        return None;
+    }
+    let left = right + 1 - need;
+    let free = |r: usize| screen[r][left..=right].iter().all(|(c, plain)| *plain && blank(*c));
+    (top.saturating_sub(6)..top)
+        .rev()
+        .find(|&r| free(r))
+        .or(Some(top - 1))
+        .map(|r| (r, right))
+}
+
 impl Render for Terminal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let badge = self.badge_element(cx);
         div()
             .id(("terminal", self.id))
             .key_context("Terminal")
@@ -889,6 +1135,7 @@ impl Render for Terminal {
                         ),
                 )
             })
+            .children(badge)
     }
 }
 
@@ -936,6 +1183,7 @@ impl EntityInputHandler for Terminal {
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
         }
+        self.track_typing(text);
         self.send(text.as_bytes().to_vec());
         cx.notify();
     }
@@ -1188,6 +1436,56 @@ fn palette(index: usize) -> u32 {
 mod tests {
     use super::key_bytes;
     use alacritty_terminal::term::TermMode;
+
+    fn screen(rows: &[&str], width: usize) -> Vec<Vec<(char, bool)>> {
+        rows.iter()
+            .map(|row| {
+                let mut cells: Vec<_> = row.chars().map(|c| (c, true)).collect();
+                cells.resize(width, (' ', true));
+                cells
+            })
+            .collect()
+    }
+
+    #[test]
+    fn badge_sits_on_blank_cells_above_claude_input() {
+        let rule = "─".repeat(60);
+        let rows = [
+            "● Updated src/app.rs with 12 additions",
+            "",
+            "✻ Working… (esc to interrupt)",
+            &rule,
+            "❯ next prompt",
+            &rule,
+            "  ⏵⏵ accept edits on",
+        ];
+        assert_eq!(super::badge_spot(&screen(&rows, 60), 20), Some((2, 58)));
+        // Text under the badge's cells pushes it up to the next blank row.
+        let busy = format!("✻ Working… {}", "x".repeat(48));
+        let rows = [rows[0], rows[1], &busy, &rule, rows[4], &rule, rows[6]];
+        assert_eq!(super::badge_spot(&screen(&rows, 60), 20), Some((1, 58)));
+    }
+
+    #[test]
+    fn badge_follows_codex_and_boxed_prompts() {
+        let rows = ["• Working (5s • esc to interrupt)", "", "› Ask Codex", "", "  ⏎ send"];
+        assert_eq!(super::badge_spot(&screen(&rows, 50), 12), Some((1, 48)));
+        let rows = ["", "╭──────────────────────────────╮", "│ > type here                  │", "╰──────────────────────────────╯"];
+        assert_eq!(super::badge_spot(&screen(&rows, 40), 12), Some((0, 31)));
+        // The composer's shaded background is not blank space.
+        let mut shaded = screen(&["", "", "› Ask Codex"], 50);
+        shaded[1].iter_mut().for_each(|cell| cell.1 = false);
+        assert_eq!(super::badge_spot(&shaded, 12), Some((0, 48)));
+    }
+
+    #[test]
+    fn no_badge_without_an_input_box() {
+        let rows = ["user@host MINGW64 ~/repo", "$ cargo test", "   Compiling vyber"];
+        assert_eq!(super::badge_spot(&screen(&rows, 60), 20), None);
+        assert_eq!(super::badge_spot(&screen(&["❯ x"], 60), 20), None);
+        assert_eq!(super::badge_spot(&screen(&["", "❯ x"], 20), 20), None);
+    }
+
     #[test]
     fn terminal_colors_preserve_rgb_cube_and_application_overrides() {
         use super::{Color, Flags, color, foreground, palette};

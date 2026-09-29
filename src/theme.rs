@@ -17,15 +17,24 @@ pub const TEXT_2: u32 = 0xa3a3a3;
 pub const MUTED: u32 = 0x6e6e6e;
 pub const FAINT: u32 = 0x3a3a3a;
 pub const LINK: u32 = 0x5aa2ff;
-pub const ADDED: u32 = 0x73c991;
-pub const MODIFIED: u32 = 0xe2c08d;
-pub const DELETED: u32 = 0xf1707a;
+// Git state colors match the Codex review pane.
+pub const ADDED: u32 = 0x40c977;
+pub const MODIFIED: u32 = 0xff8549;
+pub const DELETED: u32 = 0xfa423e;
 pub const CONFLICT: u32 = 0xe4676b;
 pub const WARNING_BG: u32 = 0x2a2213;
 pub const WARNING: u32 = 0xe8ca8b;
 
 pub fn mono_font() -> &'static str {
     if cfg!(windows) { "Consolas" } else { "Menlo" }
+}
+
+pub fn ui_font() -> &'static str {
+    if cfg!(windows) {
+        "Segoe UI"
+    } else {
+        ".SystemUIFont"
+    }
 }
 
 /// Path of an interface icon embedded by [`crate::icons::Assets`].
@@ -107,42 +116,38 @@ pub fn text_button(
         .child(label.into())
 }
 
-/// One option of a segmented control.
-pub fn segment(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    active: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .gap_1p5()
-        .h(px(24.))
-        .px_2()
-        .rounded(px(5.))
-        .text_size(px(12.))
-        .cursor_pointer()
-        .when(active, |s| s.bg(rgb(SELECTED)).text_color(rgb(TEXT)))
-        .when(!active, |s| {
-            s.text_color(rgb(MUTED))
-                .hover(|s| s.text_color(rgb(TEXT_2)))
-        })
-        .child(label.into())
+/// Ease-out curve for panel slides: quick start, soft landing.
+pub fn ease_out(t: f32) -> f32 {
+    1. - (1. - t.clamp(0., 1.)).powi(3)
 }
 
-pub fn segmented() -> Div {
+/// A thin grab strip on the left edge of a panel. Dragging it starts a drag
+/// carrying `value`; the owner resizes on `DragMoveEvent`s of that type.
+pub fn resize_handle<T: Clone + Render>(id: &'static str, value: T) -> Stateful<Div> {
     div()
+        .id(id)
+        .group(id)
+        .absolute()
+        .occlude()
+        .top_0()
+        .bottom_0()
+        .w(px(7.))
         .flex()
-        .items_center()
-        .gap_0p5()
-        .p_0p5()
-        .rounded_md()
-        .bg(rgb(SURFACE))
-        .border_1()
-        .border_color(rgb(BORDER))
+        .justify_center()
+        .cursor_col_resize()
+        .child(
+            div()
+                .w(px(2.))
+                .h_full()
+                .bg(rgb(0x4a4a4a))
+                .opacity(0.)
+                .group_hover(id, |s| s.opacity(1.)),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_drag(value, |value, _, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| value.clone())
+        })
 }
 
 /// Applies the Vyber palette to the component library (inputs, menus,
@@ -199,7 +204,7 @@ const HIGHLIGHT: &str = r##"{
     "editor.active_line_number": "#a3a3a3",
     "editor.invisible": "#3a3a3a",
     "conflict": "#e4676b",
-    "created": "#73c991",
+    "created": "#40c977",
     "created.background": "#12261c",
     "deleted.background": "#2a1417",
     "error.background": "#2a1417",
@@ -210,7 +215,7 @@ const HIGHLIGHT: &str = r##"{
     "hint.border": "#2a2f3a",
     "info.background": "#10223a",
     "info.border": "#3b82f6",
-    "modified": "#e2c08d",
+    "modified": "#ff8549",
     "modified.background": "#2a2213",
     "predictive": "#5c5c5c",
     "success.background": "#12261c",

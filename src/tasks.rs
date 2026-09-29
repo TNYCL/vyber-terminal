@@ -16,12 +16,18 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// Every observed task carries this caveat; other warnings are worth showing.
+pub const BASELINE_NOTE: &str = "Observed baseline; early writes and manual edits may be included.";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskReview {
     pub id: String,
     pub agent: String,
     pub label: String,
     pub root: PathBuf,
+    /// Agent session the turn belongs to, so its terminal can be found again.
+    #[serde(default)]
+    pub session: String,
     pub before: Option<Checkpoint>,
     pub after: Option<Checkpoint>,
     pub changes: Vec<Change>,
@@ -33,6 +39,7 @@ pub enum Boundary {
     Start {
         id: String,
         agent: String,
+        session: String,
         root: PathBuf,
         label: String,
     },
@@ -113,6 +120,7 @@ impl Parser {
                     events.push(Boundary::Start {
                         id,
                         agent: "Codex".into(),
+                        session: self.session.clone(),
                         root: self.root.clone(),
                         label: String::new(),
                     });
@@ -174,6 +182,7 @@ impl Parser {
                         events.push(Boundary::Start {
                             id,
                             agent: "Claude".into(),
+                            session: self.session.clone(),
                             root: self.root.clone(),
                             label: label(&text_content(content)),
                         });
@@ -397,6 +406,7 @@ impl Monitor {
                         Boundary::Start {
                             id,
                             agent,
+                            session,
                             root,
                             label,
                         } => {
@@ -418,7 +428,7 @@ impl Monitor {
                             let before = Checkpoint::capture(&root, &format!("{agent} task start"));
                             let warning = match &before {
                                 Ok(_) => format!(
-                                    "Observed baseline; early writes and manual edits may be included.{}",
+                                    "{BASELINE_NOTE}{}",
                                     if overlaps {
                                         " Concurrent task: changes may overlap."
                                     } else {
@@ -437,6 +447,7 @@ impl Monitor {
                                 agent,
                                 label,
                                 root,
+                                session,
                                 before: before.ok(),
                                 after: None,
                                 changes: vec![],

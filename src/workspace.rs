@@ -120,8 +120,13 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
 /// name order. Comparing whole path strings would put `foo-bar` and `foo.rs`
 /// between `foo/` and its children because `-` and `.` sort before `/`.
 pub fn tree_order(a: &FileEntry, b: &FileEntry) -> std::cmp::Ordering {
-    let mut left = a.relative.split('/');
-    let mut right = b.relative.split('/');
+    path_order(&a.relative, a.directory, &b.relative, b.directory)
+}
+
+/// [`tree_order`] for bare relative paths.
+pub fn path_order(a: &str, a_directory: bool, b: &str, b_directory: bool) -> std::cmp::Ordering {
+    let mut left = a.split('/');
+    let mut right = b.split('/');
     loop {
         match (left.next(), right.next()) {
             (None, None) => return std::cmp::Ordering::Equal,
@@ -130,8 +135,8 @@ pub fn tree_order(a: &FileEntry, b: &FileEntry) -> std::cmp::Ordering {
             (Some(x), Some(y)) if x == y => continue,
             (Some(x), Some(y)) => {
                 // A segment followed by more segments is a folder on this path.
-                let x_dir = left.clone().next().is_some() || a.directory;
-                let y_dir = right.clone().next().is_some() || b.directory;
+                let x_dir = left.clone().next().is_some() || a_directory;
+                let y_dir = right.clone().next().is_some() || b_directory;
                 return y_dir.cmp(&x_dir).then_with(|| natural_cmp(x, y));
             }
         }
@@ -179,6 +184,11 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 pub struct Change {
     pub path: String,
     pub status: String,
+    /// Added and removed lines; zero for binary files and Git status entries.
+    #[serde(default)]
+    pub additions: usize,
+    #[serde(default)]
+    pub deletions: usize,
 }
 impl Change {
     /// One-letter summary of a Git status (`M`, `A`, `D`, `U` untracked, `!` conflict).
@@ -226,6 +236,7 @@ pub fn status(root: &Path) -> Result<Vec<Change>> {
             result.push(Change {
                 path: path.into(),
                 status: status.clone(),
+                ..Default::default()
             });
         }
         if status.contains('R') || status.contains('C') {
@@ -235,81 +246,22 @@ pub fn status(root: &Path) -> Result<Vec<Change>> {
     Ok(result)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffScope {
-    All,
-    Unstaged,
-    Staged,
-}
-impl DiffScope {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::All => "All changes",
-            Self::Unstaged => "Unstaged",
-            Self::Staged => "Staged",
-        }
-    }
-}
-
-fn git_path(root: &Path, path: &str) -> Result<String> {
-    let prefix = git_text(root, &["rev-parse", "--show-prefix"])?;
-    Ok(format!("{prefix}{path}"))
-}
-pub fn before_content(root: &Path, path: &str, scope: DiffScope) -> Result<Option<Vec<u8>>> {
-    let path = git_path(root, path)?;
-    let repository = repository_root(root).context("Not a Git workspace")?;
-    let root = repository.as_path();
-    let spec = if scope == DiffScope::Unstaged {
-        format!(":{path}")
-    } else {
-        format!("HEAD:{path}")
-    };
-    let out = git(root, &["show", &spec])?;
-    if out.status.success() {
-        Ok(Some(out.stdout))
-    } else {
-        let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
-        if scope != DiffScope::Unstaged && !head.status.success() {
-            return Ok(None);
-        }
-        let list = if scope == DiffScope::Unstaged {
-            git(root, &["ls-files", "--stage", "-z", "--", &path])?
-        } else {
-            git(root, &["ls-tree", "-z", "HEAD", "--", &path])?
-        };
-        if list.status.success() && list.stdout.is_empty() {
-            Ok(None)
-        } else {
-            bail!(
-                "Cannot read Git base: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        }
-    }
-}
-pub fn after_content(root: &Path, path: &str, scope: DiffScope) -> Result<Option<Vec<u8>>> {
-    if scope == DiffScope::Staged {
-        before_content(root, path, DiffScope::Unstaged)
-    } else {
-        read_optional(&root.join(path))
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DiffLine {
     pub old: Option<usize>,
     pub new: Option<usize>,
     pub text: String,
     pub kind: char,
+    /// Syntax colors as byte ranges of `text`, sorted and non-overlapping.
+    pub spans: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
 }
 
 pub fn diff_lines_context(old: &[u8], new: &[u8], context: usize) -> Vec<DiffLine> {
     if old.contains(&0) || new.contains(&0) {
         return vec![DiffLine {
-            old: None,
-            new: None,
             text: "Binary file changed".into(),
             kind: ' ',
+            ..Default::default()
         }];
     }
     let old = String::from_utf8_lossy(old);
@@ -321,10 +273,9 @@ pub fn diff_lines_context(old: &[u8], new: &[u8], context: usize) -> Vec<DiffLin
     for (group_ix, group) in diff.grouped_ops(context).iter().enumerate() {
         if group_ix > 0 {
             result.push(DiffLine {
-                old: None,
-                new: None,
                 text: "··· unchanged lines ···".into(),
                 kind: '@',
+                ..Default::default()
             });
         }
         for op in group {
@@ -338,6 +289,7 @@ pub fn diff_lines_context(old: &[u8], new: &[u8], context: usize) -> Vec<DiffLin
                         similar::ChangeTag::Insert => '+',
                         _ => ' ',
                     },
+                    spans: Vec::new(),
                 });
             }
         }
@@ -345,38 +297,30 @@ pub fn diff_lines_context(old: &[u8], new: &[u8], context: usize) -> Vec<DiffLin
     result
 }
 
-pub fn paired_lines(lines: &[DiffLine]) -> Vec<(Option<DiffLine>, Option<DiffLine>)> {
-    let mut rows = vec![];
-    let mut i = 0;
-    while i < lines.len() {
-        match lines[i].kind {
-            '-' => {
-                let begin = i;
-                while i < lines.len() && lines[i].kind == '-' {
-                    i += 1;
-                }
-                let middle = i;
-                while i < lines.len() && lines[i].kind == '+' {
-                    i += 1;
-                }
-                for n in 0..(middle - begin).max(i - middle) {
-                    rows.push((
-                        lines.get(begin + n).filter(|_| begin + n < middle).cloned(),
-                        lines.get(middle + n).filter(|_| middle + n < i).cloned(),
-                    ));
-                }
-            }
-            '+' => {
-                rows.push((None, Some(lines[i].clone())));
-                i += 1;
-            }
-            _ => {
-                rows.push((Some(lines[i].clone()), Some(lines[i].clone())));
-                i += 1;
-            }
-        }
+/// Parses `git diff --numstat -z --no-renames` into path → (added, removed).
+/// Binary files report `-` and count as zero.
+pub fn parse_numstat(output: &[u8]) -> std::collections::HashMap<String, (usize, usize)> {
+    output
+        .split(|b| *b == 0)
+        .filter_map(|record| {
+            let text = String::from_utf8_lossy(record);
+            let mut parts = text.splitn(3, '\t');
+            let added = parts.next()?.trim().parse().unwrap_or(0);
+            let removed = parts.next()?.parse().unwrap_or(0);
+            let path = parts.next().filter(|p| !p.is_empty())?;
+            Some((path.to_owned(), (added, removed)))
+        })
+        .collect()
+}
+
+/// Line count as Git reports it for a new file: a last line without a
+/// newline still counts. Binary content has no lines.
+pub fn count_lines(bytes: &[u8]) -> usize {
+    if bytes.contains(&0) {
+        return 0;
     }
-    rows
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n'))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -551,13 +495,37 @@ impl Checkpoint {
             .split(|b| *b == 0)
             .filter(|p| !p.is_empty())
             .collect();
+        let stats = self
+            .git(&[
+                "diff",
+                "--numstat",
+                "--no-renames",
+                "-z",
+                &self.tree,
+                &after.tree,
+            ])
+            .map(|out| parse_numstat(&out.stdout))
+            .unwrap_or_default();
         Ok(parts
             .chunks_exact(2)
-            .map(|p| Change {
-                status: String::from_utf8_lossy(p[0]).into(),
-                path: String::from_utf8_lossy(p[1]).into(),
+            .map(|p| {
+                let path: String = String::from_utf8_lossy(p[1]).into();
+                let (additions, deletions) = stats.get(&path).copied().unwrap_or_default();
+                Change {
+                    status: String::from_utf8_lossy(p[0]).into(),
+                    path,
+                    additions,
+                    deletions,
+                }
             })
             .collect())
+    }
+    /// Environment that lets plain `git` commands read this snapshot's objects.
+    pub fn object_env(&self) -> [(&'static str, PathBuf); 2] {
+        [
+            ("GIT_OBJECT_DIRECTORY", self.objects.clone()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.alternates.clone()),
+        ]
     }
     pub fn checked_content(&self, path: &str) -> Result<Option<Vec<u8>>> {
         safe_path(&self.root, path)?;
@@ -629,6 +597,22 @@ impl Checkpoint {
         }
         Ok(())
     }
+}
+
+/// Keeps a copy of a file's current bytes under `recovery/` before Vyber
+/// overwrites or deletes it.
+pub fn keep_recovery(path: &Path, bytes: Option<&[u8]>) -> Result<()> {
+    let recovery = data_dir().join("recovery").join(format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&recovery)?;
+    fs::write(recovery.join("path.txt"), path.to_string_lossy().as_bytes())?;
+    if let Some(bytes) = bytes {
+        fs::write(recovery.join("content"), bytes)?;
+    }
+    Ok(())
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -807,8 +791,8 @@ mod tests {
     fn status_letters() {
         let letter = |s: &str| {
             Change {
-                path: String::new(),
                 status: s.into(),
+                ..Default::default()
             }
             .letter()
         };
@@ -831,16 +815,17 @@ mod tests {
         fs::write(root.join("sub/file.txt"), "working\n")?;
         let sub = root.join("sub");
         assert_eq!(status(&sub)?[0].path, "file.txt");
-        assert_eq!(
-            before_content(&sub, "file.txt", DiffScope::Unstaged)?,
-            Some(b"staged\n".to_vec())
-        );
-        assert_eq!(
-            after_content(&sub, "file.txt", DiffScope::Unstaged)?,
-            Some(b"working\n".to_vec())
-        );
-        assert_eq!(before_content(&sub, "new.txt", DiffScope::Unstaged)?, None);
         Ok(())
+    }
+    #[test]
+    fn numstat_and_line_counts() {
+        let stats = parse_numstat(b"3\t1\tsrc/a.rs\0-\t-\timage.png\0");
+        assert_eq!(stats["src/a.rs"], (3, 1));
+        assert_eq!(stats["image.png"], (0, 0));
+        assert_eq!(count_lines(b"a\nb"), 2);
+        assert_eq!(count_lines(b"a\nb\n"), 2);
+        assert_eq!(count_lines(b""), 0);
+        assert_eq!(count_lines(b"a\0b\n"), 0);
     }
     #[test]
     fn checked_save_preserves_bytes_and_rejects_external_change() -> Result<()> {

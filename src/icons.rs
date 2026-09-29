@@ -31,14 +31,14 @@ static ICONS: &[(&str, &[u8])] = embed![
     "ui/app-window.svg", "ui/arrow-down.svg", "ui/arrow-up.svg", "ui/book-open.svg",
     "ui/check.svg", "ui/chevron-down.svg", "ui/chevron-right.svg", "ui/chevron-up.svg",
     "ui/chevrons-up-down.svg", "ui/circle-check.svg", "ui/circle-dot.svg", "ui/code.svg",
-    "ui/columns-2.svg", "ui/copy.svg", "ui/external-link.svg", "ui/eye.svg",
+    "ui/columns-2.svg", "ui/copy.svg", "ui/ellipsis.svg", "ui/external-link.svg", "ui/eye.svg",
     "ui/file-diff.svg", "ui/file-text.svg", "ui/file-x.svg", "ui/file.svg", "ui/files.svg",
     "ui/flag.svg", "ui/fold-vertical.svg", "ui/folder-git-2.svg", "ui/folder-open.svg",
     "ui/folder-search.svg", "ui/folder.svg", "ui/git-branch.svg", "ui/git-compare.svg",
     "ui/image.svg", "ui/maximize-2.svg", "ui/minimize-2.svg", "ui/panel-right-close.svg", "ui/panel-right.svg",
     "ui/pin-off.svg", "ui/pin.svg", "ui/plus.svg", "ui/refresh-cw.svg", "ui/rotate-ccw.svg",
     "ui/rows-2.svg", "ui/save.svg", "ui/scan.svg", "ui/search.svg", "ui/text-search.svg",
-    "ui/triangle-alert.svg", "ui/unfold-vertical.svg", "ui/x.svg", "ui/zoom-in.svg",
+    "ui/triangle-alert.svg", "ui/unfold-vertical.svg", "ui/wrap-text.svg", "ui/x.svg", "ui/zoom-in.svg",
     "ui/zoom-out.svg",
 ];
 
@@ -77,7 +77,7 @@ const RED: u32 = 0xe0525a;
 const PINK: u32 = 0xf55385;
 const PURPLE: u32 = 0xa888d8;
 const GREY: u32 = 0x8a959a;
-const RUST: u32 = 0xdea584;
+const RUST: u32 = 0xffa359;
 const GIT: u32 = 0xe8643c;
 const MARKDOWN: u32 = 0x6cc07a;
 

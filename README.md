@@ -34,8 +34,9 @@
 
 **Files and previews**
 
-- A file panel that opens over the active terminal without resizing it. Every terminal keeps its
-  own tree, open files and preview.
+- A file panel that slides in over the active terminal without resizing it. Every terminal keeps
+  its own tree, open files and preview. Drag the panel's left edge to resize it, drag or toggle the
+  sidebar the same way; sizes are remembered.
 - Workspace tree with Git status colors, fuzzy file filtering and content search via
   [ripgrep](https://github.com/BurntSushi/ripgrep). Nested Git repositories can be picked as the tree root.
 - Built-in editor with syntax highlighting for Rust, Go, TypeScript/TSX, JavaScript, Python, JSON,
@@ -46,10 +47,18 @@
 
 **Review**
 
-- **Changes** — working tree vs. HEAD, working tree vs. index, and index vs. HEAD, in split or unified
-  diff view. Reverting only touches the working tree; your index is left alone.
-- **Tasks** — reads the local Claude Code / Codex session logs (read-only) to find where an agent task
-  started and ended, and shows exactly what changed in between. Manual checkpoints work with any command.
+- **Turn badge** — while Claude Code or Codex works in a terminal, a small `6 files changed +551 −3`
+  badge sits just above its input box and updates live. Vyber draws it on top of the terminal: the
+  agent never sees it and the terminal size doesn't change. Click it to review that turn.
+- **One scrolling diff** — every changed file in a single list with syntax highlighting, unchanged
+  runs folded into "N unmodified lines", split or unified view, line wrapping and find. The changed
+  files tree beside it shows added, modified and deleted files and jumps to each one.
+- **Sources** — the last agent turn (or an earlier one), uncommitted, unstaged or staged changes, any
+  recent commit, or the whole branch against its merge base with the default branch.
+- **Revert** a hunk, a file or everything a turn changed; staged and committed views are read-only.
+  **Comment** on a line to type `path:line — note` into the terminal's input without sending it.
+- Agent turns come from the local Claude Code / Codex session logs (read-only), which mark where a turn
+  started and ended. Manual checkpoints work with any command.
 - Snapshots live in a separate object store in Vyber's data directory: your index, refs, stash and
   `.git/objects` are never touched. Files changed after a snapshot are never overwritten silently; a
   recovery copy is kept first.
@@ -123,8 +132,11 @@ directory on macOS.
   view may stay empty until updated. Manual checkpoints always work.
 - Text preview is limited to 8 MB and file loading to 32 MB; this is not a streaming editor for huge files.
 - The checkpoint object store is not compacted automatically yet, so keep an eye on its size.
-- Panel widths are not restored between launches.
-- No PDF or web preview, no LSP, and no hunk-level revert yet.
+- Vyber doesn't inspect processes, so it links an agent session to the terminal in that folder where
+  Enter was pressed last when the session's first turn starts. Two agents started in the same folder
+  at the same moment can be mixed up, and their changes overlap in the review.
+- Reviews and the turn badge need a Git repository.
+- No PDF or web preview and no LSP.
 
 ## License
 
