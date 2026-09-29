@@ -145,6 +145,8 @@ pub(super) struct ReviewState {
     tree_scroll: UniformListScrollHandle,
     /// A file to scroll to once it is listed.
     pub(super) reveal_path: Option<String>,
+    /// Counts loads that start over, so the new content fades in.
+    shown: u64,
 }
 
 impl ReviewState {
@@ -225,6 +227,7 @@ impl ReviewState {
             confirm_revert: None,
             tree_scroll: UniformListScrollHandle::new(),
             reveal_path: None,
+            shown: 0,
         };
         (state, subscriptions)
     }
@@ -415,6 +418,7 @@ impl Browser {
         self.review.reload_at = None;
         self.review.reload_first = None;
         if fresh {
+            self.review.shown += 1;
             self.review.files = Rc::new(vec![]);
             self.review.rows = Rc::new(vec![]);
             self.review.list.reset(0);
@@ -803,6 +807,15 @@ impl Browser {
         cx.notify();
     }
 
+    /// Opens the diff's find bar with the caret in it.
+    pub(super) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.review.find_open = true;
+        self.review
+            .find
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
     // ---- Comments -------------------------------------------------------------
 
     fn open_comment(&mut self, file: usize, line: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1069,6 +1082,8 @@ impl Browser {
                         label: format!("Since checkpoint · {}", before.created),
                         root,
                         session: String::new(),
+                        client: String::new(),
+                        started: 0,
                         before: Some(before),
                         after: Some(after),
                         changes,
@@ -1153,7 +1168,7 @@ impl Browser {
         let find = review.find.clone();
         let source_open = self.menu == Some(Menu::Source);
         div()
-            .h(px(46.))
+            .h(rpx(46.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -1169,21 +1184,21 @@ impl Browser {
                     .flex_shrink_0()
                     .items_center()
                     .gap_1p5()
-                    .h(px(28.))
+                    .h(rpx(28.))
                     .pl_3()
                     .pr_2()
                     .rounded_full()
                     .bg(rgb(if source_open { SELECTED } else { SURFACE }))
                     .border_1()
                     .border_color(rgb(BORDER))
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(TEXT))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(SELECTED)))
                     .when(active, |s| {
                         s.child(
                             div()
-                                .size(px(6.))
+                                .size(rpx(6.))
                                 .rounded_full()
                                 .bg(rgb(TEXT_2))
                                 .with_animation(
@@ -1207,14 +1222,14 @@ impl Browser {
                 s.child(
                     div()
                         .flex_shrink_0()
-                        .text_size(px(12.5))
+                        .text_size(rpx(12.5))
                         .text_color(rgb(ADDED))
                         .child(format!("+{additions}")),
                 )
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_size(px(12.5))
+                        .text_size(rpx(12.5))
                         .text_color(rgb(DELETED))
                         .child(format!("−{deletions}")),
                 )
@@ -1224,7 +1239,7 @@ impl Browser {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(rpx(12.))
                     .text_color(rgb(MUTED))
                     .child(detail),
             )
@@ -1235,8 +1250,8 @@ impl Browser {
                         .flex_shrink_0()
                         .items_center()
                         .gap_1p5()
-                        .w(px(230.))
-                        .h(px(28.))
+                        .w(rpx(230.))
+                        .h(rpx(28.))
                         .pl_2()
                         .pr_2()
                         .rounded_md()
@@ -1248,12 +1263,12 @@ impl Browser {
                                 Input::new(&find)
                                     .small()
                                     .appearance(false)
-                                    .text_size(px(12.5)),
+                                    .text_size(rpx(12.5)),
                             ),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(rpx(11.))
                                 .text_color(rgb(MUTED))
                                 .child(find_count),
                         ),
@@ -1279,14 +1294,12 @@ impl Browser {
                             })),
                     )
                     .child(
-                        tool("review-find", "text-search", "Find in diff", find_open).on_click(
+                        tool("review-find", "text-search", "Find in diff  (Ctrl+F)", find_open).on_click(
                             cx.listener(|this, _, window, cx| {
-                                this.review.find_open = !this.review.find_open;
-                                if this.review.find_open {
-                                    this.review
-                                        .find
-                                        .update(cx, |input, cx| input.focus(window, cx));
+                                if !this.review.find_open {
+                                    this.open_find(window, cx);
                                 } else {
+                                    this.review.find_open = false;
                                     this.review
                                         .find
                                         .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1377,12 +1390,12 @@ impl Browser {
                 .flex_shrink_0()
                 .items_center()
                 .gap_2()
-                .h(px(30.))
+                .h(rpx(30.))
                 .px_3()
                 .border_b_1()
                 .border_color(rgb(DIVIDER))
                 .when(color == WARNING, |s| s.bg(rgb(WARNING_BG)))
-                .text_size(px(11.5))
+                .text_size(rpx(11.5))
                 .text_color(rgb(color))
                 .child(icon(
                     ui(if color == WARNING { "triangle-alert" } else { "circle-dot" }),
@@ -1445,6 +1458,12 @@ impl Browser {
             self.review_list(cx)
         };
         let card = self.commit_card(cx);
+        let fade = self.review.shown * 2 + u64::from(!self.review.rows.is_empty());
+        let body = div().size_full().child(body).with_animation(
+            ("review-body", fade),
+            Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(0.25 + 0.75 * t),
+        );
         div()
             .relative()
             .flex()
@@ -1454,8 +1473,12 @@ impl Browser {
             .children(banner)
             .children(card)
             .child(div().flex_1().min_h_0().child(body))
-            .when(self.menu == Some(Menu::Source), |s| s.child(self.source_menu(cx)))
-            .when(self.menu == Some(Menu::More), |s| s.child(self.more_menu(cx)))
+            .when(self.menu == Some(Menu::Source), |s| {
+                s.child(menu_in("review-source-in", self.source_menu(cx).into_any_element()))
+            })
+            .when(self.menu == Some(Menu::More), |s| {
+                s.child(menu_in("review-more-in", self.more_menu(cx).into_any_element()))
+            })
             .into_any_element()
     }
 
@@ -1503,7 +1526,7 @@ impl Browser {
         let last_checked = follow && latest.as_ref().is_some_and(|t| is(&Source::Turn(t.id.clone())));
         // Agent turns belong to the terminal, not to a repository of the Git view.
         let turns = !self.review.git;
-        let mut menu = menu_panel("review-source-menu").w(px(250.));
+        let mut menu = menu_panel("review-source-menu").w(rpx(250.));
         if turns {
         menu = menu.child(
             menu_item(
@@ -1593,16 +1616,16 @@ impl Browser {
             4. + 90. + 9.
         };
         let submenu = match self.review.submenu {
-            Some(Submenu::Turns) => Some(div().mt(px(turns_row)).child(self.turns_menu(cx))),
-            Some(Submenu::Commits) => Some(div().mt(px(commits_row)).child(self.commits_menu(cx))),
+            Some(Submenu::Turns) => Some(div().mt(rpx(turns_row)).child(self.turns_menu(cx))),
+            Some(Submenu::Commits) => Some(div().mt(rpx(commits_row)).child(self.commits_menu(cx))),
             None => None,
         };
         div()
             .id("review-source-menus")
             .absolute()
             .occlude()
-            .top(px(42.))
-            .left(px(10.))
+            .top(rpx(42.))
+            .left(rpx(10.))
             .flex()
             .items_start()
             .gap_1()
@@ -1650,8 +1673,8 @@ impl Browser {
             })
             .collect::<Vec<_>>();
         menu_panel("review-turns-menu")
-            .w(px(330.))
-            .max_h(px(420.))
+            .w(rpx(330.))
+            .max_h(rpx(420.))
             .overflow_y_scroll()
             .children(items)
     }
@@ -1693,8 +1716,8 @@ impl Browser {
                 .collect(),
         };
         menu_panel("review-commits-menu")
-            .w(px(330.))
-            .max_h(px(420.))
+            .w(rpx(330.))
+            .max_h(rpx(420.))
             .overflow_y_scroll()
             .children(body)
     }
@@ -1718,11 +1741,11 @@ impl Browser {
             .id("review-more-menus")
             .absolute()
             .occlude()
-            .top(px(42.))
-            .right(px(10.))
+            .top(rpx(42.))
+            .right(rpx(10.))
             .child(
                 menu_panel("review-more-menu")
-                    .w(px(250.))
+                    .w(rpx(250.))
                     .child(
                         menu_item("more-copy", "Copy as patch", None, false, count > 0, false)
                             .on_click(cx.listener(|this, _, _, cx| this.copy_patch(cx))),
@@ -1804,7 +1827,7 @@ impl Browser {
                         .flex()
                         .items_center()
                         .gap_1p5()
-                        .h(px(30.))
+                        .h(rpx(30.))
                         .pl_2p5()
                         .pr_1()
                         .rounded_lg()
@@ -1817,7 +1840,7 @@ impl Browser {
                                     .small()
                                     .appearance(false)
                                     .cleanable(true)
-                                    .text_size(px(12.5)),
+                                    .text_size(rpx(12.5)),
                             ),
                         ),
                 ),
@@ -2001,7 +2024,7 @@ fn render_row(ix: usize, context: &RowContext) -> AnyElement {
         Row::Line { file, line } => line_row(ix, file, line, context),
         Row::Pair { file, old, new } => pair_row(ix, file, old, new, context),
         Row::Comment { .. } => comment_row(context),
-        Row::Spacer(_) => div().h(px(SPACER_H)).into_any_element(),
+        Row::Spacer(_) => div().h(rpx(SPACER_H)).into_any_element(),
     }
 }
 
@@ -2022,7 +2045,7 @@ fn header_row(ix: usize, index: usize, context: &RowContext) -> AnyElement {
     let revert = context.entity.clone();
     div()
         .id(("review-header", ix))
-        .h(px(HEADER_H))
+        .h(rpx(HEADER_H))
         .w_full()
         .flex()
         .items_center()
@@ -2033,7 +2056,7 @@ fn header_row(ix: usize, index: usize, context: &RowContext) -> AnyElement {
         .border_t_1()
         .border_b_1()
         .border_color(rgb(DIVIDER))
-        .text_size(px(12.5))
+        .text_size(rpx(12.5))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0x101010)))
         .child(icon(
@@ -2135,12 +2158,12 @@ fn note_row(file: &ReviewFile) -> AnyElement {
             .unwrap_or_else(|| "No content changes".into()),
     };
     div()
-        .h(px(NOTE_H))
+        .h(rpx(NOTE_H))
         .w_full()
         .flex()
         .items_center()
-        .pl(px(GUTTER + 19.))
-        .text_size(px(12.))
+        .pl(rpx(GUTTER + 19.))
+        .text_size(rpx(12.))
         .text_color(rgb(MUTED))
         .child(text)
         .into_any_element()
@@ -2151,10 +2174,10 @@ fn gap_row(ix: usize, file: usize, start: usize, end: usize, context: &RowContex
     let entity = context.entity.clone();
     div()
         .id(("review-gap", ix))
-        .h(px(GAP_H))
+        .h(rpx(GAP_H))
         .w_full()
         .px_2()
-        .py(px(3.))
+        .py(rpx(3.))
         .child(
             div()
                 .size_full()
@@ -2164,7 +2187,7 @@ fn gap_row(ix: usize, file: usize, start: usize, end: usize, context: &RowContex
                 .px_3()
                 .rounded_md()
                 .bg(rgb(0x1c1c1c))
-                .text_size(px(11.5))
+                .text_size(rpx(11.5))
                 .text_color(rgb(TEXT_2))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(0x242424)).text_color(rgb(TEXT)))
@@ -2194,19 +2217,19 @@ fn line_lead(kind: char, number: Option<usize>) -> [Div; 3] {
     let accent = if kind == '+' { ADDED } else { DELETED };
     [
         div()
-            .w(px(3.))
+            .w(rpx(3.))
             .flex_shrink_0()
             .when(changed, |s| s.bg(rgb(accent))),
         div()
-            .w(px(GUTTER - 3.))
+            .w(rpx(GUTTER - 3.))
             .flex_shrink_0()
             .pr_2()
             .text_right()
-            .text_size(px(11.))
+            .text_size(rpx(11.))
             .text_color(rgb(if changed { 0x7a7a7a } else { 0x4a4a4a }))
             .child(number.map(|n| n.to_string()).unwrap_or_default()),
         div()
-            .w(px(16.))
+            .w(rpx(16.))
             .flex_shrink_0()
             .text_color(rgb(accent))
             .child(match kind {
@@ -2288,11 +2311,11 @@ fn row_frame(id: (&'static str, usize), wrap: bool) -> Stateful<Div> {
         .relative()
         .w_full()
         .flex()
-        .when(!wrap, |s| s.h(px(LINE_H)))
-        .when(wrap, |s| s.min_h(px(LINE_H)))
+        .when(!wrap, |s| s.h(rpx(LINE_H)))
+        .when(wrap, |s| s.min_h(rpx(LINE_H)))
         .font_family(mono_font())
-        .text_size(px(12.))
-        .line_height(px(LINE_H))
+        .text_size(rpx(12.))
+        .line_height(rpx(LINE_H))
 }
 
 /// The hover button that opens a comment on a line.
@@ -2301,13 +2324,13 @@ fn comment_button(ix: usize, file: usize, line: usize, context: &RowContext) -> 
     div()
         .id(("review-comment", ix))
         .absolute()
-        .left(px(5.))
-        .top(px(2.))
-        .size(px(16.))
+        .left(rpx(5.))
+        .top(rpx(2.))
+        .size(rpx(16.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded(rpx(4.))
         .bg(rgb(0xe6e6e6))
         .opacity(0.)
         .group_hover("review-line", |s| s.opacity(1.))
@@ -2329,18 +2352,18 @@ fn hunk_action(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(18.))
+        .h(rpx(18.))
         .px_1p5()
         .flex()
         .items_center()
         .gap_1()
-        .rounded(px(4.))
+        .rounded(rpx(4.))
         .bg(rgb(0x262626))
         .border_1()
         .border_color(rgb(0x3a3a3a))
         .font_family(ui_font())
-        .text_size(px(11.))
-        .line_height(px(16.))
+        .text_size(rpx(11.))
+        .line_height(rpx(16.))
         .text_color(rgb(TEXT_2))
         .hover(|s| s.bg(rgb(0x303030)).text_color(rgb(TEXT)))
         .cursor_pointer()
@@ -2371,7 +2394,7 @@ fn hunk_button(ix: usize, file: usize, line: usize, context: &RowContext) -> Opt
     Some(
         div()
             .absolute()
-            .right(px(10.))
+            .right(rpx(10.))
             .top(px(1.))
             .flex()
             .gap_1()
@@ -2477,12 +2500,12 @@ fn comment_row(context: &RowContext) -> AnyElement {
     let cancel = context.entity.clone();
     let add = context.entity.clone();
     div()
-        .h(px(COMMENT_H))
+        .h(rpx(COMMENT_H))
         .w_full()
         .flex()
         .items_center()
         .gap_2()
-        .pl(px(GUTTER + 19.))
+        .pl(rpx(GUTTER + 19.))
         .pr_3()
         .bg(rgb(0x111111))
         .border_y_1()
@@ -2492,7 +2515,7 @@ fn comment_row(context: &RowContext) -> AnyElement {
             div()
                 .flex_1()
                 .min_w_0()
-                .h(px(30.))
+                .h(rpx(30.))
                 .px_2()
                 .flex()
                 .items_center()
@@ -2505,7 +2528,7 @@ fn comment_row(context: &RowContext) -> AnyElement {
                         Input::new(&context.comment_input)
                             .small()
                             .appearance(false)
-                            .text_size(px(12.5)),
+                            .text_size(rpx(12.5)),
                     ),
                 ),
         )
@@ -2557,18 +2580,18 @@ fn tree_row(
             let key = key.clone();
             div()
                 .id(("review-tree-row", i))
-                .h(px(TREE_ROW))
+                .h(rpx(TREE_ROW))
                 .px_1()
                 .child(
                     div()
                         .size_full()
                         .flex()
                         .items_center()
-                        .gap(px(6.))
-                        .pl(px(6. + *depth as f32 * 12.))
+                        .gap(rpx(6.))
+                        .pl(rpx(6. + *depth as f32 * 12.))
                         .pr_2()
                         .rounded_md()
-                        .text_size(px(12.5))
+                        .text_size(rpx(12.5))
                         .text_color(rgb(0xdedede))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(HOVER)))
@@ -2581,8 +2604,8 @@ fn tree_row(
                         // A folder's dot is its files' state, dimmed like Codex.
                         .child(
                             div()
-                                .size(px(6.))
-                                .mr(px(4.))
+                                .size(rpx(6.))
+                                .mr(rpx(4.))
                                 .rounded_full()
                                 .bg(rgb(*color))
                                 .opacity(0.55),
@@ -2608,18 +2631,18 @@ fn tree_row(
             let deleted = change.letter == 'D';
             div()
                 .id(("review-tree-row", i))
-                .h(px(TREE_ROW))
+                .h(rpx(TREE_ROW))
                 .px_1()
                 .child(
                     div()
                         .size_full()
                         .flex()
                         .items_center()
-                        .gap(px(6.))
-                        .pl(px(6. + *depth as f32 * 12. + 20.))
+                        .gap(rpx(6.))
+                        .pl(rpx(6. + *depth as f32 * 12. + 20.))
                         .pr_2()
                         .rounded_md()
-                        .text_size(px(12.5))
+                        .text_size(rpx(12.5))
                         .text_color(rgb(if deleted {
                             MUTED
                         } else if active {
@@ -2662,23 +2685,23 @@ fn status_badge(letter: char) -> Div {
     let bar = |left: f32, top: f32, width: f32, height: f32| {
         div()
             .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(width))
-            .h(px(height))
+            .left(rpx(left))
+            .top(rpx(top))
+            .w(rpx(width))
+            .h(rpx(height))
             .rounded(px(0.5))
             .bg(rgb(color))
     };
-    let field = div().relative().size(px(12.));
+    let field = div().relative().size(rpx(12.));
     let mark = match letter {
         'A' => field.child(bar(2., 5., 8., 2.)).child(bar(5., 2., 2., 8.)),
         'D' => field.child(bar(2., 5., 8., 2.)),
         _ => field.child(bar(4., 4., 4., 4.).rounded(px(1.))),
     };
     div()
-        .size(px(14.))
+        .size(rpx(14.))
         .flex_shrink_0()
-        .rounded(px(3.5))
+        .rounded(rpx(3.5))
         .border_1()
         .border_color(rgb(color))
         .child(mark)
@@ -2712,7 +2735,7 @@ fn menu_note(text: &'static str) -> AnyElement {
     div()
         .px_2()
         .py_1p5()
-        .text_size(px(12.))
+        .text_size(rpx(12.))
         .text_color(rgb(MUTED))
         .child(text)
         .into_any_element()
@@ -2731,11 +2754,11 @@ pub(super) fn menu_item(
         .flex()
         .items_center()
         .gap_2()
-        .min_h(px(30.))
+        .min_h(rpx(30.))
         .py_1()
         .px_2()
         .rounded_md()
-        .text_size(px(12.5))
+        .text_size(rpx(12.5))
         .text_color(rgb(if enabled { TEXT } else { MUTED }))
         .when(enabled, |s| s.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
         .child(
@@ -2749,7 +2772,7 @@ pub(super) fn menu_item(
                     s.child(
                         div()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(rpx(11.))
                             .text_color(rgb(MUTED))
                             .child(detail),
                     )

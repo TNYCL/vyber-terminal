@@ -4,6 +4,7 @@ mod browser;
 mod changeset;
 mod config;
 mod git;
+mod glyphs;
 mod icons;
 mod layout;
 mod notifications;
@@ -11,6 +12,7 @@ mod platform;
 mod project;
 mod project_dialog;
 mod pty;
+mod tab_state;
 mod tasks;
 mod terminal;
 mod theme;
@@ -45,10 +47,13 @@ fn main() {
         .with_assets(icons::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            cx.set_reduce_motion(config::Config::load().reduced_motion);
+            let config = config::Config::load();
+            cx.set_reduce_motion(config.reduced_motion);
+            cx.set_global(config);
             theme::apply(cx);
             app::bind_keys(cx);
             terminal::bind_keys(cx);
+            browser::bind_keys(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,

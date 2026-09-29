@@ -28,11 +28,41 @@ pub struct TaskReview {
     /// Agent session the turn belongs to, so its terminal can be found again.
     #[serde(default)]
     pub session: String,
+    /// The program that logged the session, such as `codex-tui`, `Codex
+    /// Desktop` or Claude Code's `cli`, when the log names it.
+    #[serde(default)]
+    pub client: String,
+    /// When Vyber saw the turn start, in Unix milliseconds.
+    #[serde(default)]
+    pub started: i64,
     pub before: Option<Checkpoint>,
     pub after: Option<Checkpoint>,
     pub changes: Vec<Change>,
     pub active: bool,
     pub warning: String,
+}
+impl TaskReview {
+    /// Whether the agent may run in a terminal. Codex's desktop app and the
+    /// editor extensions log their turns in the same place as the CLIs.
+    pub fn from_terminal(&self) -> bool {
+        let client = self.client.to_lowercase();
+        client.is_empty() || ["tui", "cli", "exec"].iter().any(|k| client.contains(k))
+    }
+}
+/// The process of a Claude Code session, which Claude Code names in a file
+/// of its own for every session it runs.
+pub fn claude_process(session: &str) -> Option<u32> {
+    let dir = dirs::home_dir()?.join(".claude").join("sessions");
+    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let bytes = fs::read(entry.path()).ok()?;
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        if value["sessionId"].as_str()? != session {
+            return None;
+        }
+        value["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+    })
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Boundary {
@@ -40,6 +70,7 @@ pub enum Boundary {
         id: String,
         agent: String,
         session: String,
+        client: String,
         root: PathBuf,
         label: String,
     },
@@ -55,6 +86,7 @@ pub enum Boundary {
 #[derive(Default)]
 pub struct Parser {
     session: String,
+    client: String,
     root: PathBuf,
     current: Option<String>,
     paginated: bool,
@@ -93,6 +125,7 @@ impl Parser {
                 .unwrap_or("")
                 .into();
             self.root = p["cwd"].as_str().unwrap_or("").into();
+            self.client = p["originator"].as_str().unwrap_or("").into();
             self.paginated = p["history_mode"] == "paginated";
         }
         if v["isSidechain"] == true {
@@ -103,6 +136,9 @@ impl Parser {
         }
         if let Some(id) = v["sessionId"].as_str() {
             self.session = id.into();
+        }
+        if let Some(client) = v["entrypoint"].as_str() {
+            self.client = client.into();
         }
         if kind == "event_msg" {
             let p = &v["payload"];
@@ -121,6 +157,7 @@ impl Parser {
                         id,
                         agent: "Codex".into(),
                         session: self.session.clone(),
+                        client: self.client.clone(),
                         root: self.root.clone(),
                         label: String::new(),
                     });
@@ -183,6 +220,7 @@ impl Parser {
                             id,
                             agent: "Claude".into(),
                             session: self.session.clone(),
+                            client: self.client.clone(),
                             root: self.root.clone(),
                             label: label(&text_content(content)),
                         });
@@ -362,6 +400,8 @@ impl Monitor {
             let mut discovery = Instant::now() - Duration::from_secs(10);
             let mut refresh = Instant::now();
             let mut changed = HashSet::new();
+            // Changed paths an active turn's latest snapshot has not read yet.
+            let mut unread: HashMap<String, HashSet<PathBuf>> = HashMap::new();
             let (tx, rx) = mpsc::channel();
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -407,6 +447,7 @@ impl Monitor {
                             id,
                             agent,
                             session,
+                            client,
                             root,
                             label,
                         } => {
@@ -417,7 +458,12 @@ impl Monitor {
                                 continue;
                             }
                             let mut overlaps = false;
-                            for old in reviews.values_mut().filter(|r| r.active && r.root == root) {
+                            // A turn in a folder of projects overlaps turns in each of them.
+                            for old in reviews.values_mut().filter(|r| {
+                                r.active
+                                    && (matches_root(&r.root, &root)
+                                        || matches_root(&root, &r.root))
+                            }) {
                                 overlaps = true;
                                 if !old.warning.contains("Concurrent") {
                                     old.warning
@@ -448,6 +494,8 @@ impl Monitor {
                                 label,
                                 root,
                                 session,
+                                client,
+                                started: chrono::Utc::now().timestamp_millis(),
                                 before: before.ok(),
                                 after: None,
                                 changes: vec![],
@@ -466,6 +514,7 @@ impl Monitor {
                             }
                         }
                         Boundary::End { id, interrupted } => {
+                            unread.remove(&id);
                             if let Some(r) = reviews.get_mut(&id) {
                                 capture_end(r, interrupted);
                                 let _ = sender.send(r.clone());
@@ -474,20 +523,25 @@ impl Monitor {
                     }
                 }
                 if refresh.elapsed() > Duration::from_secs(2) && !changed.is_empty() {
-                    for r in reviews
-                        .values_mut()
-                        .filter(|r| r.active && r.before.is_some())
-                    {
-                        if changed.iter().any(|p| matches_root(p, &r.root)) {
-                            if let Ok(after) = Checkpoint::capture(&r.root, "Live review") {
-                                if let Some(before) = &r.before {
-                                    if let Ok(changes) = before.changes_to(&after) {
-                                        r.changes = changes;
-                                    }
-                                }
-                                r.after = Some(after);
-                                let _ = sender.send(r.clone());
+                    for r in reviews.values_mut().filter(|r| r.active) {
+                        let Some(before) = &r.before else {
+                            continue;
+                        };
+                        let pending = unread.entry(r.id.clone()).or_default();
+                        pending
+                            .extend(changed.iter().filter(|p| matches_root(p, &r.root)).cloned());
+                        if pending.is_empty() {
+                            continue;
+                        }
+                        let latest = r.after.as_ref().unwrap_or(before);
+                        let paths: Vec<_> = pending.iter().cloned().collect();
+                        if let Ok(after) = latest.refresh("Live review", &paths) {
+                            pending.clear();
+                            if let Ok(changes) = before.changes_to(&after) {
+                                r.changes = changes;
                             }
+                            r.after = Some(after);
+                            let _ = sender.send(r.clone());
                         }
                     }
                     changed.clear();
@@ -609,5 +663,39 @@ mod tests {
                 .feed(&json!({"new_event":true}))
                 .is_empty()
         );
+    }
+    #[test]
+    fn turns_name_the_program_that_logged_them() {
+        let client = |events: Vec<Boundary>| match &events[0] {
+            Boundary::Start { client, .. } => client.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut p = Parser::default();
+        p.feed(&json!({"type":"session_meta","payload":{"id":"s","cwd":"/r","originator":"Codex Desktop"}}));
+        let start =
+            p.feed(&json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}));
+        assert_eq!(client(start), "Codex Desktop");
+        let start = Parser::default().feed(&json!({"type":"user","uuid":"u","sessionId":"s","cwd":"/r","entrypoint":"cli","message":{"content":"hi"}}));
+        assert_eq!(client(start), "cli");
+        let review = |client: &str| TaskReview {
+            id: "t".into(),
+            agent: "Codex".into(),
+            label: String::new(),
+            root: PathBuf::new(),
+            session: "s".into(),
+            client: client.into(),
+            started: 0,
+            before: None,
+            after: None,
+            changes: vec![],
+            active: true,
+            warning: String::new(),
+        };
+        for client in ["codex-tui", "codex_cli_rs", "codex_exec", "cli", ""] {
+            assert!(review(client).from_terminal(), "{client}");
+        }
+        for client in ["Codex Desktop", "codex_vscode", "claude-vscode"] {
+            assert!(!review(client).from_terminal(), "{client}");
+        }
     }
 }

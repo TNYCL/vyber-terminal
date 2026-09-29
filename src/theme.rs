@@ -37,6 +37,80 @@ pub fn ui_font() -> &'static str {
     }
 }
 
+/// The window's rem size: the component library sets it to its font size.
+pub const REM: f32 = 13.;
+
+/// `v` pixels at the window's rem size. Inside a [`rem_scope`] the length
+/// grows and shrinks with the scope's rem size; elsewhere it is plain pixels.
+pub fn rpx(v: f32) -> Rems {
+    rems(v / REM)
+}
+
+/// Lays out and paints `child` with `rem` as the rem size, so everything in it
+/// sized in rems (see [`rpx`]) scales together, like zooming a web page.
+pub fn rem_scope(rem: Pixels, child: impl IntoElement) -> RemScope {
+    RemScope {
+        rem,
+        child: child.into_any_element(),
+    }
+}
+
+pub struct RemScope {
+    rem: Pixels,
+    child: AnyElement,
+}
+impl IntoElement for RemScope {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+impl Element for RemScope {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let layout = window.with_rem_size(Some(self.rem), |window| {
+            self.child.request_layout(window, cx)
+        });
+        (layout, ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_rem_size(Some(self.rem), |window| self.child.prepaint(window, cx));
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_rem_size(Some(self.rem), |window| self.child.paint(window, cx));
+    }
+}
+
 /// Path of an interface icon embedded by [`crate::icons::Assets`].
 pub fn ui(name: &str) -> SharedString {
     format!("vyber/ui/{name}.svg").into()
@@ -45,7 +119,7 @@ pub fn ui(name: &str) -> SharedString {
 pub fn icon(path: impl Into<SharedString>, color: u32, size: f32) -> Svg {
     svg()
         .path(path)
-        .size(px(size))
+        .size(rpx(size))
         .flex_shrink_0()
         .text_color(rgb(color))
 }
@@ -65,7 +139,7 @@ pub fn icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .size(px(26.))
+        .size(rpx(26.))
         .flex_shrink_0()
         .rounded_md()
         .cursor_pointer()
@@ -86,7 +160,7 @@ pub fn chip(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(12.))
+        .text_size(rpx(12.))
         .text_color(rgb(0xc8c8c8))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
@@ -105,15 +179,24 @@ pub fn text_button(
         .items_center()
         .flex_shrink_0()
         .gap_1p5()
-        .h(px(26.))
+        .h(rpx(26.))
         .px_2()
         .rounded_md()
-        .text_size(px(12.))
+        .text_size(rpx(12.))
         .text_color(rgb(TEXT_2))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
         .when_some(leading, |s, name| s.child(icon(ui(name), TEXT_2, 14.)))
         .child(label.into())
+}
+
+/// A menu or popover fading in as it opens.
+pub fn menu_in<E: IntoElement + 'static>(id: &'static str, element: E) -> impl IntoElement {
+    div().child(element).with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(130)).with_easing(ease_out_quint()),
+        |el, t| el.opacity(t),
+    )
 }
 
 /// Ease-out curve for panel slides: quick start, soft landing.
@@ -184,7 +267,7 @@ pub fn apply(cx: &mut App) {
         theme.table_head = rgb(0x141414).into();
         theme.table_head_foreground = rgb(TEXT).into();
         theme.table_row_border = rgb(BORDER).into();
-        theme.font_size = px(13.);
+        theme.font_size = px(REM);
         theme.mono_font_size = px(13.);
         if let Ok(highlight) = serde_json::from_str(HIGHLIGHT) {
             theme.highlight_theme = Arc::new(highlight);

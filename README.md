@@ -5,7 +5,7 @@
 <h1 align="center">Vyber</h1>
 
 <p align="center">
-  A native, GPU-rendered terminal workspace with a file tree, previews and Git review.<br>
+  A native, GPU-rendered terminal workspace with a file tree, previews, Git review and source control.<br>
   Built in Rust on <a href="https://github.com/longbridge/gpui-kit">GPUI Kit</a> and the
   <a href="https://github.com/alacritty/alacritty">Alacritty</a> terminal core — no webview, no Electron.
 </p>
@@ -23,20 +23,30 @@
 
 - Real PTY sessions (ConPTY on Windows) rendered with `alacritty_terminal`: true color, 256 colors,
   alternate screen, bracketed paste, OSC 8 hyperlinks and TUI programs.
-- Tabs are terminal groups. Split any terminal left/right/up/down, drag titles to reorder, drag a
-  pane onto another pane's edge to move it, or drop it next to `+` to turn it into its own tab.
-  Shell processes survive every layout change.
+- Tabs are stable terminal groups: selecting a group never expands or shifts the tab strip.
+  Double-click to name a group, right-click to rename/split/close it, or use the arrow beside `+`
+  to pick from all open groups. Group names and the last focused terminal are remembered.
+- Split terminals have their own compact, draggable titles with focus/restore and close buttons;
+  a lone terminal needs no extra header. Drag group tabs to reorder, drag a terminal title onto
+  another pane's edge to move it, or drop it next to `+` to give it its own tab. The strip scrolls
+  at its edges during a drag. Shell processes survive every layout change. Closing a multi-terminal
+  group asks for confirmation; a pane's close button closes only that terminal.
 - Ctrl/Cmd+click opens local paths such as `src/main.rs:42` in the file panel and URLs in the browser.
 - On Windows the default shell is **Git Bash** (found via `PATH` or the standard install locations),
   falling back to PowerShell. Your shell profiles are never modified.
 - Scrollback search, a persistent font size, and desktop notifications when a terminal rings the
   bell or sends a notification while Vyber is in the background.
+- Box-drawing, block and Powerline characters are drawn to fill their cells, so boxes, rules and
+  block logos join without gaps whatever the font.
 
 **Files and previews**
 
-- A file panel that slides in over the active terminal without resizing it. Every terminal keeps
+- A file panel that slides in over the active terminal without resizing it, or docks beside it and
+  moves the terminal aside (the button left of the sidebar toggle switches). Every terminal keeps
   its own tree, open files and preview. Drag the panel's left edge to resize it, drag or toggle the
   sidebar the same way; sizes are remembered.
+- The zoom shortcuts size whatever has focus: the terminals, the file panel or source control, each
+  on its own and saved in `config.toml`.
 - Workspace tree with Git status colors, fuzzy file filtering and content search via
   [ripgrep](https://github.com/BurntSushi/ripgrep). Nested Git repositories can be picked as the tree root.
 - Built-in editor with syntax highlighting for Rust, Go, TypeScript/TSX, JavaScript, Python, JSON,
@@ -48,8 +58,12 @@
 **Review**
 
 - **Turn badge** — while Claude Code or Codex works in a terminal, a small `6 files changed +551 −3`
-  badge sits just above its input box and updates live. Vyber draws it on top of the terminal: the
-  agent never sees it and the terminal size doesn't change. Click it to review that turn.
+  badge sits just above its input box and updates live. An active turn stays visible through TUI
+  redraws and long task lists: when the input cannot be recognized it keeps its last verified
+  position, or uses the terminal's top-right corner (also while viewing scrollback). Only explicitly
+  dismissing it hides an active turn. Vyber draws it on top of the terminal: the agent never sees it
+  and the terminal size doesn't change. Click it to review that turn. Narrow panes keep the file
+  count visible and put the full addition/deletion totals in the tooltip.
 - **One scrolling diff** — every changed file in a single list with syntax highlighting, unchanged
   runs folded into "N unmodified lines", split or unified view, line wrapping and find. The changed
   files tree beside it shows added, modified and deleted files and jumps to each one.
@@ -59,9 +73,44 @@
   **Comment** on a line to type `path:line — note` into the terminal's input without sending it.
 - Agent turns come from the local Claude Code / Codex session logs (read-only), which mark where a turn
   started and ended. Manual checkpoints work with any command.
+- A turn's badge goes to the terminal the agent runs in: Claude Code names each session's process,
+  and a Codex session goes to the terminal running `codex`. Turns from the Codex app or an editor
+  extension show only in Review.
+- An agent started in a folder that holds repositories without being one, such as `Documents`, gets
+  a snapshot of the repositories below it. Linked worktrees, such as the ones agents check out under
+  `.claude/worktrees`, are left out of every snapshot.
 - Snapshots live in a separate object store in Vyber's data directory: your index, refs, stash and
   `.git/objects` are never touched. Files changed after a snapshot are never overwritten silently; a
   recovery copy is kept first.
+
+**Projects**
+
+- A project is a named set of source folders, the first one primary, like a Codex project
+  (≡ ▸ Edit project…). Opening a folder that holds repositories offers them as a project, and a
+  project already defined in the Codex app is picked up.
+- Project folders show in the file tree even when the primary folder's `.gitignore` hides them, as
+  in a playground that keeps its repositories side by side. Worktrees can be picked as the tree root.
+- An agent turn in the primary folder snapshots every project repository inside it, so the turn
+  badge and Review show changes across repositories.
+- Projects live in Vyber's data directory; nothing is written into the folders.
+
+**Source control**
+
+- The branch button left of the file panel button (Ctrl+Shift+G) opens source control laid out like
+  Cursor's: every repository of the project and its worktrees, a commit box at the top, Merge,
+  Staged and Changes groups, and the commit graph with branch lanes, refs and the commits to pull
+  or push.
+- Stage, unstage and discard files or everything, and single hunks from the diff. Commit, amend,
+  commit and push or sync, undo the last commit; fetch, pull (with rebase), push, force push with
+  lease, publish a branch.
+- Switch branches from a picker; when local changes are in the way, stash them, carry them over or
+  discard them. Create, rename, delete, merge and rebase branches, check out remote branches, tags
+  or commits; cherry-pick, revert and reset commits; stashes, tags, remotes and worktrees; continue
+  or abort merges and rebases and take either side of a conflict.
+- Git runs as the command line with your configuration, hooks and credential helpers, and the Git
+  Output view lists every command. Background fetches never prompt for credentials; discards and
+  hard resets keep recovery copies; a running agent turn is pointed out before commands that
+  change its files.
 
 Vyber never talks to agents: it doesn't install hooks, use an SDK or scan processes. `claude`, `codex`
 and every other CLI simply run in your terminal.
@@ -99,17 +148,22 @@ Run the test suite with `cargo test --locked`.
 | Close terminal | Ctrl+Shift+W | Cmd+W |
 | Next terminal | Ctrl+Shift+] | Cmd+] |
 | Switch tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
+| Go to tab 1–8 / last tab | Ctrl+1…8 / Ctrl+9 | Cmd+1…8 / Cmd+9 |
 | Maximize terminal | Ctrl+Shift+Enter | Cmd+Enter |
 | File panel | Ctrl+Shift+B | Cmd+B |
+| Source control | Ctrl+Shift+G | Cmd+Shift+G |
 | Find file | Ctrl+Shift+P | Cmd+P |
 | Search terminal history | Ctrl+Shift+F | Cmd+F |
 | Open folder | Ctrl+Shift+O | Cmd+O |
 | Manual checkpoint | Ctrl+Shift+K | Cmd+Shift+K |
 | Save in editor | Ctrl+S | Cmd+S |
+| Close the file in the panel (the panel when no file is open) | Ctrl+W | Cmd+W |
+| Next / previous panel tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp | Ctrl+Tab / Ctrl+Shift+Tab |
+| Find in the Review diff | Ctrl+F | Cmd+F |
 | Copy / paste in terminal | Ctrl+Shift+C / V | Cmd+C / V |
 | Settings file | Ctrl+Shift+, | Cmd+, |
 | Shortcut help | Ctrl+Shift+H | Cmd+Shift+H |
-| Font size up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 |
+| Font size of the focused terminal or panel: up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 |
 
 In the file tree: ↑/↓ to move, →/← to expand or collapse, Enter to open, Space for quick look.
 In the filter box, Enter opens the best match and Shift+Enter searches file contents.
@@ -121,8 +175,10 @@ directory on macOS.
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | `shell`, `font_family`, `font_size`, `scrollback`, `reduced_motion`, `notifications`, `restore_workspace`, `task_history_days`, `task_history_limit` |
+| `config.toml` | `shell`, `font_family`, `font_size`, `files_font_size`, `git_font_size`, `panel_mode` (`"overlay"` or `"dock"`), `scrollback`, `reduced_motion`, `notifications`, `restore_workspace`, `task_history_days`, `task_history_limit`, `git_autofetch`. Changes apply as soon as the file is saved. |
 | `workspace.json` | Tabs, split layout, terminal folders, open files and unsaved drafts |
+| `projects.json` | Projects and their source folders |
+| `git-drafts.json` | Unsent commit messages |
 | `checkpoints/`, `tasks/`, `recovery/` | Local review snapshots and recovery copies |
 | `vyber.log` | Application errors only — terminal output is never logged |
 
@@ -132,10 +188,14 @@ directory on macOS.
   view may stay empty until updated. Manual checkpoints always work.
 - Text preview is limited to 8 MB and file loading to 32 MB; this is not a streaming editor for huge files.
 - The checkpoint object store is not compacted automatically yet, so keep an eye on its size.
-- Vyber doesn't inspect processes, so it links an agent session to the terminal in that folder where
-  Enter was pressed last when the session's first turn starts. Two agents started in the same folder
-  at the same moment can be mixed up, and their changes overlap in the review.
-- Reviews and the turn badge need a Git repository.
+- Codex doesn't name its process in its log, so a Codex session goes to the terminal in its folder
+  that runs `codex` and where Enter was pressed last when the session's first turn starts. Two Codex
+  sessions started in the same folder at the same moment can be mixed up.
+- Turns running at the same time in overlapping folders are flagged, since their changes overlap in
+  the review.
+- Reviews and the turn badge need a Git repository in the folder or below it; a folder of
+  repositories is snapshotted up to 20,000 files.
+- Source control has no generated commit messages, pull request view, blame or interactive rebase.
 - No PDF or web preview and no LSP.
 
 ## License

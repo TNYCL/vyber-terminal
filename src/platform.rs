@@ -144,3 +144,118 @@ pub fn open_in_code(path: &std::path::Path) -> std::io::Result<()> {
         Err(std::io::Error::other("VS Code launcher `code` was not found on PATH"))
     }
 }
+
+/// The running processes, each with its parent and executable name, for
+/// telling which terminal an agent runs in.
+#[derive(Default)]
+pub struct Processes(std::collections::HashMap<u32, (u32, String)>);
+
+impl Processes {
+    pub fn list() -> Self {
+        #[cfg(windows)]
+        {
+            use windows::Win32::{
+                Foundation::CloseHandle,
+                System::Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                    TH32CS_SNAPPROCESS,
+                },
+            };
+            let mut list = std::collections::HashMap::new();
+            // Safety: the snapshot handle is closed below, and each entry
+            // carries its size as Process32FirstW/NextW require.
+            unsafe {
+                let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                    return Self::default();
+                };
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                let mut next = Process32FirstW(snapshot, &mut entry);
+                while next.is_ok() {
+                    let name = &entry.szExeFile;
+                    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+                    list.insert(
+                        entry.th32ProcessID,
+                        (
+                            entry.th32ParentProcessID,
+                            String::from_utf16_lossy(&name[..len]),
+                        ),
+                    );
+                    next = Process32NextW(snapshot, &mut entry);
+                }
+                let _ = CloseHandle(snapshot);
+            }
+            Self(list)
+        }
+        #[cfg(not(windows))]
+        {
+            let Ok(out) = std::process::Command::new("ps")
+                .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "comm="])
+                .output()
+            else {
+                return Self::default();
+            };
+            Self(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        let id = fields.next()?.parse().ok()?;
+                        let parent = fields.next()?.parse().ok()?;
+                        let command = fields.collect::<Vec<_>>().join(" ");
+                        let name = std::path::Path::new(&command).file_name()?;
+                        Some((id, (parent, name.to_string_lossy().into_owned())))
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    /// Whether process `id` runs under `ancestor`, through its parents.
+    pub fn descends(&self, mut id: u32, ancestor: u32) -> bool {
+        for _ in 0..64 {
+            if id == ancestor {
+                return true;
+            }
+            match self.0.get(&id) {
+                Some(&(parent, _)) if parent != id && parent != 0 => id = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether a program whose name starts with `name`, in lowercase, runs
+    /// under `ancestor`.
+    pub fn runs(&self, ancestor: u32, name: &str) -> bool {
+        self.0.iter().any(|(id, (_, program))| {
+            *id != ancestor
+                && program.to_lowercase().starts_with(name)
+                && self.descends(*id, ancestor)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn processes_know_what_runs_under_them() {
+        // Git waits for input here, so it is still running when listed.
+        let mut child = crate::workspace::command("git")
+            .args(["cat-file", "--batch"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let processes = super::Processes::list();
+        let me = std::process::id();
+        assert!(processes.descends(child.id(), me));
+        assert!(!processes.descends(me, child.id()));
+        assert!(processes.runs(me, "git"));
+        assert!(!processes.runs(child.id(), "git"));
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+}

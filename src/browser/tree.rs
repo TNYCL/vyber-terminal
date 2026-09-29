@@ -174,6 +174,35 @@ impl Browser {
             return;
         }
         let key = event.keystroke.key.as_str();
+        // An open Git dialog or menu takes Escape (cancel) and Enter (its
+        // main button) first.
+        if let Some(confirm) = &self.git.confirm {
+            match key {
+                "escape" => self.dismiss_confirm(),
+                "enter" => {
+                    let main = confirm
+                        .buttons
+                        .iter()
+                        .find(|b| b.style == super::scm::Style::Primary)
+                        .map(|b| b.action.clone());
+                    match main {
+                        Some(Some(action)) => self.perform(action, window, cx),
+                        Some(None) => self.dismiss_confirm(),
+                        None => return,
+                    }
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "escape" && self.git.menu.is_some() {
+            self.git.menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if key == "escape" {
             self.quick_look = false;
             self.menu = None;
@@ -290,13 +319,13 @@ impl Browser {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .h(px(30.))
+                            .h(rpx(30.))
                             .px_2p5()
                             .rounded_lg()
                             .bg(rgb(SURFACE))
                             .border_1()
                             .border_color(rgb(BORDER))
-                            .text_size(px(12.5))
+                            .text_size(rpx(12.5))
                             .text_color(rgb(TEXT))
                             .when(can_switch, |s| {
                                 s.cursor_pointer()
@@ -321,7 +350,7 @@ impl Browser {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .h(px(30.))
+                            .h(rpx(30.))
                             .flex_shrink_0()
                             .pl_2p5()
                             .pr_1()
@@ -335,14 +364,14 @@ impl Browser {
                                         .small()
                                         .appearance(false)
                                         .cleanable(true)
-                                        .text_size(px(12.5)),
+                                        .text_size(rpx(12.5)),
                                 ),
                             ),
                     ),
             )
             .child(body)
             .when(self.menu == Some(Menu::Root), |s| {
-                s.child(self.root_menu(repositories, cx))
+                s.child(menu_in("root-menu-in", self.root_menu(repositories, cx).into_any_element()))
             })
             .into_any_element()
     }
@@ -361,10 +390,10 @@ impl Browser {
                 .flex()
                 .items_center()
                 .gap_2()
-                .h(px(28.))
+                .h(rpx(28.))
                 .px_2()
                 .rounded_md()
-                .text_size(px(12.5))
+                .text_size(rpx(12.5))
                 .text_color(rgb(TEXT))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(HOVER)))
@@ -379,7 +408,7 @@ impl Browser {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(rpx(11.))
                             .text_color(rgb(MUTED))
                             .child(d),
                     )
@@ -411,7 +440,7 @@ impl Browser {
                 .px_2()
                 .pt_2()
                 .pb_1()
-                .text_size(px(10.5))
+                .text_size(rpx(10.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(MUTED))
                 .child(text)
@@ -429,10 +458,10 @@ impl Browser {
                 .flex()
                 .items_center()
                 .gap_2()
-                .h(px(28.))
+                .h(rpx(28.))
                 .px_2()
                 .rounded_md()
-                .text_size(px(12.5))
+                .text_size(rpx(12.5))
                 .text_color(rgb(TEXT))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(HOVER)))
@@ -442,7 +471,7 @@ impl Browser {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.))
+                        .text_size(rpx(11.))
                         .text_color(rgb(MUTED))
                         .child(if relative.is_some() {
                             detail
@@ -507,10 +536,10 @@ impl Browser {
             .id("root-menu")
             .absolute()
             .occlude()
-            .top(px(44.))
+            .top(rpx(44.))
             .left_2()
             .right_2()
-            .max_h(px(320.))
+            .max_h(rpx(320.))
             .overflow_y_scroll()
             .p_1()
             .flex()
@@ -560,11 +589,11 @@ impl Browser {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .h(px(ROW))
+                        .h(rpx(ROW))
                         .mx_1()
-                        .px(px(PAD - 4.))
+                        .px(rpx(PAD - 4.))
                         .rounded_md()
-                        .text_size(px(12.5))
+                        .text_size(rpx(12.5))
                         .text_color(rgb(TEXT_2))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
@@ -578,7 +607,7 @@ impl Browser {
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(rpx(11.))
                                 .text_color(rgb(MUTED))
                                 .child("⇧↵"),
                         )
@@ -588,9 +617,9 @@ impl Browser {
             .when_some(placeholder, |s, text| {
                 s.child(
                     div()
-                        .px(px(PAD + 4.))
+                        .px(rpx(PAD + 4.))
                         .py_2()
-                        .text_size(px(12.))
+                        .text_size(rpx(12.))
                         .text_color(rgb(MUTED))
                         .child(text),
                 )
@@ -623,9 +652,9 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(ROW))
-                    .px(px(PAD))
-                    .text_size(px(11.5))
+                    .h(rpx(ROW))
+                    .px(rpx(PAD))
+                    .text_size(rpx(11.5))
                     .text_color(rgb(MUTED))
                     .child(icon(ui("text-search"), MUTED, 13.))
                     .child(
@@ -655,9 +684,9 @@ impl Browser {
                             let view = entity.clone();
                             div()
                                 .id(("result", i))
-                                .h(px(48.))
+                                .h(rpx(48.))
                                 .mx_1()
-                                .px(px(PAD - 4.))
+                                .px(rpx(PAD - 4.))
                                 .flex()
                                 .flex_col()
                                 .justify_center()
@@ -670,7 +699,7 @@ impl Browser {
                                         .flex()
                                         .items_center()
                                         .gap_1p5()
-                                        .text_size(px(12.))
+                                        .text_size(rpx(12.))
                                         .child(icon(icon_path, color, 14.))
                                         .child(
                                             div()
@@ -687,10 +716,10 @@ impl Browser {
                                 )
                                 .child(
                                     div()
-                                        .pl(px(20.))
+                                        .pl(rpx(20.))
                                         .truncate()
                                         .font_family(mono_font())
-                                        .text_size(px(11.))
+                                        .text_size(rpx(11.))
                                         .text_color(rgb(TEXT_2))
                                         .child(text),
                                 )
@@ -753,7 +782,7 @@ fn tree_row(i: usize, row: Row, entity: Entity<Browser>) -> AnyElement {
     div()
         .id(("file", i))
         .relative()
-        .h(px(ROW))
+        .h(rpx(ROW))
         .px_1()
         .child(
             div()
@@ -761,24 +790,24 @@ fn tree_row(i: usize, row: Row, entity: Entity<Browser>) -> AnyElement {
                 .size_full()
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .pl(px(left - 4.))
+                .gap(rpx(6.))
+                .pl(rpx(left - 4.))
                 .pr_2()
                 .rounded_md()
-                .text_size(px(12.5))
+                .text_size(rpx(12.5))
                 .text_color(rgb(name_color))
                 .cursor_pointer()
                 .when(row.active, |s| s.bg(rgb(SELECTED)))
                 .when(row.selected && !row.active, |s| s.bg(rgb(HOVER)))
                 .when(!row.active, |s| s.hover(|s| s.bg(rgb(HOVER))))
-                .child(div().w(px(16.)).flex().justify_center().child(lead))
+                .child(div().w(rpx(16.)).flex().justify_center().child(lead))
                 .child(div().min_w_0().truncate().child(name))
                 .when_some(row.parent.clone(), |s, parent| {
                     s.child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(rpx(11.))
                             .text_color(rgb(MUTED))
                             .child(parent),
                     )
@@ -787,14 +816,14 @@ fn tree_row(i: usize, row: Row, entity: Entity<Browser>) -> AnyElement {
                 .when_some(row.status, |s, letter| {
                     s.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(rpx(11.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(status_color(letter)))
                             .child(letter.to_string()),
                     )
                 })
                 .when(row.changed, |s| {
-                    s.child(div().size(px(5.)).rounded_full().bg(rgb(MODIFIED)).opacity(0.7))
+                    s.child(div().size(rpx(5.)).rounded_full().bg(rgb(MODIFIED)).opacity(0.7))
                 }),
         )
         .when_some(row.guide, |s, depth| {
@@ -803,7 +832,7 @@ fn tree_row(i: usize, row: Row, entity: Entity<Browser>) -> AnyElement {
                     .absolute()
                     .top_0()
                     .bottom_0()
-                    .left(px(PAD + depth.saturating_sub(1) as f32 * INDENT + 7.5))
+                    .left(rpx(PAD + depth.saturating_sub(1) as f32 * INDENT + 7.5))
                     .w(px(1.))
                     .bg(rgb(FAINT)),
             )

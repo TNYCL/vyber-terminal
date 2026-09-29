@@ -5,8 +5,8 @@ use super::{
     Browser, View,
     review::{menu_item, menu_panel, separator},
     scm::{
-        Ask, CheckoutKind, CheckoutMode, Detail, GitAction, GitMenu, Group, MenuKind,
-        RepoView, Style, repo_label, GROUP_LIMIT,
+        Ask, CheckoutKind, CheckoutMode, Detail, FADE_TIME, Fold, GitAction, GitMenu, Group,
+        MenuKind, RepoView, Style, repo_label, GROUP_LIMIT,
     },
     tree::status_color,
 };
@@ -46,9 +46,37 @@ fn spinner(size: f32, color: u32) -> impl IntoElement {
     )
 }
 
+/// A chevron that turns from right (0) to down (1).
+fn chevron(open: f32, color: u32, size: f32) -> Svg {
+    icon(ui("chevron-right"), color, size)
+        .with_transformation(Transformation::rotate(radians(std::f32::consts::FRAC_PI_2 * open)))
+}
+
+/// Shows `body` at `open` of its height (`full`), fading with it.
+fn folding(body: Div, open: f32, full: f32) -> Div {
+    if open >= 0.999 {
+        body
+    } else {
+        div()
+            .h(rpx(full * open))
+            .overflow_hidden()
+            .opacity(open)
+            .child(body)
+    }
+}
+
+/// Fades an overlay in and lets it settle a few pixels downwards.
+fn appear<E: IntoElement + 'static>(id: impl Into<ElementId>, element: E) -> impl IntoElement {
+    div().child(element).with_animation(
+        id,
+        Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+        |el, t| el.opacity(t).mt(rpx(-6. * (1. - t))),
+    )
+}
+
 fn section_title(text: &'static str) -> Div {
     div()
-        .text_size(px(10.5))
+        .text_size(rpx(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(MUTED))
         .child(text)
@@ -57,15 +85,15 @@ fn section_title(text: &'static str) -> Div {
 fn count_badge(count: usize) -> Div {
     div()
         .flex_shrink_0()
-        .min_w(px(18.))
-        .h(px(16.))
+        .min_w(rpx(18.))
+        .h(rpx(16.))
         .px_1()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(8.))
+        .rounded(rpx(8.))
         .bg(rgb(SELECTED))
-        .text_size(px(10.5))
+        .text_size(rpx(10.5))
         .text_color(rgb(TEXT_2))
         .child(count.to_string())
 }
@@ -79,8 +107,8 @@ fn bar_action(id: impl Into<ElementId>, name: &str, tooltip: impl Into<SharedStr
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .size(px(22.))
-        .rounded(px(4.))
+        .size(rpx(22.))
+        .rounded(rpx(4.))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0x2a2a2a)))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
@@ -94,9 +122,9 @@ fn row_action(id: impl Into<ElementId>, name: &str, tooltip: &'static str, group
         .flex()
         .items_center()
         .justify_center()
-        .size(px(20.))
+        .size(rpx(20.))
         .flex_shrink_0()
-        .rounded(px(4.))
+        .rounded(rpx(4.))
         .cursor_pointer()
         .opacity(0.)
         .group_hover(group.clone(), |s| s.opacity(1.))
@@ -112,15 +140,15 @@ fn strip_pill(id: &'static str, name: &str, label: String) -> Stateful<Div> {
         .flex_shrink_0()
         .items_center()
         .gap_1p5()
-        .h(px(28.))
-        .max_w(px(220.))
+        .h(rpx(28.))
+        .max_w(rpx(220.))
         .pl_2p5()
         .pr_2()
         .rounded_full()
         .bg(rgb(SURFACE))
         .border_1()
         .border_color(rgb(BORDER))
-        .text_size(px(12.5))
+        .text_size(rpx(12.5))
         .text_color(rgb(TEXT))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(SELECTED)))
@@ -135,10 +163,10 @@ fn dialog_button(id: impl Into<ElementId>, label: String, style: Style) -> State
         .flex()
         .items_center()
         .justify_center()
-        .h(px(30.))
+        .h(rpx(30.))
         .px_3()
         .rounded_md()
-        .text_size(px(12.5))
+        .text_size(rpx(12.5))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(label);
@@ -176,14 +204,14 @@ fn label_pill(label: &Label) -> Option<Div> {
             .flex_shrink_0()
             .items_center()
             .gap_1()
-            .h(px(18.))
-            .max_w(px(160.))
+            .h(rpx(18.))
+            .max_w(rpx(160.))
             .px_1p5()
-            .rounded(px(9.))
+            .rounded(rpx(9.))
             .border_1()
             .border_color(rgba((color << 8) | 0x66))
             .bg(rgba((color << 8) | 0x1a))
-            .text_size(px(10.5))
+            .text_size(rpx(10.5))
             .text_color(rgb(color))
             .child(icon(ui(icon_name), color, 11.))
             .child(div().min_w_0().truncate().child(text)),
@@ -196,10 +224,12 @@ fn graph_cell(row: &graph::Row, head: bool, width: f32) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            let lane_x = |lane: usize| bounds.left() + px(12. + lane as f32 * LANE);
+            // Painting works in pixels; the panel's text size scales the graph.
+            let scale = f32::from(window.rem_size()) / REM;
+            let lane_x = |lane: usize| bounds.left() + px((12. + lane as f32 * LANE) * scale);
             let top = bounds.top();
             let bottom = bounds.bottom();
-            let middle = top + px(GRAPH_ROW / 2.);
+            let middle = top + px(GRAPH_ROW / 2. * scale);
             let node = row.lane;
             for edge in &row.edges {
                 let (from, to) = match edge.kind {
@@ -207,7 +237,7 @@ fn graph_cell(row: &graph::Row, head: bool, width: f32) -> impl IntoElement {
                     graph::EdgeKind::Into => (point(lane_x(edge.from), top), point(lane_x(node), middle)),
                     graph::EdgeKind::OutOf => (point(lane_x(node), middle), point(lane_x(edge.to), bottom)),
                 };
-                let mut path = PathBuilder::stroke(px(1.5));
+                let mut path = PathBuilder::stroke(px(1.5 * scale));
                 path.move_to(from);
                 if from.x == to.x {
                     path.line_to(to);
@@ -221,7 +251,7 @@ fn graph_cell(row: &graph::Row, head: bool, width: f32) -> impl IntoElement {
             }
             let color = rgb(graph::COLORS[row.color % graph::COLORS.len()]);
             let center = point(lane_x(node), middle);
-            let radius = if head { 4.5 } else { 3.5 };
+            let radius = if head { 4.5 } else { 3.5 } * scale;
             let dot = |r: f32| Bounds {
                 origin: point(center.x - px(r), center.y - px(r)),
                 size: size(px(r * 2.), px(r * 2.)),
@@ -229,12 +259,12 @@ fn graph_cell(row: &graph::Row, head: bool, width: f32) -> impl IntoElement {
             window.paint_quad(fill(dot(radius), color).corner_radii(px(radius)));
             if head || row.merge {
                 // A ring: merges and HEAD read differently from plain commits.
-                window.paint_quad(fill(dot(radius - 1.75), rgb(PANEL)).corner_radii(px(radius)));
+                window.paint_quad(fill(dot(radius - 1.75 * scale), rgb(PANEL)).corner_radii(px(radius)));
             }
         },
     )
-    .w(px(width))
-    .h(px(GRAPH_ROW))
+    .w(rpx(width))
+    .h(rpx(GRAPH_ROW))
     .flex_shrink_0()
 }
 
@@ -290,7 +320,7 @@ impl Browser {
             }
         });
         div()
-            .h(px(42.))
+            .h(rpx(42.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -329,13 +359,13 @@ impl Browser {
                         .gap_1p5()
                         .px_2()
                         .min_w_0()
-                        .text_size(px(12.))
+                        .text_size(rpx(12.))
                         .text_color(rgb(TEXT_2))
                         .child(spinner(13., TEXT_2))
                         .child(div().truncate().child(label)),
                 )
             })
-            .child(div().flex_1().min_w(px(8.)))
+            .child(div().flex_1().min_w(rpx(8.)))
             .when(has_repo, |s| {
                 s.child(
                     icon_button("git-fetch", "cloud-download", "Fetch from all remotes")
@@ -356,6 +386,7 @@ impl Browser {
                         })),
                 )
             })
+            .child(self.dock_button(cx))
             .child({
                 let open = self.sidebar_open();
                 icon_button(
@@ -378,13 +409,8 @@ impl Browser {
                 })),
             )
             .child(
-                icon_button("close-panel", "x", "Close panel  (Ctrl+Shift+G)").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.visible = false;
-                        this.git.menu = None;
-                        cx.notify();
-                    },
-                )),
+                icon_button("close-panel", "x", "Close panel  (Ctrl+Shift+G)")
+                    .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
             )
             .into_any_element()
     }
@@ -425,14 +451,14 @@ impl Browser {
             .child(icon(ui("folder-git-2"), TEXT_2, 30.).mb_2())
             .child(
                 div()
-                    .text_size(px(15.))
+                    .text_size(rpx(15.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
                     .child("No Git repository here"),
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(MUTED))
                     .child("Initialize one, or add this folder's repositories to a project"),
             )
@@ -480,7 +506,7 @@ impl Browser {
                             ),
                     )
                     .when(!e.output.is_empty(), |s| {
-                        s.child(div().pl(px(64.)).text_color(rgb(MUTED)).child(e.output.clone()))
+                        s.child(div().pl(rpx(64.)).text_color(rgb(MUTED)).child(e.output.clone()))
                     })
             })
             .collect::<Vec<_>>();
@@ -490,7 +516,7 @@ impl Browser {
             .flex_col()
             .child(
                 div()
-                    .h(px(46.))
+                    .h(rpx(46.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -502,10 +528,10 @@ impl Browser {
                         text_button("git-output-back", Some("arrow-left"), "Changes")
                             .on_click(cx.listener(|this, _, window, cx| this.perform(GitAction::HideOutput, window, cx))),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child("Git Output"))
+                    .child(div().text_size(rpx(13.)).text_color(rgb(TEXT)).child("Git Output"))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rpx(12.))
                             .text_color(rgb(MUTED))
                             .child("Every command Vyber ran, newest last"),
                     ),
@@ -520,7 +546,7 @@ impl Browser {
                     .px_3()
                     .py_2()
                     .font_family(mono_font())
-                    .text_size(px(11.5))
+                    .text_size(rpx(11.5))
                     .when(rows.is_empty(), |s| {
                         s.child(div().text_color(rgb(MUTED)).child("No Git commands yet"))
                     })
@@ -608,7 +634,7 @@ impl Browser {
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(14.))
+                        .text_size(rpx(14.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT))
                         .child(subject),
@@ -616,9 +642,9 @@ impl Browser {
                 .when(!body.is_empty(), |s| {
                     s.child(
                         div()
-                            .max_h(px(140.))
+                            .max_h(rpx(140.))
                             .overflow_hidden()
-                            .text_size(px(12.5))
+                            .text_size(rpx(12.5))
                             .text_color(rgb(TEXT_2))
                             .child(body),
                     )
@@ -630,17 +656,17 @@ impl Browser {
                         .flex_wrap()
                         .items_center()
                         .gap_1p5()
-                        .text_size(px(12.))
+                        .text_size(rpx(12.))
                         .text_color(rgb(MUTED))
                         .child(
                             div()
-                                .size(px(18.))
+                                .size(rpx(18.))
                                 .rounded_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .bg(rgb(0x2a2a2a))
-                                .text_size(px(10.))
+                                .text_size(rpx(10.))
                                 .text_color(rgb(TEXT))
                                 .child(initial),
                         )
@@ -697,7 +723,7 @@ impl Browser {
             vec![div()
                 .px_3()
                 .py_2()
-                .text_size(px(12.))
+                .text_size(rpx(12.))
                 .text_color(rgb(MUTED))
                 .child("Looking for repositories…")
                 .into_any_element()]
@@ -705,7 +731,7 @@ impl Browser {
             vec![div()
                 .px_3()
                 .py_2()
-                .text_size(px(12.))
+                .text_size(rpx(12.))
                 .text_color(rgb(MUTED))
                 .child("No repositories in this folder")
                 .into_any_element()]
@@ -728,7 +754,11 @@ impl Browser {
                 .map(|(i, path)| self.repo_block(i, path, cx))
                 .collect()
         };
+        if self.git.moving() {
+            window.request_animation_frame();
+        }
         let graph_open = self.git.graph_open;
+        let graph = self.git.fold(&Fold::Graph, graph_open);
         let split = self.git.split;
         let selected = self
             .git
@@ -760,7 +790,7 @@ impl Browser {
             .border_color(rgb(DIVIDER))
             .child(
                 div()
-                    .h(px(34.))
+                    .h(rpx(34.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -773,7 +803,7 @@ impl Browser {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.5))
+                            .text_size(rpx(11.5))
                             .text_color(rgb(TEXT_2))
                             .child(title),
                     )
@@ -786,7 +816,13 @@ impl Browser {
                         icon_button("scm-collapse", "chevrons-down-up", "Collapse all").on_click(cx.listener(
                             |this, _, _, cx| {
                                 let all: Vec<PathBuf> = this.git.repos.iter().map(|r| r.repo.path.clone()).collect();
-                                if this.git.collapsed.len() >= all.len() {
+                                let open = this.git.collapsed.len() >= all.len();
+                                for path in &all {
+                                    if this.git.collapsed.contains(path) == open {
+                                        this.git.set_fold(Fold::Repo(path.clone()), open);
+                                    }
+                                }
+                                if open {
                                     this.git.collapsed.clear();
                                 } else {
                                     this.git.collapsed.extend(all);
@@ -802,19 +838,21 @@ impl Browser {
             .child(
                 div()
                     .id("scm-list")
-                    .when(graph_open, |s| s.h(relative(split)))
-                    .when(!graph_open, |s| s.flex_1())
+                    // While the graph slides, the list's share eases between
+                    // the split and the whole column.
+                    .when(graph > 0.001, |s| s.h(relative(split + (1. - split) * (1. - graph))))
+                    .when(graph <= 0.001, |s| s.flex_1())
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.git.list_scroll)
                     .pb_2()
                     .children(blocks),
             )
-            .child(self.graph_header(graph_open, cx))
-            .when(graph_open, |s| s.child(self.graph_list(cx)))
+            .child(self.graph_header(graph_open, graph, cx))
+            .when(graph > 0.001, |s| s.child(div().flex_1().min_h_0().flex().flex_col().opacity(graph).child(self.graph_list(cx))))
             .on_drag_move(cx.listener(|this, e: &DragMoveEvent<GitSplit>, _, cx| {
                 let height = f32::from(e.bounds.size.height).max(1.);
-                let y = f32::from(e.event.position.y - e.bounds.top()) - 34.;
+                let y = f32::from(e.event.position.y - e.bounds.top()) - 34. * this.scale;
                 this.git.split = (y / height).clamp(0.15, 0.85);
                 cx.notify();
             }))
@@ -830,6 +868,7 @@ impl Browser {
         let status = view.status().cloned();
         let selected = self.git.selected.as_ref() == Some(&path);
         let collapsed = self.git.collapsed.contains(&path);
+        let open = self.git.fold(&Fold::Repo(path.clone()), !collapsed);
         let busy = self.git.busy.get(&path).cloned();
         let changes = status.as_ref().map(Status::changes).unwrap_or(0);
         let depth = usize::from(repo.is_worktree());
@@ -881,12 +920,12 @@ impl Browser {
         let header = div()
             .id(("scm-repo", index))
             .group(group.clone())
-            .h(px(28.))
+            .h(rpx(28.))
             .mx_1()
             .flex()
             .items_center()
             .gap_1p5()
-            .pl(px(6. + depth as f32 * 14.))
+            .pl(rpx(6. + depth as f32 * 14.))
             .pr_1()
             .rounded_md()
             .cursor_pointer()
@@ -895,16 +934,14 @@ impl Browser {
             .child(
                 div()
                     .id(("scm-repo-toggle", index))
-                    .child(icon(
-                        ui(if collapsed { "chevron-right" } else { "chevron-down" }),
-                        MUTED,
-                        13.,
-                    ))
+                    .child(chevron(open, MUTED, 13.))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        if !this.git.collapsed.remove(&toggle_path) {
+                        let now_open = this.git.collapsed.remove(&toggle_path);
+                        if !now_open {
                             this.git.collapsed.insert(toggle_path.clone());
                         }
+                        this.git.set_fold(Fold::Repo(toggle_path.clone()), now_open);
                         cx.notify();
                     })),
             )
@@ -916,9 +953,9 @@ impl Browser {
             .child(
                 div()
                     .flex_shrink_0()
-                    .max_w(px(170.))
+                    .max_w(rpx(170.))
                     .truncate()
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(TEXT))
                     .when(selected, |s| s.font_weight(FontWeight::SEMIBOLD))
                     .child(label),
@@ -928,14 +965,14 @@ impl Browser {
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .text_size(px(11.5))
+                    .text_size(rpx(11.5))
                     .text_color(rgb(MUTED))
                     .child(detail),
             )
             .when(agent, |s| {
                 s.child(
                     div()
-                        .size(px(6.))
+                        .size(rpx(6.))
                         .rounded_full()
                         .bg(rgb(TEXT_2))
                         .with_animation(
@@ -958,10 +995,10 @@ impl Browser {
                         .flex_shrink_0()
                         .items_center()
                         .gap_1()
-                        .h(px(22.))
+                        .h(rpx(22.))
                         .px_1p5()
-                        .rounded(px(4.))
-                        .text_size(px(11.))
+                        .rounded(rpx(4.))
+                        .text_size(rpx(11.))
                         .text_color(rgb(TEXT_2))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(0x2a2a2a)).text_color(rgb(TEXT)))
@@ -990,21 +1027,23 @@ impl Browser {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.perform(GitAction::SelectRepo(open_path.clone()), window, cx);
             }));
-        let mut block = div().flex().flex_col().child(header);
-        if collapsed {
+        let block = div().flex().flex_col().child(header);
+        if open <= 0.001 {
             return block.into_any_element();
         }
+        let mut body = div().flex().flex_col();
+        let mut height = 0.;
         if let Some(error) = error {
-            block = block.child(
+            body = body.child(
                 div()
-                    .pl(px(28. + depth as f32 * 14.))
+                    .pl(rpx(28. + depth as f32 * 14.))
                     .pr_2()
                     .py_1()
-                    .text_size(px(11.5))
+                    .text_size(rpx(11.5))
                     .text_color(rgb(WARNING))
                     .child(error.lines().next().unwrap_or_default().to_string()),
             );
-            return block.into_any_element();
+            return block.child(folding(body, open, 24.)).into_any_element();
         }
         let Some(status) = status else {
             return block.into_any_element();
@@ -1018,9 +1057,11 @@ impl Browser {
             if entries.is_empty() {
                 continue;
             }
-            block = block.child(self.change_group(index, &path, depth, group_kind, title, entries, cx));
+            let (group, group_height) = self.change_group(index, &path, depth, group_kind, title, entries, cx);
+            body = body.child(group);
+            height += group_height;
         }
-        block.into_any_element()
+        block.child(folding(body, open, height)).into_any_element()
     }
 
     fn operation_banner(&self, operation: Operation, status: &Status, cx: &mut Context<Self>) -> AnyElement {
@@ -1036,9 +1077,9 @@ impl Browser {
         };
         let button = |id: &'static str, label: &'static str, step: &'static str, primary: bool| {
             dialog_button(id, label.into(), if primary { Style::Primary } else { Style::Plain })
-                .h(px(24.))
+                .h(rpx(24.))
                 .px_2()
-                .text_size(px(11.5))
+                .text_size(rpx(11.5))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.perform(GitAction::Sequence(operation, step), window, cx)
                 }))
@@ -1058,7 +1099,7 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .text_size(px(12.))
+                    .text_size(rpx(12.))
                     .text_color(rgb(WARNING))
                     .child(icon(ui("git-merge"), WARNING, 13.))
                     .child(text),
@@ -1141,12 +1182,12 @@ impl Browser {
                             .appearance(false)
                             .bordered(false)
                             .small()
-                            .text_size(px(12.5)),
+                            .text_size(rpx(12.5)),
                     ),
             )
             .child(
                 div()
-                    .h(px(28.))
+                    .h(rpx(28.))
                     .flex()
                     .rounded_md()
                     .overflow_hidden()
@@ -1160,7 +1201,7 @@ impl Browser {
                             .gap_1p5()
                             .bg(rgb(bg))
                             .text_color(rgb(fg))
-                            .text_size(px(12.5))
+                            .text_size(rpx(12.5))
                             .font_weight(FontWeight::MEDIUM)
                             .when_some(busy, |s, busy| s.child(spinner(13., fg)).child(busy.to_string()))
                             .when(busy.is_none(), |s| {
@@ -1180,14 +1221,14 @@ impl Browser {
                         div()
                             .w(px(1.))
                             .h_full()
-                            .py(px(6.))
+                            .py(rpx(6.))
                             .bg(rgb(bg))
                             .child(div().size_full().bg(rgb(if enabled { 0xb4b4b4 } else { 0x3a3a3a }))),
                     )
                     .child(
                         div()
                             .id("scm-commit-options")
-                            .w(px(30.))
+                            .w(rpx(30.))
                             .h_full()
                             .flex()
                             .items_center()
@@ -1218,8 +1259,9 @@ impl Browser {
         title: &'static str,
         entries: &[Entry],
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, f32) {
         let closed = self.git.closed.contains(&(repo.to_path_buf(), kind));
+        let open = self.git.fold(&Fold::Group(repo.to_path_buf(), kind), !closed);
         let group: SharedString = format!("scm-group-{repo_index}-{kind:?}").into();
         let key = (repo.to_path_buf(), kind);
         let all: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
@@ -1228,18 +1270,18 @@ impl Browser {
         let header = div()
             .id(("scm-group", repo_index * 4 + kind as usize))
             .group(group.clone())
-            .h(px(ROW))
+            .h(rpx(ROW))
             .mx_1()
             .flex()
             .items_center()
             .gap_1()
-            .pl(px(indent - 4.))
+            .pl(rpx(indent - 4.))
             .pr_1()
             .rounded_md()
             .cursor_pointer()
             .hover(|s| s.bg(rgb(HOVER)))
-            .child(icon(ui(if closed { "chevron-right" } else { "chevron-down" }), MUTED, 12.))
-            .child(div().text_size(px(12.)).text_color(rgb(TEXT_2)).child(title))
+            .child(chevron(open, MUTED, 12.))
+            .child(div().text_size(rpx(12.)).text_color(rgb(TEXT_2)).child(title))
             .child(count_badge(entries.len()))
             .child(div().flex_1())
             .when(kind == Group::Staged, |s| {
@@ -1274,33 +1316,40 @@ impl Browser {
                 )
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.git.closed.remove(&key) {
+                let now_open = this.git.closed.remove(&key);
+                if !now_open {
                     this.git.closed.insert(key.clone());
                 }
+                this.git.set_fold(Fold::Group(key.0.clone(), key.1), now_open);
                 cx.notify();
             }));
         let _ = all;
-        let mut column = div().flex().flex_col().child(header);
-        if closed {
-            return column.into_any_element();
+        let column = div().flex().flex_col().child(header);
+        let rows_height = (entries.len().min(GROUP_LIMIT) + usize::from(entries.len() > GROUP_LIMIT)) as f32 * ROW;
+        if open <= 0.001 {
+            return (column.into_any_element(), ROW);
         }
+        let mut rows = div().flex().flex_col();
         let revealed = self.review.reveal_path.clone();
         for (i, entry) in entries.iter().take(GROUP_LIMIT).enumerate() {
-            column = column.child(self.file_row(repo_index, repo, indent, kind, i, entry, revealed.as_deref(), cx));
+            rows = rows.child(self.file_row(repo_index, repo, indent, kind, i, entry, revealed.as_deref(), cx));
         }
         if entries.len() > GROUP_LIMIT {
-            column = column.child(
+            rows = rows.child(
                 div()
-                    .pl(px(indent + 20.))
-                    .h(px(ROW))
+                    .pl(rpx(indent + 20.))
+                    .h(rpx(ROW))
                     .flex()
                     .items_center()
-                    .text_size(px(11.5))
+                    .text_size(rpx(11.5))
                     .text_color(rgb(MUTED))
                     .child(format!("… {} more", entries.len() - GROUP_LIMIT)),
             );
         }
-        column.into_any_element()
+        (
+            column.child(folding(rows, open, rows_height)).into_any_element(),
+            ROW + rows_height * open,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1338,12 +1387,12 @@ impl Browser {
         let mut row = div()
             .id(ElementId::Integer(id))
             .group(group.clone())
-            .h(px(ROW))
+            .h(rpx(ROW))
             .mx_1()
             .flex()
             .items_center()
             .gap_1p5()
-            .pl(px(indent + 14.))
+            .pl(rpx(indent + 14.))
             .pr_1()
             .rounded_md()
             .cursor_pointer()
@@ -1354,9 +1403,9 @@ impl Browser {
             .child(
                 div()
                     .flex_shrink_0()
-                    .max_w(px(200.))
+                    .max_w(rpx(200.))
                     .truncate()
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(if deleted { MUTED } else { 0xd0d0d0 }))
                     .when(deleted, |s| s.line_through())
                     .child(name),
@@ -1366,7 +1415,7 @@ impl Browser {
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(rpx(11.))
                     .text_color(rgb(MUTED))
                     .child(folder),
             );
@@ -1466,10 +1515,10 @@ impl Browser {
         let conflict_file = absolute.clone();
         row.child(
             div()
-                .w(px(14.))
+                .w(rpx(14.))
                 .flex_shrink_0()
                 .text_center()
-                .text_size(px(11.))
+                .text_size(rpx(11.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(status_color(letter)))
                 .child(letter.to_string()),
@@ -1491,7 +1540,7 @@ impl Browser {
 
     // ---- Graph -------------------------------------------------------------------
 
-    fn graph_header(&self, open: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn graph_header(&self, open: bool, shown: f32, cx: &mut Context<Self>) -> AnyElement {
         let all = self.git.graph.all;
         let name = self
             .git
@@ -1506,7 +1555,7 @@ impl Browser {
                 s.child(
                     div()
                         .id("scm-split")
-                        .h(px(5.))
+                        .h(rpx(5.))
                         .flex()
                         .items_center()
                         .cursor_row_resize()
@@ -1516,7 +1565,7 @@ impl Browser {
                                 .h(px(1.))
                                 .w_full()
                                 .bg(rgb(DIVIDER))
-                                .group_hover("scm-split", |s| s.h(px(2.)).bg(rgb(0x4a4a4a))),
+                                .group_hover("scm-split", |s| s.h(rpx(2.)).bg(rgb(0x4a4a4a))),
                         )
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_drag(GitSplit, |value, _, _, cx| {
@@ -1529,30 +1578,30 @@ impl Browser {
             .child(
                 div()
                     .id("scm-graph-header")
-                    .h(px(30.))
+                    .h(rpx(30.))
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .pl_2()
                     .pr_1p5()
                     .cursor_pointer()
-                    .child(icon(ui(if open { "chevron-down" } else { "chevron-right" }), MUTED, 13.))
+                    .child(chevron(shown, MUTED, 13.))
                     .child(section_title("GRAPH"))
-                    .child(div().min_w_0().flex_1().truncate().text_size(px(11.5)).text_color(rgb(TEXT_2)).child(name))
+                    .child(div().min_w_0().flex_1().truncate().text_size(rpx(11.5)).text_color(rgb(TEXT_2)).child(name))
                     .when(open, |s| {
                         s.child(
                             div()
                                 .id("scm-graph-scope")
                                 .flex_shrink_0()
-                                .h(px(20.))
+                                .h(rpx(20.))
                                 .px_2()
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .rounded(px(10.))
+                                .rounded(rpx(10.))
                                 .border_1()
                                 .border_color(rgb(BORDER))
-                                .text_size(px(11.))
+                                .text_size(rpx(11.))
                                 .text_color(rgb(TEXT_2))
                                 .hover(|s| s.bg(rgb(HOVER)))
                                 .tooltip(|window, cx| {
@@ -1568,6 +1617,7 @@ impl Browser {
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.git.graph_open = !this.git.graph_open;
+                        this.git.set_fold(Fold::Graph, this.git.graph_open);
                         if this.git.graph_open && this.git.graph.commits.is_empty() {
                             this.load_graph(false);
                         }
@@ -1591,7 +1641,7 @@ impl Browser {
                 .flex_1()
                 .px_3()
                 .py_1()
-                .text_size(px(12.))
+                .text_size(rpx(12.))
                 .text_color(rgb(MUTED))
                 .child(text)
                 .into_any_element();
@@ -1613,11 +1663,11 @@ impl Browser {
                         let entity = entity.clone();
                         return div()
                             .id("scm-graph-more")
-                            .h(px(GRAPH_ROW))
-                            .pl(px(width + 8.))
+                            .h(rpx(GRAPH_ROW))
+                            .pl(rpx(width + 8.))
                             .flex()
                             .items_center()
-                            .text_size(px(12.))
+                            .text_size(rpx(12.))
                             .text_color(rgb(LINK))
                             .cursor_pointer()
                             .hover(|s| s.underline())
@@ -1656,7 +1706,7 @@ impl Browser {
                     let labels: Vec<Div> = commit.labels.iter().take(2).filter_map(label_pill).collect();
                     div()
                         .id(("scm-commit-row", i))
-                        .h(px(GRAPH_ROW))
+                        .h(rpx(GRAPH_ROW))
                         .w_full()
                         .px_1()
                         .child(
@@ -1676,10 +1726,10 @@ impl Browser {
                         // The subject keeps its room; ref pills give way first.
                         .child(
                             div()
-                                .min_w(px(72.))
+                                .min_w(rpx(72.))
                                 .flex_shrink(1.)
                                 .truncate()
-                                .text_size(px(12.5))
+                                .text_size(rpx(12.5))
                                 .text_color(rgb(if head || is_selected { TEXT } else { 0xc4c4c4 }))
                                 .child(commit.subject.clone()),
                         )
@@ -1689,14 +1739,15 @@ impl Browser {
                                 .items_center()
                                 .gap_1()
                                 .min_w_0()
-                                .max_w(px(190.))
+                                .max_w(rpx(190.))
+                                .flex_shrink(12.)
                                 .overflow_hidden()
                                 .children(labels)
                                 .when(more_labels > 0, |s| {
                                     s.child(
                                         div()
                                             .flex_shrink_0()
-                                            .text_size(px(10.5))
+                                            .text_size(rpx(10.5))
                                             .text_color(rgb(MUTED))
                                             .child(format!("+{more_labels}")),
                                     )
@@ -1707,7 +1758,7 @@ impl Browser {
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(11.))
+                                .text_size(rpx(11.))
                                 .text_color(rgb(MUTED))
                                 .child(git::age(commit.time)),
                         )
@@ -1742,11 +1793,49 @@ impl Browser {
         if self.git.menu.is_some() {
             out.push(self.menu_overlay(cx));
         }
+        // A closed picker or dialog is drawn once more per frame, fading out.
+        let fade = |at: std::time::Instant| 1. - (at.elapsed().as_secs_f32() / FADE_TIME).min(1.);
+        if let Some((quick, at)) = self.git.closing_quick.take() {
+            let left = fade(at);
+            if left > 0. && self.git.quick.is_none() {
+                self.git.quick = Some(quick);
+                let ghost = self.quick_overlay(window, cx);
+                let quick = self.git.quick.take();
+                self.git.closing_quick = quick.map(|q| (q, at));
+                out.push(div().absolute().top_0().left_0().size_full().opacity(left).child(ghost).into_any_element());
+                window.request_animation_frame();
+            }
+        }
         if self.git.quick.is_some() {
-            out.push(self.quick_overlay(window, cx));
+            let element = self.quick_overlay(window, cx);
+            out.push(div().absolute().top_0().left_0().size_full().child(element).with_animation(
+                "git-quick-in",
+                Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint()),
+                |el, t| el.opacity(t),
+            ).into_any_element());
+        }
+        if let Some((confirm, at)) = self.git.closing_confirm.take() {
+            let left = fade(at);
+            if left > 0. && self.git.confirm.is_none() {
+                self.git.confirm = Some(confirm);
+                let ghost = self.confirm_overlay(cx);
+                let confirm = self.git.confirm.take();
+                self.git.closing_confirm = confirm.map(|c| (c, at));
+                out.push(div().absolute().top_0().left_0().size_full().opacity(left).child(ghost).into_any_element());
+                window.request_animation_frame();
+            }
         }
         if self.git.confirm.is_some() {
-            out.push(self.confirm_overlay(cx));
+            // Keys reach the panel so Escape and Enter answer the dialog.
+            if !self.focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
+            let element = self.confirm_overlay(cx);
+            out.push(div().absolute().top_0().left_0().size_full().child(element).with_animation(
+                "git-confirm-in",
+                Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                |el, t| el.opacity(t),
+            ).into_any_element());
         }
         out
     }
@@ -1935,7 +2024,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let open_sub = self.git.menu.as_ref().and_then(|m| m.sub);
-        let mut panel = menu_panel(prefix).w(px(if submenu { 230. } else { 250. }));
+        let mut panel = menu_panel(prefix).w(rpx(if submenu { 230. } else { 250. }));
         for (i, entry) in entries.iter().enumerate() {
             panel = match entry {
                 MenuEntry::Separator => panel.child(separator()),
@@ -1983,7 +2072,7 @@ impl Browser {
                 .iter()
                 .map(|e| if matches!(e, MenuEntry::Separator) { 9. } else { 30. })
                 .sum();
-            Some(div().mt(px(offset)).child(self.render_entries(children, "git-submenu", true, cx)))
+            Some(div().mt(rpx(offset)).child(self.render_entries(children, "git-submenu", true, cx)))
         });
         let right = matches!(menu.kind, MenuKind::Repo | MenuKind::CommitOptions);
         deferred(
@@ -1991,7 +2080,8 @@ impl Browser {
                 .position(menu.at)
                 .anchor(if right { Anchor::TopRight } else { Anchor::TopLeft })
                 .snap_to_window_with_margin(px(8.))
-                .child(
+                .child(appear(
+                    "git-menu-in",
                     div()
                         .id("git-menus")
                         .occlude()
@@ -2006,7 +2096,7 @@ impl Browser {
                             this.git.menu = None;
                             cx.notify();
                         })),
-                ),
+                )),
         )
         .with_priority(2)
         .into_any_element()
@@ -2036,12 +2126,12 @@ impl Browser {
                     .when_some(header, |s, header| {
                         s.child(
                             div()
-                                .h(px(24.))
+                                .h(rpx(24.))
                                 .px_2()
                                 .flex()
                                 .items_end()
                                 .pb_0p5()
-                                .text_size(px(10.5))
+                                .text_size(rpx(10.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(MUTED))
                                 .child(header),
@@ -2050,7 +2140,7 @@ impl Browser {
                     .child(
                         div()
                             .id(("quick-item", n))
-                            .h(px(28.))
+                            .h(rpx(28.))
                             .px_2()
                             .flex()
                             .items_center()
@@ -2063,9 +2153,9 @@ impl Browser {
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .max_w(px(260.))
+                                    .max_w(rpx(260.))
                                     .truncate()
-                                    .text_size(px(12.5))
+                                    .text_size(rpx(12.5))
                                     .text_color(rgb(TEXT))
                                     .child(item.label.clone()),
                             )
@@ -2074,14 +2164,14 @@ impl Browser {
                                     .min_w_0()
                                     .flex_1()
                                     .truncate()
-                                    .text_size(px(11.5))
+                                    .text_size(rpx(11.5))
                                     .text_color(rgb(MUTED))
                                     .child(item.detail.clone()),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(11.))
+                                    .text_size(rpx(11.))
                                     .text_color(rgb(MUTED))
                                     .child(item.right.clone()),
                             )
@@ -2118,7 +2208,7 @@ impl Browser {
             .child(
                 div()
                     .absolute()
-                    .top(px(50.))
+                    .top(rpx(50.))
                     .left_0()
                     .right_0()
                     .flex()
@@ -2127,7 +2217,7 @@ impl Browser {
                     .child(
                         div()
                             .id("git-quick")
-                            .w(px(560.))
+                            .w(rpx(560.))
                             .max_w_full()
                             .p_1p5()
                             .flex()
@@ -2160,13 +2250,13 @@ impl Browser {
                                 div()
                                     .px_1p5()
                                     .pt_0p5()
-                                    .text_size(px(11.))
+                                    .text_size(rpx(11.))
                                     .text_color(rgb(MUTED))
                                     .child(quick.title.clone()),
                             )
                             .child(
                                 div()
-                                    .h(px(32.))
+                                    .h(rpx(32.))
                                     .px_2()
                                     .flex()
                                     .items_center()
@@ -2179,18 +2269,18 @@ impl Browser {
                                             Input::new(&quick.input)
                                                 .appearance(false)
                                                 .small()
-                                                .text_size(px(13.)),
+                                                .text_size(rpx(13.)),
                                         ),
                                     ),
                             )
                             .when_some(hint, |s, hint| {
-                                s.child(div().px_1p5().text_size(px(11.)).text_color(rgb(FAINT)).child(hint))
+                                s.child(div().px_1p5().text_size(rpx(11.)).text_color(rgb(FAINT)).child(hint))
                             })
                             .when(!rows.is_empty() || empty.is_some(), |s| {
                                 s.child(
                                     div()
                                         .id("git-quick-list")
-                                        .max_h(px(380.))
+                                        .max_h(rpx(380.))
                                         .overflow_y_scroll()
                                         .track_scroll(&quick.scroll)
                                         .when_some(empty, |s, text| {
@@ -2198,7 +2288,7 @@ impl Browser {
                                                 div()
                                                     .px_2()
                                                     .py_1p5()
-                                                    .text_size(px(12.))
+                                                    .text_size(rpx(12.))
                                                     .text_color(rgb(MUTED))
                                                     .child(text),
                                             )
@@ -2225,7 +2315,7 @@ impl Browser {
                     move |this, _, window, cx| match action.clone() {
                         Some(action) => this.perform(action, window, cx),
                         None => {
-                            this.git.confirm = None;
+                            this.dismiss_confirm();
                             cx.notify();
                         }
                     },
@@ -2247,7 +2337,7 @@ impl Browser {
             .child(
                 div()
                     .id("git-confirm")
-                    .w(px(460.))
+                    .w(rpx(460.))
                     .max_w_full()
                     .p_5()
                     .flex()
@@ -2260,7 +2350,7 @@ impl Browser {
                     .shadow_xl()
                     .child(
                         div()
-                            .text_size(px(15.))
+                            .text_size(rpx(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
                             .child(confirm.title.clone()),
@@ -2268,7 +2358,7 @@ impl Browser {
                     .when(!confirm.message.is_empty(), |s| {
                         s.child(
                             div()
-                                .text_size(px(12.5))
+                                .text_size(rpx(12.5))
                                 .text_color(rgb(TEXT_2))
                                 .child(confirm.message.clone()),
                         )
@@ -2277,7 +2367,7 @@ impl Browser {
                         s.child(
                             div()
                                 .id("git-confirm-detail")
-                                .max_h(px(180.))
+                                .max_h(rpx(180.))
                                 .overflow_y_scroll()
                                 .p_2()
                                 .rounded_md()
@@ -2285,7 +2375,7 @@ impl Browser {
                                 .border_1()
                                 .border_color(rgb(BORDER))
                                 .font_family(mono_font())
-                                .text_size(px(11.5))
+                                .text_size(rpx(11.5))
                                 .text_color(rgb(0xbdbdbd))
                                 .child(detail),
                         )

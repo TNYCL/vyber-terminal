@@ -7807,6 +7807,7 @@ dependencies = [
  "blake3",
  "chrono",
  "dirs 6.0.0",
+ "embed-resource",
  "env_logger",
  "gpui-kit",
  "gpui-pre",

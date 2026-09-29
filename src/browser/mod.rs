@@ -8,9 +8,10 @@ mod tree;
 
 use crate::{
     changeset::{self, Commit, FileChange, FileDiff},
+    config::{Config, PanelMode},
     git::{self as vcs, ops},
     tasks::TaskReview,
-    theme::{self, BORDER, PANEL},
+    theme::{self, BORDER, PANEL, rpx},
     workspace::{self, Change, Checkpoint, FileEntry},
 };
 use gpui::{prelude::*, *};
@@ -27,6 +28,35 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+actions!(
+    vyber_files,
+    [CloseFile, NextFile, PreviousFile, FindInPanel]
+);
+
+/// Editor-style shortcuts inside the file panel; the terminal keeps Ctrl+W.
+/// Ctrl+Tab is bound for the whole window, which hands it to a focused panel
+/// (see [`Browser::cycle_tab`]): a binding without context outranks the
+/// panel's own inside the editor.
+pub fn bind_keys(cx: &mut App) {
+    let context = Some("FileBrowser");
+    let close = if cfg!(target_os = "macos") {
+        "cmd-w"
+    } else {
+        "ctrl-w"
+    };
+    let find = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+    cx.bind_keys([
+        KeyBinding::new(close, CloseFile, context),
+        KeyBinding::new("ctrl-pagedown", NextFile, context),
+        KeyBinding::new("ctrl-pageup", PreviousFile, context),
+        KeyBinding::new(find, FindInPanel, context),
+    ]);
+}
 
 const NOTICE_TIME: Duration = Duration::from_secs(4);
 const SIDEBAR_MIN: f32 = 190.;
@@ -166,6 +196,8 @@ pub enum BrowserEvent {
     RunInTerminal(String),
     /// Edit (or create) the project of this folder.
     EditProject(PathBuf),
+    /// The panel was closed from the keyboard or its close button.
+    Closed,
 }
 impl EventEmitter<BrowserEvent> for Browser {}
 
@@ -243,6 +275,9 @@ pub struct Browser {
     notice_serial: u64,
     loading: bool,
     zoom: f32,
+    /// How much the panel's text size scales it, for turning dragged pixels
+    /// into widths that scale along.
+    scale: f32,
     restore_docs: Vec<SavedDocument>,
     restore_active: Option<PathBuf>,
     pending_line: Option<(PathBuf, usize)>,
@@ -344,6 +379,7 @@ impl Browser {
             notice_serial: 0,
             loading: true,
             zoom: 1.,
+            scale: 1.,
             restore_docs: vec![],
             restore_active: None,
             pending_line: None,
@@ -361,6 +397,119 @@ impl Browser {
             stop,
             scope,
             _subscriptions: subscriptions,
+        }
+    }
+    /// Whether the panel or anything in it has keyboard focus.
+    pub fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+    }
+    /// Shows `text` briefly at the bottom of the panel.
+    pub fn announce(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.say(text);
+        cx.notify();
+    }
+    /// Floats every file panel over its terminal, or docks it beside the
+    /// terminal, which then gets narrower.
+    pub(super) fn dock_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let docked = cx.global::<Config>().panel_mode == PanelMode::Dock;
+        theme::icon_button(
+            "panel-mode",
+            if docked { "panel-float" } else { "panel-dock" },
+            if docked {
+                "Float over terminal"
+            } else {
+                "Dock beside terminal"
+            },
+        )
+        .on_click(cx.listener(|_, _, _, cx| {
+            Config::update(cx, |c| {
+                c.panel_mode = match c.panel_mode {
+                    PanelMode::Dock => PanelMode::Overlay,
+                    PanelMode::Overlay => PanelMode::Dock,
+                }
+            });
+        }))
+    }
+    /// Hides the panel and hands the keyboard back to the terminal.
+    pub(super) fn close_panel(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        self.menu = None;
+        self.git.menu = None;
+        cx.emit(BrowserEvent::Closed);
+        cx.notify();
+    }
+    fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_front(window, cx);
+    }
+    /// Ctrl+W closes the file in front, or the panel when no file is.
+    pub fn close_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Files && self.active_doc < self.docs.len() {
+            self.close_doc(self.active_doc, cx);
+            self.focus_shown_tab(window, cx);
+        } else {
+            self.close_panel(cx);
+        }
+    }
+    fn next_file(&mut self, _: &NextFile, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.cycle_tab(1, window, cx) {
+            cx.propagate();
+        }
+    }
+    fn previous_file(&mut self, _: &PreviousFile, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.cycle_tab(-1, window, cx) {
+            cx.propagate();
+        }
+    }
+    /// Moves along the tab strip (Review, then the open files), wrapping
+    /// around. Source control has no tabs: there it returns false and leaves
+    /// the shortcut to the window.
+    pub fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.view == View::Git {
+            return false;
+        }
+        let count = self.docs.len() as isize + 1;
+        let current = if self.view == View::Review || self.docs.is_empty() {
+            0
+        } else {
+            self.active_doc as isize + 1
+        };
+        match (current + step).rem_euclid(count) {
+            0 => self.show_review(cx),
+            next => {
+                let index = next as usize - 1;
+                let path = self.docs[index].path.clone();
+                self.active_doc = index;
+                self.view = View::Files;
+                self.menu = None;
+                self.tree_selected = Some(self.relative(&path));
+                self.reveal = true;
+                self.tab_scroll.scroll_to_item(index);
+            }
+        }
+        self.focus_shown_tab(window, cx);
+        cx.notify();
+        true
+    }
+    fn find_in_panel(&mut self, _: &FindInPanel, window: &mut Window, cx: &mut Context<Self>) {
+        match self.view {
+            View::Review => self.open_find(window, cx),
+            // The editor has its own find; elsewhere there is nothing to search.
+            _ => cx.propagate(),
+        }
+    }
+    /// Keeps the keyboard in the panel after the shown tab changed: in the
+    /// editor when the tab shows one, else on the panel itself.
+    fn focus_shown_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self
+            .docs
+            .get(self.active_doc)
+            .filter(|d| {
+                self.view == View::Files && d.kind == Kind::Text && !(d.preview && d.markdown())
+            })
+            .map(|d| d.editor.clone());
+        match editor {
+            Some(editor) => editor.update(cx, |e, cx| e.focus(window, cx)),
+            None => window.focus(&self.focus, cx),
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -1010,6 +1159,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scale = f32::from(window.rem_size()) / theme::REM;
         self.view_changed();
         if self.shown_view != Some(self.view) {
             self.shown_view = Some(self.view);
@@ -1058,7 +1208,7 @@ impl Render for Browser {
                             .relative()
                             .h_full()
                             .flex_shrink_0()
-                            .w(px(width * shown))
+                            .w(rpx(width * shown))
                             .overflow_hidden()
                             .child(
                                 div()
@@ -1066,14 +1216,15 @@ impl Render for Browser {
                                     .top_0()
                                     .bottom_0()
                                     .left_0()
-                                    .w(px(width))
+                                    .w(rpx(width))
                                     .child(sidebar),
                             )
                             .child(theme::resize_handle("sidebar-resize", SidebarResize).left_0()),
                     )
                 })
                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
-                    this.sidebar_width[side] = f32::from(e.bounds.right() - e.event.position.x)
+                    this.sidebar_width[side] = (f32::from(e.bounds.right() - e.event.position.x)
+                        / this.scale)
                         .clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
                     cx.notify();
                 }))
@@ -1098,11 +1249,16 @@ impl Render for Browser {
             .track_focus(&self.focus)
             .key_context("FileBrowser")
             .on_key_down(cx.listener(Self::tree_key))
+            .on_action(cx.listener(Self::close_file))
+            .on_action(cx.listener(Self::next_file))
+            .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(Self::find_in_panel))
             .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(PANEL))
+            .text_size(rpx(12.))
             .text_color(rgb(theme::TEXT))
             .child(if self.view == View::Git {
                 self.git_strip(cx)
@@ -1117,7 +1273,7 @@ impl Render for Browser {
                         .absolute()
                         .bottom_3()
                         .left_3()
-                        .max_w(px(460.))
+                        .max_w(rpx(460.))
                         .px_3()
                         .py_1p5()
                         .rounded_md()
@@ -1125,7 +1281,7 @@ impl Render for Browser {
                         .border_1()
                         .border_color(rgb(BORDER))
                         .shadow_lg()
-                        .text_size(px(12.))
+                        .text_size(rpx(12.))
                         .text_color(rgb(theme::TEXT_2))
                         .child(self.notice.clone())
                         .with_animation(

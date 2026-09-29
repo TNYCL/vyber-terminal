@@ -28,7 +28,7 @@ impl Browser {
                 let dirty = doc.dirty;
                 tab(("doc", i), active)
                     .group(group.clone())
-                    .max_w(px(220.))
+                    .max_w(rpx(220.))
                     .child(icon(icon_path, color, 14.))
                     .child(
                         div()
@@ -43,12 +43,12 @@ impl Browser {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(18.))
+                            .size(rpx(18.))
                             .flex_shrink_0()
-                            .rounded(px(4.))
+                            .rounded(rpx(4.))
                             .hover(|s| s.bg(rgb(SELECTED)))
                             .when(dirty, |s| {
-                                s.child(div().size(px(7.)).rounded_full().bg(rgb(TEXT_2)))
+                                s.child(div().size(rpx(7.)).rounded_full().bg(rgb(TEXT_2)))
                             })
                             .when(!dirty, |s| {
                                 s.child(
@@ -78,7 +78,7 @@ impl Browser {
             })
             .collect::<Vec<_>>();
         div()
-            .h(px(42.))
+            .h(rpx(42.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -98,9 +98,9 @@ impl Browser {
                         s.child(
                             div()
                                 .px_1p5()
-                                .rounded(px(4.))
+                                .rounded(rpx(4.))
                                 .bg(rgb(SELECTED))
-                                .text_size(px(10.5))
+                                .text_size(rpx(10.5))
                                 .text_color(rgb(TEXT_2))
                                 .child(change_count.to_string()),
                         )
@@ -108,7 +108,7 @@ impl Browser {
                     .on_click(cx.listener(|this, _, _, cx| this.show_review(cx))),
             )
             .when(!self.docs.is_empty(), |s| {
-                s.child(div().w(px(1.)).h(px(18.)).mx_0p5().bg(rgb(BORDER)))
+                s.child(div().w(px(1.)).h(rpx(18.)).mx_0p5().bg(rgb(BORDER)))
             })
             .child(
                 div()
@@ -126,7 +126,8 @@ impl Browser {
                     cx.listener(|this, _, window, cx| this.focus_filter(window, cx)),
                 ),
             )
-            .child(div().flex_1().min_w(px(8.)))
+            .child(div().flex_1().min_w(rpx(8.)))
+            .child(self.dock_button(cx))
             .child({
                 let open = self.sidebar_open();
                 let label = match (self.view, open) {
@@ -189,11 +190,7 @@ impl Browser {
             )
             .child(
                 icon_button("close-panel", "x", "Close panel  (Ctrl+Shift+B)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.visible = false;
-                        this.menu = None;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
             )
     }
 
@@ -257,7 +254,7 @@ impl Browser {
                             .px_8()
                             .pt_5()
                             .pb_12()
-                            .text_size(px(14.))
+                            .text_size(rpx(14.))
                             .line_height(rems(1.6))
                             .text_color(rgb(0xd6d6d6))
                             .child(
@@ -289,6 +286,7 @@ impl Browser {
                     Editor::new(&doc.editor)
                         .appearance(false)
                         .bordered(false)
+                        .text_size(rpx(13.))
                         .h_full(),
                 )
                 .into_any_element(),
@@ -306,11 +304,11 @@ impl Browser {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .h(px(34.))
+                        .h(rpx(34.))
                         .px_3()
                         .bg(rgb(WARNING_BG))
                         .text_color(rgb(WARNING))
-                        .text_size(px(12.))
+                        .text_size(rpx(12.))
                         .child(icon(ui("triangle-alert"), WARNING, 14.))
                         .child(
                             div()
@@ -328,7 +326,7 @@ impl Browser {
             })
             .child(div().flex_1().min_h_0().overflow_hidden().child(body))
             .when(self.menu == Some(Menu::Open), |s| {
-                s.child(self.open_menu(path.clone(), cx))
+                s.child(menu_in("open-menu-in", self.open_menu(path.clone(), cx).into_any_element()))
             })
             .into_any_element()
     }
@@ -362,7 +360,7 @@ impl Browser {
                     .id(("crumb", id))
                     .flex_shrink_0()
                     .px_1()
-                    .rounded(px(4.))
+                    .rounded(rpx(4.))
                     .text_color(rgb(if last { TEXT } else { MUTED }))
                     .when(last, |s| s.font_weight(FontWeight::SEMIBOLD))
                     .when(!last, |s| {
@@ -397,7 +395,7 @@ impl Browser {
         }
         let copy_path = relative.to_string();
         div()
-            .h(px(36.))
+            .h(rpx(36.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -406,7 +404,7 @@ impl Browser {
             .pr_2()
             .border_b_1()
             .border_color(rgb(DIVIDER))
-            .text_size(px(12.5))
+            .text_size(rpx(12.5))
             .child(
                 div()
                     .id("breadcrumb")
@@ -426,9 +424,9 @@ impl Browser {
                 )))
                 .child(
                     div()
-                        .w(px(40.))
+                        .w(rpx(40.))
                         .text_center()
-                        .text_size(px(11.5))
+                        .text_size(rpx(11.5))
                         .text_color(rgb(MUTED))
                         .child(format!("{:.0}%", self.zoom * 100.)),
                 )
@@ -480,14 +478,14 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .h(px(26.))
+                    .h(rpx(26.))
                     .pl_2()
                     .pr_1p5()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(SURFACE))
-                    .text_size(px(12.))
+                    .text_size(rpx(12.))
                     .text_color(rgb(TEXT))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(HOVER)))
@@ -516,9 +514,9 @@ impl Browser {
             .id("open-menu")
             .absolute()
             .occlude()
-            .top(px(38.))
+            .top(rpx(38.))
             .right_2()
-            .w(px(230.))
+            .w(rpx(230.))
             .p_1()
             .flex()
             .flex_col()
@@ -534,10 +532,10 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(30.))
+                    .h(rpx(30.))
                     .px_2()
                     .rounded_md()
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(TEXT))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(HOVER)))
@@ -579,14 +577,14 @@ impl Browser {
             .child(
                 div()
                     .mt_2()
-                    .text_size(px(15.))
+                    .text_size(rpx(15.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
                     .child(name),
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(rpx(12.5))
                     .text_color(rgb(MUTED))
                     .child(format!("{reason} · {}", human_size(size))),
             )
@@ -625,12 +623,12 @@ fn tab(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         .items_center()
         .flex_shrink_0()
         .gap_1p5()
-        .h(px(28.))
+        .h(rpx(28.))
         .pl_2p5()
         .pr_1()
         .rounded_lg()
         .border_1()
-        .text_size(px(12.5))
+        .text_size(rpx(12.5))
         .cursor_pointer()
         .when(active, |s| {
             s.bg(rgb(SURFACE))
@@ -660,14 +658,14 @@ pub(super) fn empty_state(
         .child(icon(ui(name), TEXT_2, 30.).mb_2())
         .child(
             div()
-                .text_size(px(15.))
+                .text_size(rpx(15.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT))
                 .child(title.to_string()),
         )
         .child(
             div()
-                .text_size(px(12.5))
+                .text_size(rpx(12.5))
                 .text_color(rgb(MUTED))
                 .child(detail.to_string()),
         )
@@ -675,7 +673,7 @@ pub(super) fn empty_state(
             s.child(
                 div()
                     .mt_3()
-                    .text_size(px(11.5))
+                    .text_size(rpx(11.5))
                     .text_color(rgb(FAINT))
                     .child(hint.to_string()),
             )
@@ -692,14 +690,14 @@ fn markdown_style() -> TextViewStyle {
         .p_3();
     TextViewStyle::default()
         .paragraph_gap(rems(0.9))
-        .heading_font_size(|level, _| {
-            px(match level {
+        .heading_font_size(|level, rem| {
+            rem * (match level {
                 1 => 26.,
                 2 => 20.,
                 3 => 17.,
                 4 => 15.,
                 _ => 14.,
-            })
+            } / REM)
         })
         .code_block(code_block)
         .inline_code(HighlightStyle {

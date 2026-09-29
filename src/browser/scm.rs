@@ -26,6 +26,19 @@ pub(super) const GRAPH_PAGE: usize = 200;
 /// Files shown per group before "… more".
 pub(super) const GROUP_LIMIT: usize = 400;
 
+/// Seconds a section takes to open or close.
+const FOLD_TIME: f32 = 0.2;
+/// Seconds a dialog or picker takes to fade out.
+pub(super) const FADE_TIME: f32 = 0.12;
+
+/// A section that opens and closes with a slide.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) enum Fold {
+    Repo(PathBuf),
+    Group(PathBuf, Group),
+    Graph,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) enum Group {
     Merge,
@@ -325,6 +338,11 @@ pub(super) struct GitState {
     pub quick_subscription: Option<Subscription>,
     /// The Files or Review view the Files button goes back to.
     pub files_view: Option<View>,
+    /// Sections moving open or closed, and since when.
+    pub folds: HashMap<Fold, (bool, Instant)>,
+    /// A picker or dialog fading out after it closed.
+    pub closing_quick: Option<(Quick, Instant)>,
+    pub closing_confirm: Option<(Confirm, Instant)>,
 }
 
 impl GitState {
@@ -370,21 +388,39 @@ impl GitState {
             subscriptions: vec![],
             quick_subscription: None,
             files_view: None,
+            folds: HashMap::new(),
+            closing_quick: None,
+            closing_confirm: None,
         }
+    }
+    /// How open a section is, from 0 (closed) to 1, easing towards `open`.
+    pub fn fold(&self, key: &Fold, open: bool) -> f32 {
+        let target = f32::from(u8::from(open));
+        match self.folds.get(key) {
+            Some((to, at)) if *to == open => {
+                let t = crate::theme::ease_out((at.elapsed().as_secs_f32() / FOLD_TIME).min(1.));
+                (1. - target) + (target - (1. - target)) * t
+            }
+            _ => target,
+        }
+    }
+    /// Starts moving a section open or closed.
+    pub fn set_fold(&mut self, key: Fold, open: bool) {
+        self.folds.insert(key, (open, Instant::now()));
+    }
+    /// Whether anything is still moving, so frames keep coming.
+    pub fn moving(&self) -> bool {
+        self.folds
+            .values()
+            .any(|(_, at)| at.elapsed().as_secs_f32() < FOLD_TIME)
+            || self.closing_quick.is_some()
+            || self.closing_confirm.is_some()
     }
     pub fn repo(&self, path: &Path) -> Option<&RepoView> {
         self.repos.iter().find(|r| r.repo.path == path)
     }
     pub fn current(&self) -> Option<&RepoView> {
         self.selected.as_deref().and_then(|p| self.repo(p))
-    }
-    /// Changes across every repository, for the title bar badge.
-    pub fn change_count(&self) -> usize {
-        self.repos
-            .iter()
-            .filter_map(RepoView::status)
-            .map(Status::changes)
-            .sum()
     }
 }
 
@@ -463,13 +499,10 @@ impl Browser {
         cx.notify();
     }
 
-    /// Changes in the workspace (and its project repositories).
+    /// Changed files in the workspace and its project repositories, for the
+    /// title bar badge. The same count whether or not the Git view was opened.
     pub fn change_count(&self) -> usize {
-        if self.git.discovered {
-            self.git.change_count()
-        } else {
-            self.changes.len()
-        }
+        self.changes.len()
     }
 
     pub(super) fn load_repos(&mut self) {
@@ -1054,9 +1087,16 @@ impl Browser {
 
     // ---- Actions -----------------------------------------------------------------
 
+    /// Closes the dialog with a short fade.
+    pub(super) fn dismiss_confirm(&mut self) {
+        if let Some(confirm) = self.git.confirm.take() {
+            self.git.closing_confirm = Some((confirm, Instant::now()));
+        }
+    }
+
     pub(super) fn perform(&mut self, action: GitAction, window: &mut Window, cx: &mut Context<Self>) {
         self.git.menu = None;
-        self.git.confirm = None;
+        self.dismiss_confirm();
         let Some(repo) = self.git.selected.clone().or_else(|| match &action {
             GitAction::SelectRepo(p) => Some(p.clone()),
             _ => None,
@@ -1865,7 +1905,7 @@ impl Browser {
                     switch(repo, false)?;
                     if let Err(e) = ops::stash_action(repo, "pop", "stash@{0}") {
                         return Ok(After::Notice(format!(
-                            "Switched to {target} · your changes conflicted and stay in the latest stash ({})",
+                            "Switched to {target} · your changes conflict here: resolve them under Merge Changes (they're also kept in the latest stash) · {}",
                             e.message.lines().next().unwrap_or_default()
                         )));
                     }
@@ -1934,7 +1974,9 @@ impl Browser {
     }
 
     pub(super) fn close_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.git.quick = None;
+        if let Some(quick) = self.git.quick.take() {
+            self.git.closing_quick = Some((quick, Instant::now()));
+        }
         self.git.quick_subscription = None;
         window.focus(&self.focus, cx);
         cx.notify();

@@ -1,7 +1,8 @@
 //! Embedded icons and the file-type → icon mapping used by the file browser.
 //!
-//! File icons are Seti UI glyphs (MIT); interface icons are Lucide (ISC). Both
-//! are monochrome and tinted at draw time. Regenerate with
+//! File icons are Seti UI glyphs (MIT); interface icons are Lucide (ISC), with
+//! `panel-dock` and `panel-float` drawn in the same style. All are monochrome
+//! and tinted at draw time. Regenerate with
 //! `scripts/build_file_icons.py`.
 use gpui::{AssetSource, SharedString};
 use std::{borrow::Cow, path::Path};
@@ -40,6 +41,7 @@ static ICONS: &[(&str, &[u8])] = embed![
     "ui/git-branch-plus.svg", "ui/git-branch.svg", "ui/git-commit-horizontal.svg",
     "ui/git-compare.svg", "ui/git-fork.svg", "ui/git-graph.svg", "ui/git-merge.svg", "ui/image.svg",
     "ui/loader-circle.svg", "ui/maximize-2.svg", "ui/minimize-2.svg", "ui/minus.svg",
+    "ui/panel-dock.svg", "ui/panel-float.svg",
     "ui/panel-right-close.svg", "ui/panel-right.svg", "ui/pencil.svg", "ui/pin-off.svg",
     "ui/pin.svg", "ui/plus.svg", "ui/refresh-ccw.svg", "ui/refresh-cw.svg", "ui/rotate-ccw.svg",
     "ui/rows-2.svg", "ui/save.svg", "ui/scan.svg", "ui/search.svg", "ui/square-terminal.svg",

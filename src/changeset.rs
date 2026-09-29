@@ -358,7 +358,7 @@ pub fn turn_plan(task: &TaskReview) -> Result<Plan> {
         .context("This turn has no start snapshot, so its changes can't be shown")?;
     let git = Git {
         dir: before.root.clone(),
-        env: before.object_env().to_vec(),
+        env: before.object_env(),
     };
     let (changes, after) = match &task.after {
         Some(after) => (
@@ -1082,6 +1082,8 @@ mod tests {
             label: String::new(),
             root: root.to_owned(),
             session: String::new(),
+            client: String::new(),
+            started: 0,
             changes: before.changes_to(&after)?,
             before: Some(before),
             after: Some(after),
@@ -1104,6 +1106,53 @@ mod tests {
                 ("b.txt".into(), 'A', 1, 0, Blob::Missing, bytes("new\n")),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn turn_plan_reads_a_folder_of_repositories() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        for name in ["api", "web"] {
+            fs::create_dir(root.join(name))?;
+            git_text(&root.join(name), &["init", "-q"])?;
+            git_text(&root.join(name), &["config", "core.autocrlf", "false"])?;
+            fs::write(root.join(name).join("a.txt"), "one\n")?;
+        }
+        let before = Checkpoint::capture(root, "start")?;
+        fs::write(root.join("api/a.txt"), "one\ntwo\n")?;
+        fs::write(root.join("web/b.txt"), "new\n")?;
+        let mut task = TaskReview {
+            id: "t".into(),
+            agent: "Codex".into(),
+            label: String::new(),
+            root: root.to_owned(),
+            session: String::new(),
+            client: String::new(),
+            started: 0,
+            changes: vec![],
+            before: Some(before.clone()),
+            after: None,
+            active: true,
+            warning: String::new(),
+        };
+        let expected = vec![
+            (
+                "api/a.txt".into(),
+                'M',
+                1,
+                0,
+                bytes("one\n"),
+                bytes("one\ntwo\n"),
+            ),
+            ("web/b.txt".into(), 'A', 1, 0, Blob::Missing, bytes("new\n")),
+        ];
+        // Live, the after side is the working tree; at the end, a snapshot.
+        let live = before.refresh("live", &[root.join("api/a.txt"), root.join("web/b.txt")])?;
+        task.changes = before.changes_to(&live)?;
+        assert_eq!(read(&turn_plan(&task)?)?, expected);
+        task.after = Some(Checkpoint::capture(root, "end")?);
+        assert_eq!(read(&turn_plan(&task)?)?, expected);
         Ok(())
     }
 

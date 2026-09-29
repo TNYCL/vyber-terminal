@@ -44,7 +44,12 @@ pub fn repository_root(path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Settings and saved state. `VYBER_DATA_DIR` gives a second copy, such as a
+/// test instance, a folder of its own.
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("VYBER_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("Vyber")
@@ -407,33 +412,44 @@ pub struct Checkpoint {
     pub created: String,
     pub objects: PathBuf,
     pub alternates: PathBuf,
+    /// Vyber's own repository, for a snapshot of a folder that has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dir: Option<PathBuf>,
 }
 
 impl Checkpoint {
     /// Snapshots the working tree of `root`'s repository, including the
-    /// project's repositories inside it.
+    /// project's repositories inside it. A folder that is no repository
+    /// itself, such as one that holds several projects, gets a snapshot of
+    /// the repositories below it instead.
     pub fn capture(root: &Path, label: &str) -> Result<Self> {
-        let root = repository_root(root).context("Checkpoints require a Git repository")?;
-        let nested = crate::project::nested_folders(&root);
-        Self::capture_with(&root, label, &nested)
+        let Some(repository) = repository_root(root) else {
+            return Self::capture_group(root, label, None);
+        };
+        let nested = crate::project::nested_folders(&repository);
+        Self::capture_with(&repository, label, &nested)
+    }
+
+    /// A later snapshot of the same folder. For a folder of repositories only
+    /// those with a path in `changed` are read again; the others keep their
+    /// files from `self`.
+    pub fn refresh(&self, label: &str, changed: &[PathBuf]) -> Result<Self> {
+        if self.git_dir.is_some() {
+            Self::capture_group(&self.root, label, Some((self, changed)))
+        } else {
+            Self::capture(&self.root, label)
+        }
     }
 
     /// [`Checkpoint::capture`] of the repository at `root` with the
     /// repositories in `nested` folded in.
     pub fn capture_with(root: &Path, label: &str, nested: &[PathBuf]) -> Result<Self> {
         let root = root.to_owned();
-        let id = format!(
-            "{}-{}",
-            chrono::Utc::now().timestamp_millis(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = next_id();
         let store = data_dir().join("checkpoints");
         fs::create_dir_all(&store)?;
         let index = store.join(format!("{id}.index"));
-        let repository_key = blake3::hash(root.to_string_lossy().as_bytes())
-            .to_hex()
-            .to_string();
-        let objects = store.join(repository_key).join("objects");
+        let objects = store.join(store_key(&root)).join("objects");
         fs::create_dir_all(&objects)?;
         let alternates = PathBuf::from(git_text(
             &root,
@@ -451,31 +467,21 @@ impl Checkpoint {
         if real_index.exists() {
             fs::copy(&real_index, &index)?;
         }
-        let run = |args: &[&str]| -> Result<String> {
-            let output = command("git")
-                .args(args)
-                .current_dir(&root)
-                .env("GIT_INDEX_FILE", &index)
-                .env("GIT_OBJECT_DIRECTORY", &objects)
-                .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &alternates)
-                .output()?;
-            if !output.status.success() {
-                bail!("{}", String::from_utf8_lossy(&output.stderr));
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+        let git = SnapshotGit {
+            root: &root,
+            index: &index,
+            objects: &objects,
+            alternates: &alternates,
+            git_dir: None,
         };
         let result = (|| {
             if !index.exists() {
-                run(&["read-tree", "--empty"])?;
+                git.run(&["read-tree", "--empty"])?;
             }
-            run(&["add", "-A", "--", "."])?;
+            git.run(&["add", "-A", "--", "."])?;
             // Store exact working-tree bytes, including CRLF/BOM. Clean filters must not
             // turn a task snapshot into a different file from the one on disk.
-            let listed = command("git")
-                .args(["ls-files", "--stage", "-z"])
-                .current_dir(&root)
-                .env("GIT_INDEX_FILE", &index)
-                .output()?;
+            let listed = git.command().args(["ls-files", "--stage", "-z"]).output()?;
             if !listed.status.success() {
                 bail!("Cannot enumerate snapshot index");
             }
@@ -497,7 +503,7 @@ impl Checkpoint {
                 let mode = std::str::from_utf8(&entry[..6])?.to_owned();
                 let path = std::str::from_utf8(&entry[tab + 1..])?.to_owned();
                 if mode == "160000" {
-                    if root.join(&path).join(".git").exists() {
+                    if embedded(&root.join(&path)) {
                         nested.push(path);
                     }
                     continue;
@@ -514,82 +520,128 @@ impl Checkpoint {
                     !nested.iter().any(|n| path.starts_with(&format!("{n}/")))
                 });
                 for folder in &nested {
-                    entries.extend(nested_entries(&root, folder)?);
+                    entries.extend(nested_entries(&root, folder)?.0);
                 }
                 // Start the snapshot index over so no gitlink is left in it.
                 let _ = fs::remove_file(&index);
-                run(&["read-tree", "--empty"])?;
+                git.run(&["read-tree", "--empty"])?;
             }
-            let mut names = Vec::new();
-            for (_, path) in &entries {
-                names.extend(serde_json::to_string(path)?.as_bytes());
-                names.push(b'\n');
-            }
-            let run_input = |args: &[&str], input: Vec<u8>| -> Result<Vec<u8>> {
-                use std::io::Write;
-                let mut child = command("git")
-                    .args(args)
-                    .current_dir(&root)
-                    .env("GIT_INDEX_FILE", &index)
-                    .env("GIT_OBJECT_DIRECTORY", &objects)
-                    .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &alternates)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()?;
-                let mut stdin = child.stdin.take().context("Snapshot input pipe")?;
-                let writer = std::thread::spawn(move || stdin.write_all(&input));
-                let out = child.wait_with_output()?;
-                writer
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("Snapshot writer failed"))??;
-                if !out.status.success() {
-                    bail!("{}", String::from_utf8_lossy(&out.stderr));
-                }
-                Ok(out.stdout)
-            };
-            if !entries.is_empty() {
-                let hashes = run_input(
-                    &["hash-object", "-w", "--no-filters", "--stdin-paths"],
-                    names,
-                )?;
-                let hashes = std::str::from_utf8(&hashes)?.lines().collect::<Vec<_>>();
-                if hashes.len() != entries.len() {
-                    bail!("Incomplete raw snapshot");
-                }
-                let mut updates = Vec::new();
-                for ((mode, path), hash) in entries.iter().zip(hashes) {
-                    updates.extend(format!("{mode} {hash}\t{path}\0").as_bytes());
-                }
-                run_input(&["update-index", "-z", "--index-info"], updates)?;
-            }
-            let tree = run(&["write-tree"])?;
-            let snapshot = Self {
+            Self {
                 id: id.clone(),
-                tree,
+                tree: git.write(&entries, Vec::new())?,
                 root: root.clone(),
                 objects: objects.clone(),
                 alternates: alternates.clone(),
+                git_dir: None,
                 label: label.into(),
                 created: chrono::Local::now().format("%H:%M:%S").to_string(),
-            };
-            fs::write(
-                store.join(format!("{id}.json")),
-                serde_json::to_vec_pretty(&snapshot)?,
-            )?;
-            Ok(snapshot)
+            }
+            .saved()
         })();
         let _ = fs::remove_file(&index);
         result
     }
+
+    /// Snapshot of a folder that is no repository: the repositories below it
+    /// (see [`crate::project::discover`]) side by side under their folders,
+    /// kept in a bare repository of Vyber's own. With `previous`, a
+    /// repository without a path in its list keeps its files from that
+    /// snapshot instead of being read again.
+    fn capture_group(
+        root: &Path,
+        label: &str,
+        previous: Option<(&Self, &[PathBuf])>,
+    ) -> Result<Self> {
+        let repositories = crate::project::discover(root);
+        if repositories.is_empty() {
+            bail!("Checkpoints require a Git repository");
+        }
+        let root = root.to_owned();
+        let id = next_id();
+        let store = data_dir().join("checkpoints");
+        let git_dir = store.join(store_key(&root));
+        let objects = git_dir.join("objects");
+        fs::create_dir_all(&objects)?;
+        if !git_dir.join("HEAD").exists() {
+            git_text(&git_dir, &["init", "-q", "--bare"])?;
+        }
+        let index = store.join(format!("{id}.index"));
+        let git = SnapshotGit {
+            root: &root,
+            index: &index,
+            objects: &objects,
+            alternates: &objects,
+            git_dir: Some(&git_dir),
+        };
+        let result = (|| {
+            let mut entries = Vec::new();
+            // Index lines, as `ls-tree` prints them, of the repositories kept.
+            let mut kept = Vec::new();
+            for repository in &repositories {
+                let folder = repository
+                    .strip_prefix(&root)
+                    .unwrap_or(repository)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Some((before, changed)) = previous
+                    && !changed
+                        .iter()
+                        .any(|p| crate::tasks::matches_root(p, repository))
+                {
+                    let tree = before.tree.as_str();
+                    let listed =
+                        before.git(&["ls-tree", "-r", "-z", "--full-tree", tree, "--", &folder])?;
+                    if listed.status.success() && !listed.stdout.is_empty() {
+                        kept.extend(listed.stdout);
+                        continue;
+                    }
+                }
+                entries.extend(repository_entries(&root, &folder)?);
+            }
+            let count = entries.len() + kept.iter().filter(|b| **b == 0).count();
+            if count > GROUP_LIMIT {
+                bail!(
+                    "{count} files in the repositories below {}; start the agent in one of them",
+                    root.display()
+                );
+            }
+            git.run(&["read-tree", "--empty"])?;
+            Self {
+                id: id.clone(),
+                tree: git.write(&entries, kept)?,
+                root: root.clone(),
+                objects: objects.clone(),
+                alternates: objects.clone(),
+                git_dir: Some(git_dir.clone()),
+                label: label.into(),
+                created: chrono::Local::now().format("%H:%M:%S").to_string(),
+            }
+            .saved()
+        })();
+        let _ = fs::remove_file(&index);
+        result
+    }
+
+    /// Records the snapshot next to its objects, for Review to find again.
+    fn saved(self) -> Result<Self> {
+        fs::write(
+            data_dir()
+                .join("checkpoints")
+                .join(format!("{}.json", self.id)),
+            serde_json::to_vec_pretty(&self)?,
+        )?;
+        Ok(self)
+    }
     fn git(&self, args: &[&str]) -> Result<Output> {
-        Ok(command("git")
+        let mut command = command("git");
+        command
             .args(["--no-pager", "-c", "core.quotepath=false"])
             .args(args)
-            .current_dir(&self.root)
-            .env("GIT_OBJECT_DIRECTORY", &self.objects)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &self.alternates)
-            .output()?)
+            .current_dir(&self.root);
+        for (key, value) in self.object_env() {
+            command.env(key, value);
+        }
+        Ok(command.output()?)
     }
     pub fn changes_to(&self, after: &Self) -> Result<Vec<Change>> {
         let out = self.git(&[
@@ -634,11 +686,15 @@ impl Checkpoint {
             .collect())
     }
     /// Environment that lets plain `git` commands read this snapshot's objects.
-    pub fn object_env(&self) -> [(&'static str, PathBuf); 2] {
-        [
+    pub fn object_env(&self) -> Vec<(&'static str, PathBuf)> {
+        let mut env = vec![
             ("GIT_OBJECT_DIRECTORY", self.objects.clone()),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.alternates.clone()),
-        ]
+        ];
+        if let Some(dir) = &self.git_dir {
+            env.push(("GIT_DIR", dir.clone()));
+        }
+        env
     }
     pub fn checked_content(&self, path: &str) -> Result<Option<Vec<u8>>> {
         safe_path(&self.root, path)?;
@@ -712,15 +768,139 @@ impl Checkpoint {
     }
 }
 
+/// A snapshot of a folder of repositories stops at this many files.
+const GROUP_LIMIT: usize = 20_000;
+
+fn next_id() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Folder name of a snapshotted folder's objects in the checkpoint store.
+fn store_key(root: &Path) -> String {
+    blake3::hash(root.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Whether a snapshot folds in the repository at `path`. Linked worktrees,
+/// such as those agents check out under `.claude/worktrees`, are other
+/// checkouts of a repository rather than part of the folder they sit in.
+fn embedded(path: &Path) -> bool {
+    crate::project::is_repository(path) && !crate::project::is_linked_worktree(path)
+}
+
+/// Git on a snapshot's temporary index and object store.
+struct SnapshotGit<'a> {
+    root: &'a Path,
+    index: &'a Path,
+    objects: &'a Path,
+    alternates: &'a Path,
+    git_dir: Option<&'a Path>,
+}
+
+impl SnapshotGit<'_> {
+    fn command(&self) -> Command {
+        let mut git = command("git");
+        git.current_dir(self.root)
+            .env("GIT_INDEX_FILE", self.index)
+            .env("GIT_OBJECT_DIRECTORY", self.objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.alternates);
+        if let Some(dir) = self.git_dir {
+            git.env("GIT_DIR", dir);
+        }
+        git
+    }
+    fn run(&self, args: &[&str]) -> Result<String> {
+        let output = self.command().args(args).output()?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    }
+    fn run_input(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("Snapshot input pipe")?;
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output()?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("Snapshot writer failed"))??;
+        if !out.status.success() {
+            bail!("{}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(out.stdout)
+    }
+    /// Stores the exact bytes of `entries` (mode, path), adds them and the
+    /// ready index lines in `updates` to the index, and writes its tree.
+    fn write(&self, entries: &[(String, String)], mut updates: Vec<u8>) -> Result<String> {
+        if !entries.is_empty() {
+            let mut names = Vec::new();
+            for (_, path) in entries {
+                names.extend(serde_json::to_string(path)?.as_bytes());
+                names.push(b'\n');
+            }
+            let hashes = self.run_input(
+                &["hash-object", "-w", "--no-filters", "--stdin-paths"],
+                names,
+            )?;
+            let hashes = std::str::from_utf8(&hashes)?.lines().collect::<Vec<_>>();
+            if hashes.len() != entries.len() {
+                bail!("Incomplete raw snapshot");
+            }
+            for ((mode, path), hash) in entries.iter().zip(hashes) {
+                updates.extend(format!("{mode} {hash}\t{path}\0").as_bytes());
+            }
+        }
+        if !updates.is_empty() {
+            self.run_input(&["update-index", "-z", "--index-info"], updates)?;
+        }
+        self.run(&["write-tree"])
+    }
+}
+
+/// Snapshot entries of the repository at `root/folder` with the repositories
+/// inside it folded in, one level deep, as a snapshot of that repository
+/// holds them.
+fn repository_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>> {
+    let (mut entries, mut inner) = nested_entries(root, folder)?;
+    inner.extend(
+        crate::project::nested_folders(&root.join(folder))
+            .iter()
+            .filter(|f| crate::project::is_repository(f))
+            .filter_map(|f| f.strip_prefix(root).ok())
+            .map(|f| f.to_string_lossy().replace('\\', "/")),
+    );
+    inner.sort();
+    inner.dedup();
+    entries.retain(|(_, path)| !inner.iter().any(|n| path.starts_with(&format!("{n}/"))));
+    for folder in &inner {
+        entries.extend(nested_entries(root, folder)?.0);
+    }
+    Ok(entries)
+}
+
 /// Snapshot entries (mode, path under `root`) for the tracked and untracked,
-/// not ignored, regular files of the repository at `root/folder`.
-fn nested_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>> {
+/// not ignored, regular files of the repository at `root/folder`, and the
+/// folders under `root` of the repositories embedded in it.
+fn nested_entries(root: &Path, folder: &str) -> Result<(Vec<(String, String)>, Vec<String>)> {
     let dir = root.join(folder);
     let is_file = |relative: &str| {
         fs::symlink_metadata(dir.join(relative)).is_ok_and(|m| m.file_type().is_file())
     };
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mut inner = Vec::new();
     let staged = git(&dir, &["ls-files", "--stage", "-z"])?;
     if !staged.status.success() {
         bail!("Cannot list files of {folder}");
@@ -731,6 +911,9 @@ fn nested_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>> {
         };
         let mode = String::from_utf8_lossy(&entry[..6]).into_owned();
         let path = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
+        if mode == "160000" && embedded(&dir.join(&path)) {
+            inner.push(format!("{folder}/{path}"));
+        }
         // Conflicted files list up to three stages; one entry is enough.
         if (mode == "100644" || mode == "100755") && is_file(&path) && seen.insert(path.clone()) {
             out.push((mode, format!("{folder}/{path}")));
@@ -739,11 +922,20 @@ fn nested_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>> {
     let others = git(&dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     for path in others.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(path).into_owned();
+        // An untracked repository inside is listed as its folder.
+        if let Some(repository) = path.strip_suffix('/') {
+            if embedded(&dir.join(repository)) {
+                inner.push(format!("{folder}/{repository}"));
+            }
+            continue;
+        }
         if is_file(&path) && seen.insert(path.clone()) {
             out.push(("100644".into(), format!("{folder}/{path}")));
         }
     }
-    Ok(out)
+    inner.sort();
+    inner.dedup();
+    Ok((out, inner))
 }
 
 /// Keeps a copy of a file's current bytes under `recovery/` before Vyber
@@ -1043,6 +1235,75 @@ mod tests {
         );
         before.restore_file(&after, "api/src/main.rs")?;
         assert_eq!(fs::read_to_string(root.join("api/src/main.rs"))?, "fn main() {}\n");
+        Ok(())
+    }
+    fn paths(before: &Checkpoint, after: &Checkpoint) -> Result<Vec<(String, String)>> {
+        let mut paths: Vec<_> = before
+            .changes_to(after)?
+            .into_iter()
+            .map(|c| (c.path, c.status))
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+    #[test]
+    fn snapshots_leave_out_linked_worktrees() -> Result<()> {
+        let dir = playground()?;
+        let root = dir.path();
+        git_text(root, &["add", ".gitignore", "notes.md"])?;
+        git_text(root, &["commit", "-q", "-m", "start"])?;
+        // An agent's worktree inside the repository, which does not ignore it.
+        let worktree = ".claude/worktrees/agent";
+        git_text(root, &["worktree", "add", "-q", worktree, "-b", "agent"])?;
+        let before = Checkpoint::capture(root, "start")?;
+        fs::write(root.join(".claude/worktrees/agent/notes.md"), "agent\n")?;
+        fs::write(root.join(".claude/worktrees/agent/new.md"), "new\n")?;
+        fs::write(root.join("notes.md"), "edited\n")?;
+        let after = Checkpoint::capture(root, "end")?;
+        assert_eq!(
+            paths(&before, &after)?,
+            vec![("notes.md".to_string(), "M".to_string())]
+        );
+        Ok(())
+    }
+    #[test]
+    fn folders_of_repositories_get_a_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        init(&root.join("a"))?;
+        fs::write(root.join("a/a.txt"), "a\n")?;
+        // An untracked repository inside `a`, as project source folders are.
+        init(&root.join("a/inner"))?;
+        fs::write(root.join("a/inner/inner.txt"), "inner\n")?;
+        init(&root.join("group/b"))?;
+        fs::write(root.join("group/b/b.txt"), "b\n")?;
+        fs::write(root.join("loose.txt"), "not in a repository\n")?;
+        let before = Checkpoint::capture(root, "start")?;
+        assert!(before.git_dir.is_some());
+        fs::write(root.join("a/a.txt"), "a2\n")?;
+        fs::write(root.join("a/inner/inner.txt"), "inner2\n")?;
+        fs::write(root.join("group/b/new.txt"), "new\n")?;
+        fs::write(root.join("loose.txt"), "edited\n")?;
+        let after = Checkpoint::capture(root, "end")?;
+        assert_eq!(
+            paths(&before, &after)?,
+            vec![
+                ("a/a.txt".to_string(), "M".to_string()),
+                ("a/inner/inner.txt".to_string(), "M".to_string()),
+                ("group/b/new.txt".to_string(), "A".to_string()),
+            ]
+        );
+        // A refresh reads again only the repositories with a changed path.
+        fs::write(root.join("group/b/b.txt"), "b2\n")?;
+        let unchanged = after.refresh("live", &[root.join("a/a.txt")])?;
+        assert!(paths(&after, &unchanged)?.is_empty());
+        let refreshed = after.refresh("live", &[root.join("group/b/b.txt")])?;
+        assert_eq!(
+            paths(&after, &refreshed)?,
+            vec![("group/b/b.txt".to_string(), "M".to_string())]
+        );
+        before.restore_file(&after, "a/a.txt")?;
+        assert_eq!(fs::read_to_string(root.join("a/a.txt"))?, "a\n");
         Ok(())
     }
     #[test]

@@ -6,6 +6,7 @@ use crate::{
     workspace,
 };
 use gpui::{prelude::*, *};
+use std::time::Duration;
 use gpui_kit::component::{
     Sizable,
     input::{Input, InputEvent, InputState},
@@ -70,12 +71,16 @@ impl ProjectDialog {
                 }
             }
         };
+        // The caret goes after the name, with nothing selected, as in Codex.
+        let end = name.encode_utf16().count() as u32;
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Project name")
                 .default_value(name)
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
+        input.update(cx, |input, cx| {
+            input.set_cursor_position(gpui_kit::component::input::Position::new(0, end), window, cx)
+        });
         let subscription = cx.subscribe_in(&input, window, |this, _, event, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.save(cx);
@@ -491,7 +496,17 @@ impl Render for ProjectDialog {
                                     .child("Save")
                                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                             ),
+                    )
+                    .with_animation(
+                        "project-card-in",
+                        Animation::new(Duration::from_millis(170)).with_easing(ease_out_quint()),
+                        |el, t| el.opacity(t).mt(px(-10. * (1. - t))),
                     ),
+            )
+            .with_animation(
+                "project-backdrop-in",
+                Animation::new(Duration::from_millis(140)),
+                |el, t| el.opacity(t),
             )
     }
 }
