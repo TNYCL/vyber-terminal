@@ -44,9 +44,29 @@ pub fn repository_root(path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Settings and saved state. `VYBER_DATA_DIR` gives a second copy, such as a
-/// test instance, a folder of its own.
+#[cfg(test)]
+thread_local! {
+    static TEST_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub struct TestDataDir(Option<PathBuf>);
+#[cfg(test)]
+impl TestDataDir {
+    pub fn set(path: PathBuf) -> Self {
+        Self(TEST_DATA_DIR.with(|value| value.replace(Some(path))))
+    }
+}
+#[cfg(test)]
+impl Drop for TestDataDir {
+    fn drop(&mut self) {
+        TEST_DATA_DIR.with(|value| value.replace(self.0.take()));
+    }
+}
 pub fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_DATA_DIR.with(|value| value.borrow().clone()) {
+        return path;
+    }
     if let Some(dir) = std::env::var_os("VYBER_DATA_DIR") {
         return PathBuf::from(dir);
     }
@@ -516,9 +536,8 @@ impl Checkpoint {
             nested.sort();
             nested.dedup();
             if !nested.is_empty() {
-                entries.retain(|(_, path)| {
-                    !nested.iter().any(|n| path.starts_with(&format!("{n}/")))
-                });
+                entries
+                    .retain(|(_, path)| !nested.iter().any(|n| path.starts_with(&format!("{n}/"))));
                 for folder in &nested {
                     entries.extend(nested_entries(&root, folder)?.0);
                 }
@@ -1054,7 +1073,11 @@ pub fn fuzzy_score(query: &str, relative: &str) -> Option<(i64, Vec<usize>)> {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     let name_chars = lower(name);
     if let Some(positions) = greedy(&name_chars) {
-        let bonus = if name_chars.starts_with(&query) { 40 } else { 20 };
+        let bonus = if name_chars.starts_with(&query) {
+            40
+        } else {
+            20
+        };
         return Some((score(&positions, &name_chars) + bonus, positions));
     }
     let path_chars = lower(relative);
@@ -1100,7 +1123,10 @@ mod tests {
             entry(".gitignore", false),
         ];
         entries.sort_by(tree_order);
-        let order = entries.iter().map(|e| e.relative.as_str()).collect::<Vec<_>>();
+        let order = entries
+            .iter()
+            .map(|e| e.relative.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
             order,
             [
@@ -1198,14 +1224,21 @@ mod tests {
         assert!(!paths.iter().any(|p| p.starts_with("api/target")));
         let api = entries.iter().find(|e| e.relative == "api").unwrap();
         assert!(api.repository && api.directory && api.depth == 0);
-        let main = entries.iter().find(|e| e.relative == "api/src/main.rs").unwrap();
+        let main = entries
+            .iter()
+            .find(|e| e.relative == "api/src/main.rs")
+            .unwrap();
         assert_eq!(main.depth, 2);
         // Tree order keeps the folder's children right after it.
         let at = paths.iter().position(|p| *p == "api").unwrap();
         assert_eq!(paths[at + 1], "api/src");
         fs::write(root.join("api/src/main.rs"), "fn main() { run() }\n")?;
         let changes = status_with(root, &[root.join("api")])?;
-        assert!(changes.iter().any(|c| c.path == "api/src/main.rs" && c.letter() == 'M'));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "api/src/main.rs" && c.letter() == 'M')
+        );
         Ok(())
     }
     #[test]
@@ -1234,7 +1267,10 @@ mod tests {
             ]
         );
         before.restore_file(&after, "api/src/main.rs")?;
-        assert_eq!(fs::read_to_string(root.join("api/src/main.rs"))?, "fn main() {}\n");
+        assert_eq!(
+            fs::read_to_string(root.join("api/src/main.rs"))?,
+            "fn main() {}\n"
+        );
         Ok(())
     }
     fn paths(before: &Checkpoint, after: &Checkpoint) -> Result<Vec<(String, String)>> {

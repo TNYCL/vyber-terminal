@@ -96,6 +96,7 @@ pub struct Terminal {
     pub root: PathBuf,
     pub title: String,
     pub exited: bool,
+    pub process: crate::processes::TerminalProcess,
     pub bell: bool,
     pub notification: Option<String>,
     pub open_path: Option<(PathBuf, usize)>,
@@ -135,6 +136,8 @@ pub struct Terminal {
     search_visible: bool,
     search_origin: Option<TermPoint>,
     search_subscription: Option<Subscription>,
+    #[cfg(target_os = "macos")]
+    _shell_integration: Option<tempfile::TempDir>,
 }
 pub struct Backend {
     term: Arc<FairMutex<Term<Proxy>>>,
@@ -143,6 +146,9 @@ pub struct Backend {
     dirty: Arc<AtomicBool>,
     program: String,
     shell: Option<u32>,
+    process: crate::processes::TerminalProcess,
+    #[cfg(target_os = "macos")]
+    shell_integration: Option<tempfile::TempDir>,
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
@@ -201,6 +207,9 @@ impl Terminal {
         #[cfg(test)]
         let args = if program.to_lowercase().contains("codex") {
             vec!["--no-daemon".into()]
+        } else if program == "/bin/sh" {
+            // Başsız test kabuğu kullanıcı profillerini çalıştırmaz.
+            vec![]
         } else {
             args
         };
@@ -220,6 +229,18 @@ impl Terminal {
                 ),
             );
         }
+        #[cfg(target_os = "macos")]
+        let shell_integration = if Path::new(&program)
+            .file_stem()
+            .is_some_and(|name| name == "zsh")
+        {
+            Some(crate::shell::zsh_integration(
+                &mut env,
+                std::env::var_os("ZDOTDIR"),
+            )?)
+        } else {
+            None
+        };
         let options = tty::Options {
             shell: Some(tty::Shell::new(program.clone(), args)),
             working_directory: Some(root.to_owned()),
@@ -243,6 +264,10 @@ impl Terminal {
         let shell = pty.child_watcher().pid().map(|pid| pid.get());
         #[cfg(not(windows))]
         let shell = Some(pty.child().id());
+        let process = crate::processes::TerminalProcess {
+            pid: shell,
+            shell: program.clone(),
+        };
         let pty = crate::pty::ObservedPty::new(pty, proxy.clone());
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
         let sender = event_loop.channel();
@@ -254,6 +279,9 @@ impl Terminal {
             dirty,
             program,
             shell,
+            process,
+            #[cfg(target_os = "macos")]
+            shell_integration,
         })
     }
     pub fn new(id: usize, root: &Path, backend: Backend, cx: &mut Context<Self>) -> Self {
@@ -264,12 +292,17 @@ impl Terminal {
             dirty,
             program,
             shell,
+            process,
+            #[cfg(target_os = "macos")]
+            shell_integration,
         } = backend;
         let config = cx.global::<crate::config::Config>();
         let (font_family, font_size) = (config.font_family.clone(), config.font_size);
         cx.spawn(async move |entity, cx| {
             loop {
-                smol::Timer::after(Duration::from_millis(16)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
                 if entity.update(cx, |view, cx| view.poll(cx)).is_err() {
                     break;
                 }
@@ -285,6 +318,7 @@ impl Terminal {
                 .to_string_lossy()
                 .into(),
             exited: false,
+            process,
             bell: false,
             notification: None,
             open_path: None,
@@ -320,6 +354,8 @@ impl Terminal {
             search_visible: false,
             search_origin: None,
             search_subscription: None,
+            #[cfg(target_os = "macos")]
+            _shell_integration: shell_integration,
         }
     }
     pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {

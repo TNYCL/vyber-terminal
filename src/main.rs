@@ -2,23 +2,28 @@
 mod app;
 mod browser;
 mod changeset;
+mod closing;
 mod config;
 mod git;
 mod glyphs;
 mod icons;
 mod layout;
+mod lifecycle;
 mod notifications;
+mod panel;
 mod platform;
+mod processes;
 mod project;
 mod project_dialog;
 mod pty;
+#[cfg(target_os = "macos")]
+mod shell;
 mod tab_state;
 mod tasks;
 mod terminal;
 mod theme;
 mod workspace;
 use gpui::*;
-use gpui_kit::component::TitleBar;
 fn main() {
     platform::login_environment();
     let logs = workspace::data_dir();
@@ -31,44 +36,30 @@ fn main() {
         env_logger::init();
     }
     std::panic::set_hook(Box::new(|info| log::error!("{info}")));
-    let root = std::env::args_os()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            if cwd.to_string_lossy().contains("WindowsApps") {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            } else {
-                cwd
-            }
-        });
-    gpui_kit::application()
+    let root = platform::startup_root(std::env::args_os().nth(1).map(std::path::PathBuf::from));
+    let application = gpui_kit::application()
         .with_assets(icons::Assets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            let config = config::Config::load();
-            cx.set_reduce_motion(config.reduced_motion);
-            cx.set_global(config);
-            theme::apply(cx);
-            app::bind_keys(cx);
-            terminal::bind_keys(cx);
-            browser::bind_keys(cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1380.), px(850.)),
-                    cx,
-                ))),
-                window_min_size: Some(size(px(900.), px(550.))),
-                app_id: Some("dev.vyber.terminal".into()),
-                ..TitleBar::window_options()
-            };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                window.set_window_title("Vyber");
-                cx.new(|cx| app::Vyber::new(root, window, cx))
-            })
-            .expect("open Vyber");
-            cx.activate(true);
+        .with_quit_mode(if cfg!(target_os = "macos") {
+            QuitMode::Explicit
+        } else {
+            QuitMode::LastWindowClosed
         });
+    application.on_reopen(|cx| {
+        if let Err(error) = lifecycle::show_workspace(cx) {
+            log::error!("Reopen workspace: {error}");
+        }
+    });
+    application.run(move |cx| {
+        gpui_kit::init(cx);
+        let config = config::Config::load();
+        cx.set_reduce_motion(config.reduced_motion);
+        cx.set_global(config);
+        theme::apply(cx);
+        app::bind_keys(cx);
+        terminal::bind_keys(cx);
+        browser::bind_keys(cx);
+        lifecycle::init(root, cx);
+        lifecycle::open_workspace(app::WorkspaceLaunch::Restore, cx).expect("open Vyber");
+        cx.activate(true);
+    });
 }

@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 /// Prefer the installed Git for Windows shell; explicit config still takes precedence.
 pub fn default_shell() -> String {
     #[cfg(windows)]
@@ -141,7 +143,68 @@ pub fn open_in_code(path: &std::path::Path) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other("VS Code launcher `code` was not found on PATH"))
+        Err(std::io::Error::other(
+            "VS Code launcher `code` was not found on PATH",
+        ))
+    }
+}
+
+pub fn startup_root(directory: Option<PathBuf>) -> PathBuf {
+    directory
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .or_else(|| dirs::home_dir().filter(|path| path.is_dir()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+pub fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            let name = path.display().to_string();
+            if name.is_empty() {
+                "Terminal".into()
+            } else {
+                name
+            }
+        })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn startup_uses_home_and_respects_an_explicit_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            startup_root(Some(directory.path().to_owned())),
+            directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            startup_root(Some(PathBuf::from("."))),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        if let Some(home) = dirs::home_dir().filter(|path| path.is_dir()) {
+            assert_eq!(startup_root(None), home);
+            assert_eq!(startup_root(Some(directory.path().join("missing"))), home);
+        }
+    }
+
+    #[test]
+    fn folder_names_include_unicode_and_a_root_fallback() {
+        assert_eq!(folder_name(Path::new("/Users/tnycl")), "tnycl");
+        assert_eq!(
+            folder_name(Path::new("/Users/tnycl/Çalışma alanı")),
+            "Çalışma alanı"
+        );
+        assert_eq!(folder_name(Path::new("")), "Terminal");
+        #[cfg(unix)]
+        assert_eq!(folder_name(Path::new("/")), "/");
+        #[cfg(windows)]
+        assert_eq!(folder_name(Path::new("C:\\")), "C:\\");
     }
 }
 

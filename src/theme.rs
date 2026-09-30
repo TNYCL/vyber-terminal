@@ -6,6 +6,19 @@ use gpui::{prelude::*, *};
 use gpui_kit::component::{Theme, ThemeMode, tooltip::Tooltip};
 use std::sync::Arc;
 
+pub const TITLE_BAR_HEIGHT: f32 = 34.;
+
+pub fn title_bar_padding(macos: bool, fullscreen: bool) -> f32 {
+    // TitleBar tam ekranda içeride 12 px ekler; dışarıdan ikinci boşluk verilmez.
+    if fullscreen {
+        0.
+    } else if macos {
+        80.
+    } else {
+        2.
+    }
+}
+
 pub const PANEL: u32 = 0x0b0b0b;
 pub const SURFACE: u32 = 0x161616;
 pub const HOVER: u32 = 0x1a1a1a;
@@ -353,5 +366,18 @@ mod tests {
     fn highlight_theme_parses() {
         serde_json::from_str::<gpui_kit::component::highlighter::HighlightTheme>(super::HIGHLIGHT)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use super::title_bar_padding;
+
+    #[test]
+    fn fullscreen_removes_the_windowed_traffic_light_inset() {
+        assert_eq!(title_bar_padding(true, false), 80.);
+        assert_eq!(title_bar_padding(true, true), 0.);
+        assert_eq!(title_bar_padding(false, false), 2.);
+        assert_eq!(title_bar_padding(false, true), 0.);
     }
 }

@@ -1,7 +1,9 @@
 use crate::{
     browser::{Browser, BrowserEvent},
+    closing::{self, ClosePlan, CloseTarget},
     config::{Config, PANEL_FONT_SIZE, PanelMode},
     layout::{self, DropEdge, Layout},
+    panel::{DEFAULT_FRACTION, WorkspaceBody},
     project_dialog::{ProjectDialog, ProjectDialogEvent},
     tab_state::TabState,
     tasks::{Monitor, TaskReview},
@@ -59,6 +61,12 @@ actions!(
 #[action(namespace = vyber, no_json)]
 struct SelectTab(usize);
 
+#[derive(Clone, Copy)]
+pub enum WorkspaceLaunch {
+    Restore,
+    Empty,
+}
+
 #[derive(Clone)]
 struct TabDrag {
     id: usize,
@@ -78,16 +86,12 @@ impl Render for TabDrag {
 }
 /// Dragging the file panel's left edge.
 #[derive(Clone)]
-struct PanelResize;
+pub(crate) struct PanelResize;
 impl Render for PanelResize {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
     }
 }
-/// The file panel never gets narrower than this.
-const PANEL_MIN: f32 = 480.;
-/// Terminals keep at least this width beside a docked panel.
-const DOCK_TERMINAL_MIN: f32 = 360.;
 fn turn_badge(review: &TaskReview) -> TurnBadge {
     let warning = review
         .warning
@@ -124,7 +128,7 @@ fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> State
         .items_center()
         .justify_center()
         .w(px(28.))
-        .h(px(30.))
+        .h_full()
         .flex_shrink_0()
         .text_size(px(13.))
         .text_color(rgb(0x9b9b9b))
@@ -132,6 +136,33 @@ fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> State
         .hover(|s| s.bg(rgb(0x171717)).text_color(rgb(0xffffff)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(label.into())
+}
+fn icon_bar_button(id: impl Into<ElementId>, name: &str, active: bool) -> Stateful<Div> {
+    let id = id.into();
+    let group: SharedString = format!("bar-button-{id}").into();
+    div()
+        .id(id)
+        .group(group.clone())
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(30.))
+        .h_full()
+        .flex_shrink_0()
+        .text_size(px(13.))
+        .text_color(rgb(0x9b9b9b))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x171717)).text_color(rgb(0xffffff)))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            theme::icon(
+                theme::ui(name),
+                if active { 0xffffff } else { 0x9b9b9b },
+                16.,
+            )
+            .group_hover(group, |s| s.text_color(rgb(0xffffff))),
+        )
 }
 
 struct Slot {
@@ -184,6 +215,11 @@ pub struct Vyber {
     last_persist: std::time::Instant,
     zoomed: bool,
     show_shortcuts: bool,
+    close_pending: bool,
+    state_path: PathBuf,
+    restoring: bool,
+    #[cfg(test)]
+    process_snapshot: Option<crate::processes::ProcessSnapshot>,
     drop_hint: Option<DropHint>,
     tab_drag: Option<TabDrag>,
     panel: Option<PanelMotion>,
@@ -242,15 +278,18 @@ impl PanelMotion {
 fn unit(on: bool) -> f32 {
     f32::from(u8::from(on))
 }
-/// The widest a docked panel gets: the terminals keep room for a usable
-/// prompt, or half the window when it is small.
-fn dock_limit(full: f32) -> f32 {
-    (full - 8. - DOCK_TERMINAL_MIN).max(full * 0.5)
-}
 impl Vyber {
-    pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let roots = Arc::new(Mutex::new(vec![root.clone()]));
+    pub fn new(
+        root: PathBuf,
+        launch: WorkspaceLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let roots = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(not(test))]
         let monitor = Monitor::start(roots.clone());
+        #[cfg(test)]
+        let monitor = Monitor::inactive();
         let mut app = Self {
             slots: HashMap::new(),
             tabs: vec![],
@@ -271,6 +310,11 @@ impl Vyber {
             last_persist: std::time::Instant::now(),
             zoomed: false,
             show_shortcuts: false,
+            close_pending: false,
+            state_path: workspace::data_dir().join("workspace.json"),
+            restoring: true,
+            #[cfg(test)]
+            process_snapshot: None,
             drop_hint: None,
             tab_drag: None,
             panel: None,
@@ -281,15 +325,22 @@ impl Vyber {
             project_closing: None,
             _subscriptions: vec![],
         };
-        let saved = if std::env::args_os().nth(1).is_none()
-            && crate::config::Config::load().restore_workspace
-        {
-            std::fs::read(workspace::data_dir().join("workspace.json"))
+        #[cfg(not(test))]
+        let restore_allowed = std::env::args_os().nth(1).is_none();
+        #[cfg(test)]
+        let restore_allowed = true;
+        let saved = if matches!(launch, WorkspaceLaunch::Empty) {
+            Some(SavedState::default())
+        } else if restore_allowed && crate::config::Config::load().restore_workspace {
+            std::fs::read(&app.state_path)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<SavedState>(&b).ok())
         } else {
             None
         };
+        let preserve_empty = saved
+            .as_ref()
+            .is_some_and(|state| state.slots.is_empty() && state.tabs.is_empty());
         if let Some(saved) = saved {
             if let Some(size) = saved.font_size {
                 Config::update(cx, |c| c.font_size = size);
@@ -306,7 +357,9 @@ impl Vyber {
             }
             if !app.slots.is_empty() {
                 let mut tabs = saved.tabs;
-                let missing = (0..app.next + 1)
+                let missing = tabs
+                    .iter()
+                    .flat_map(Layout::leaves)
                     .filter(|id| !app.slots.contains_key(id))
                     .collect::<Vec<_>>();
                 for id in missing {
@@ -329,23 +382,38 @@ impl Vyber {
                 window.focus(&app.slots[&app.active].terminal.read(cx).focus.clone(), cx);
             }
         }
-        if app.slots.is_empty() {
+        if app.slots.is_empty() && !preserve_empty {
             app.add_terminal(root, false, false, window, cx);
+        }
+        app.normalize_selection();
+        app.restoring = false;
+        app.update_roots(cx);
+        app.persist(cx);
+        if app.slots.is_empty() {
+            window.focus(&app.focus, cx);
         }
         app._subscriptions
             .push(cx.on_release(|this, cx| this.persist(cx)));
         app._subscriptions
             .push(cx.observe_global::<Config>(|this, cx| this.apply_config(cx)));
         let weak = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             if let Some(app) = weak.upgrade() {
-                app.read(cx).persist(cx);
+                app.update(cx, |app, cx| {
+                    app.request_close(CloseTarget::Window, window, cx)
+                });
+                false
+            } else {
+                true
             }
-            true
         });
+        app._subscriptions
+            .push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
         cx.spawn_in(window, async move |entity, cx| {
             loop {
-                smol::Timer::after(Duration::from_millis(350)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
                 if let Err(e) = entity.update_in(cx, |this, window, cx| this.poll(window, cx)) {
                     log::warn!("Workspace poll ended: {e}");
                     break;
@@ -365,15 +433,20 @@ impl Vyber {
     ) {
         let id = self.next;
         self.next += 1;
-        let backend =
-            match Terminal::prepare(id, &root, crate::config::Config::load().shell.as_deref()) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    self.notice = error.to_string();
-                    cx.notify();
-                    return;
-                }
-            };
+        #[cfg(not(test))]
+        let config = crate::config::Config::load();
+        #[cfg(not(test))]
+        let shell = config.shell.as_deref();
+        #[cfg(test)]
+        let shell = Some("/bin/sh");
+        let backend = match Terminal::prepare(id, &root, shell) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.notice = error.to_string();
+                cx.notify();
+                return;
+            }
+        };
         let terminal = cx.new(|cx| Terminal::new(id, &root, backend, cx));
         let browser = cx.new(|cx| Browser::new(root.clone(), window, cx));
         let focus = terminal.read(cx).focus.clone();
@@ -398,6 +471,7 @@ impl Vyber {
             &browser,
             window,
             move |this, _, event: &BrowserEvent, window, cx| match event {
+                BrowserEvent::LayoutChanged => cx.notify(),
                 BrowserEvent::Comment(text) => {
                     if let Some(slot) = this.slots.get(&id) {
                         slot.terminal.update(cx, |t, _| t.insert_comment(text));
@@ -542,7 +616,7 @@ impl Vyber {
         self.slots
             .get(&self.active)
             .map(|s| s.terminal.read(cx).root.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .unwrap_or_else(|| crate::platform::startup_root(None))
     }
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let stamp = Config::modified();
@@ -588,12 +662,6 @@ impl Vyber {
         if changed {
             self.update_roots(cx);
         }
-        if !self.slots.is_empty() && self.slots.values().all(|s| s.terminal.read(cx).exited) {
-            // Keep the final layout and editor drafts for the next launch, then quit normally.
-            self.persist(cx);
-            cx.quit();
-            return;
-        }
         let exited = self
             .slots
             .iter()
@@ -606,7 +674,7 @@ impl Vyber {
                     self.notice = notice.into();
                     changed = true;
                 }
-            } else {
+            } else if !self.close_pending {
                 self.close_pane(id, window, cx);
             }
         }
@@ -666,6 +734,9 @@ impl Vyber {
         }
     }
     fn persist(&self, cx: &App) {
+        if self.restoring {
+            return;
+        }
         let mut slots = self
             .slots
             .iter()
@@ -685,17 +756,22 @@ impl Vyber {
             font_size: None,
         };
         if let Ok(bytes) = serde_json::to_vec(&state) {
-            let dir = workspace::data_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join("workspace.json");
-            if std::fs::read(&path).ok().as_ref() != Some(&bytes) {
-                if let Err(e) = std::fs::write(path, bytes) {
+            if let Some(dir) = self.state_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes) {
+                if let Err(e) = std::fs::write(&self.state_path, bytes) {
                     log::warn!("Save workspace: {e}");
                 }
             }
         }
     }
-    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_terminal(
+        &mut self,
+        _: &NewTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.add_terminal(self.current_root(cx), false, false, window, cx);
     }
     fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
@@ -786,109 +862,92 @@ impl Vyber {
         }
         cx.notify();
     }
+    fn keyboard_pane(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.slots
+            .iter()
+            .find_map(|(id, slot)| {
+                (slot.terminal.read(cx).focus.contains_focused(window, cx)
+                    || slot.browser.read(cx).has_focus(window, cx))
+                .then_some(*id)
+            })
+            .or_else(|| self.selection().map(|(_, id)| id))
+    }
     fn close(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        // Cmd+W closes the file in a focused panel, as Ctrl+W does elsewhere.
-        if cfg!(target_os = "macos")
-            && let Some(browser) = self.focused_panel(window, cx)
-        {
-            browser.update(cx, |b, cx| b.close_front(window, cx));
+        if self.close_pending {
             return;
         }
-        self.close_pane(self.active, window, cx);
-    }
-    fn close_pane(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.tabs.iter().position(|layout| layout.contains(id)) else {
+        let Some(id) = self.keyboard_pane(window, cx) else {
             return;
         };
-        if self.slots.len() == 1 {
-            if self.slots.values().any(|s| s.browser.read(cx).has_dirty()) {
-                self.notice = "Save your editor changes before closing.".into();
+        if let Some(slot) = self.slots.get(&id) {
+            if slot.browser.read(cx).visible {
+                let handled = slot
+                    .browser
+                    .update(cx, |browser, cx| browser.close_active_document(window, cx));
+                if !handled {
+                    slot.browser
+                        .update(cx, |browser, cx| browser.close_panel(cx));
+                    window.focus(&slot.terminal.read(cx).focus.clone(), cx);
+                }
+                self.persist(cx);
                 cx.notify();
                 return;
             }
-            self.persist(cx);
-            cx.quit();
+        }
+        // Split grubundaki komşular aynı Cmd+W isteğine dahil edilmez.
+        self.close_pane(id, window, cx);
+    }
+    fn close_pane(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close(CloseTarget::Pane(id), window, cx);
+    }
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = self.tabs.get(index) else {
             return;
-        }
-        if self
-            .slots
-            .get(&id)
-            .is_some_and(|s| s.browser.read(cx).has_dirty())
-        {
-            self.notice = "Save your editor changes before closing this terminal.".into();
-            cx.notify();
-            return;
-        }
-        if let Some(layout) = self.tabs[index].remove(id) {
-            self.tabs[index] = layout;
-        } else {
-            self.tabs.remove(index);
-        }
-        self.slots.remove(&id);
-        self.tab_state.sync(&self.tabs, None);
-        self.tab = self
-            .tabs
-            .iter()
-            .position(|layout| layout.contains(self.active))
-            .unwrap_or_else(|| index.min(self.tabs.len() - 1));
-        if self.active == id {
-            self.active = self.tab_state.groups[self.tab].active;
+        };
+        let mut ids = layout.leaves();
+        ids.sort_unstable();
+        self.request_close(CloseTarget::Tab(ids), window, cx);
+    }
+    fn selection(&self) -> Option<(usize, usize)> {
+        closing::selection(&self.tabs, self.active, self.tab)
+    }
+    fn normalize_selection(&mut self) {
+        (self.tab, self.active) = self.selection().unwrap_or((0, 0));
+        if self.tabs.is_empty() {
             self.zoomed = false;
-            if let Some(slot) = self.slots.get(&self.active) {
-                let focus = slot.terminal.read(cx).focus.clone();
-                window.focus(&focus, cx);
+            self.panel = None;
+        }
+    }
+    fn remove_terminals(&mut self, ids: &[usize], window: &mut Window, cx: &mut Context<Self>) {
+        let active_removed = ids.contains(&self.active);
+        closing::remove_panes(&mut self.tabs, ids);
+        for id in ids {
+            self.slots.remove(id);
+        }
+        self.tab_state.sync(&self.tabs, None);
+        self.normalize_selection();
+        if active_removed {
+            if let Some(group) = self.tab_state.groups.get(self.tab) {
+                self.active = group.active;
             }
         }
         self.tab_state.focus(self.active);
         self.tab_scroll.scroll_to_item(self.tab);
-        self.update_roots(cx);
-        self.persist(cx);
-        cx.notify();
-    }
-    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(layout) = self.tabs.get(index).cloned() else {
-            return;
-        };
-        let active_closed = layout.contains(self.active);
-        let ids = self
-            .slots
-            .keys()
-            .copied()
-            .filter(|id| layout.contains(*id))
-            .collect::<Vec<_>>();
-        if ids
-            .iter()
-            .any(|id| self.slots[id].browser.read(cx).has_dirty())
-        {
-            self.notice = "Save your editor changes before closing this tab.".into();
-            cx.notify();
-            return;
+        self.tab_menu = None;
+        if active_removed {
+            self.zoomed = false;
+            self.panel = None;
+            let focus = self
+                .slots
+                .get(&self.active)
+                .map(|slot| slot.terminal.read(cx).focus.clone())
+                .unwrap_or_else(|| self.focus.clone());
+            window.focus(&focus, cx);
         }
-        if self.tabs.len() == 1 {
-            self.persist(cx);
-            cx.quit();
-            return;
-        }
-        for id in ids {
-            self.slots.remove(&id);
-        }
-        self.tabs.remove(index);
-        self.tab_state.sync(&self.tabs, None);
-        self.tab = self
-            .tabs
-            .iter()
-            .position(|t| t.contains(self.active))
-            .unwrap_or_else(|| index.min(self.tabs.len() - 1));
-        self.active = self.tab_state.groups[self.tab].active;
         self.tab_state.focus(self.active);
         self.tab_scroll.scroll_to_item(self.tab);
-        self.tab_menu = None;
-        if active_closed {
-            self.zoomed = false;
-        }
-        let focus = self.slots[&self.active].terminal.read(cx).focus.clone();
-        window.focus(&focus, cx);
         self.update_roots(cx);
+        // Kapanmış sekmeler tekrar açılmasın diye sonuç düzeni kaydedilir.
         self.persist(cx);
         cx.notify();
     }
@@ -896,33 +955,172 @@ impl Vyber {
         self.zoomed = !self.zoomed;
         cx.notify();
     }
-    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        self.persist(cx);
-        cx.quit();
+    pub(crate) fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close(CloseTarget::Quit, window, cx);
     }
-    fn settings(&mut self, _: &Settings, _: &mut Window, cx: &mut Context<Self>) {
+    fn close_sessions(&self, ids: &[usize], cx: &App) -> Vec<(usize, Option<u32>)> {
+        ids.iter()
+            .filter_map(|id| {
+                self.slots
+                    .get(id)
+                    .map(|slot| (*id, slot.terminal.read(cx).process.pid))
+            })
+            .collect()
+    }
+    fn plan_valid(&self, plan: &ClosePlan, cx: &App) -> bool {
+        plan.valid(
+            &self.tabs,
+            self.slots.keys().copied().collect(),
+            &self.close_sessions(&plan.ids, cx),
+        )
+    }
+    fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_pending {
+            return;
+        }
+        let Some(ids) = target.ids(&self.tabs, self.slots.keys().copied().collect()) else {
+            return;
+        };
+        let plan = ClosePlan {
+            target,
+            sessions: self.close_sessions(&ids, cx),
+            ids,
+        };
+        if self.close_blocked(&plan, cx) {
+            return;
+        }
+        let terminals = plan
+            .ids
+            .iter()
+            .filter_map(|id| {
+                let terminal = self.slots[id].terminal.read(cx);
+                (!terminal.exited).then(|| {
+                    (
+                        format!(
+                            "Terminal {} · {} · {}",
+                            terminal.id + 1,
+                            terminal.title,
+                            crate::platform::folder_name(&terminal.root)
+                        ),
+                        terminal.process.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if terminals.is_empty() {
+            self.finish_close(&plan, window, cx);
+            return;
+        }
+        self.close_pending = true;
+        #[cfg(test)]
+        let snapshot_override = self.process_snapshot.clone();
+        let inspection = cx.background_executor().spawn(async move {
+            #[cfg(not(test))]
+            let snapshot = crate::processes::ProcessSnapshot::capture();
+            #[cfg(test)]
+            let snapshot = snapshot_override
+                .map(Ok)
+                .unwrap_or_else(crate::processes::ProcessSnapshot::capture);
+            terminals
+                .into_iter()
+                .filter_map(|(label, process)| {
+                    match snapshot
+                        .as_ref()
+                        .ok()
+                        .and_then(|snapshot| snapshot.running(&process))
+                    {
+                        Some(names) if names.is_empty() => None,
+                        Some(names) => Some(format!("{label}: {}", names.join(", "))),
+                        None => Some(format!("{label}: process information unavailable")),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |entity, cx| {
+            let running = inspection.await;
+            let answer = entity.update_in(cx, |this, window, cx| {
+                if !this.plan_valid(&plan, cx) {
+                    this.close_pending = false;
+                    this.notice = "The terminal layout changed. Try closing again.".into();
+                    cx.notify();
+                    None
+                } else if running.is_empty() {
+                    this.close_pending = false;
+                    this.finish_close(&plan, window, cx);
+                    None
+                } else {
+                    let (message, confirm) = match &plan.target {
+                        CloseTarget::Quit => ("Quit Vyber and stop running processes?", "Quit Vyber"),
+                        CloseTarget::Window => ("Close this window and stop running processes?", "Close window"),
+                        CloseTarget::Tab(_) => ("Close this group and stop running processes?", "Close group"),
+                        CloseTarget::Pane(_) => ("Close this terminal and stop running processes?", "Close terminal"),
+                    };
+                    let detail = format!("Running terminal sessions:\n\n{}\n\nClosing will interrupt these sessions.", running.join("\n"));
+                    Some(window.prompt(PromptLevel::Warning, message, Some(&detail), &[
+                        PromptButton::cancel("Cancel"), PromptButton::new(confirm),
+                    ], cx))
+                }
+            }).ok().flatten();
+            if let Some(answer) = answer {
+                let confirmed = matches!(answer.await, Ok(1));
+                let _ = entity.update_in(cx, |this, window, cx| {
+                    this.close_pending = false;
+                    if confirmed {
+                        this.finish_close(&plan, window, cx);
+                    }
+                });
+            }
+        }).detach();
+    }
+    fn close_blocked(&mut self, plan: &ClosePlan, cx: &mut Context<Self>) -> bool {
+        if !matches!(plan.target, CloseTarget::Quit)
+            && plan.ids.iter().any(|id| {
+                self.slots
+                    .get(id)
+                    .is_some_and(|slot| slot.browser.read(cx).has_dirty())
+            })
+        {
+            self.notice = "Save your editor changes before closing this terminal.".into();
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+    fn finish_close(&mut self, plan: &ClosePlan, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.plan_valid(plan, cx) {
+            self.notice = "The terminal layout changed. Try closing again.".into();
+            cx.notify();
+            return;
+        }
+        if self.close_blocked(plan, cx) {
+            return;
+        }
+        match plan.target {
+            CloseTarget::Pane(_) | CloseTarget::Tab(_) => {
+                self.remove_terminals(&plan.ids, window, cx)
+            }
+            CloseTarget::Window => {
+                self.remove_terminals(&plan.ids, window, cx);
+                window.remove_window();
+            }
+            CloseTarget::Quit => {
+                // Çıkışta açık düzen ve taslaklar bir sonraki başlangıç için korunur.
+                self.persist(cx);
+                crate::lifecycle::quit_application(cx);
+            }
+        }
+    }
+    pub(crate) fn settings(&mut self, _: &Settings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slots.is_empty() {
+            self.new_terminal(&NewTerminal, window, cx);
+        }
         crate::config::Config::load();
         if let Some(slot) = self.slots.get(&self.active) {
             slot.browser.update(cx, |b, cx| {
                 b.visible = true;
                 b.open(crate::config::Config::path(), true, cx);
             });
-        }
-        cx.notify();
-    }
-    /// Moves the panel's left edge to `x`.
-    fn resize_panel(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let full = f32::from(window.viewport_size().width);
-        let widest = if cx.global::<Config>().panel_mode == PanelMode::Dock {
-            dock_limit(full)
-        } else {
-            full - 8.
-        };
-        let width = (full - 4. - x).clamp(PANEL_MIN.min(widest), widest);
-        self.resizing_panel = true;
-        if let Some(slot) = self.panel.and_then(|m| self.slots.get(&m.slot)) {
-            slot.browser
-                .update(cx, |b, _| b.panel_width = Some(width / full));
         }
         cx.notify();
     }
@@ -933,6 +1131,10 @@ impl Vyber {
         for slot in self.slots.values() {
             slot.terminal.update(cx, |t, cx| {
                 t.set_font(&config.font_family, config.font_size, cx)
+            });
+            slot.browser.update(cx, |browser, cx| {
+                browser.docked = config.panel_mode == PanelMode::Dock;
+                browser.layout_changed(cx);
             });
         }
         cx.notify();
@@ -994,7 +1196,10 @@ impl Vyber {
         }
     }
     fn next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.tabs[self.tab].leaves();
+        let Some(layout) = self.tabs.get(self.tab) else {
+            return;
+        };
+        let ids = layout.leaves();
         if let Some(i) = ids.iter().position(|id| *id == self.active) {
             self.active = ids[(i + 1) % ids.len()];
             self.tab_state.focus(self.active);
@@ -1025,17 +1230,21 @@ impl Vyber {
         if self.cycle_panel_tab(1, window, cx) {
             return;
         }
-        self.switch_tab((self.tab + 1) % self.tabs.len(), window, cx);
+        if !self.tabs.is_empty() {
+            self.switch_tab((self.tab + 1) % self.tabs.len(), window, cx);
+        }
     }
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.cycle_panel_tab(-1, window, cx) {
             return;
         }
-        self.switch_tab(
-            (self.tab + self.tabs.len() - 1) % self.tabs.len(),
-            window,
-            cx,
-        );
+        if !self.tabs.is_empty() {
+            self.switch_tab(
+                (self.tab + self.tabs.len() - 1) % self.tabs.len(),
+                window,
+                cx,
+            );
+        }
     }
     fn select_tab(&mut self, action: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
         let index = if action.0 >= 8 {
@@ -1061,7 +1270,12 @@ impl Vyber {
         window.focus(&focus, cx);
         cx.notify();
     }
-    fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_folder(
+        &mut self,
+        _: &OpenFolder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1345,7 +1559,26 @@ impl Render for Vyber {
                     self.layout(&l, cx)
                 }
             })
-            .unwrap_or_else(|| div().into_any_element());
+            .unwrap_or_else(|| {
+                div()
+                    .id("empty-workspace")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_color(rgb(0x9b9b9b))
+                    .child(div().text_size(px(18.)).child("No terminals open"))
+                    .child(
+                        chip("empty-new-terminal", "New terminal  ⌘T / Ctrl+Shift+T").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.new_terminal(&NewTerminal, window, cx)
+                            }),
+                        ),
+                    )
+                    .into_any_element()
+            });
         // A closed project dialog fades out over a few frames.
         let closing = self.project_closing.as_ref().and_then(|(dialog, at)| {
             let left = 1. - at.elapsed().as_secs_f32() / 0.14;
@@ -1380,7 +1613,7 @@ impl Render for Vyber {
                 let b = b.read(cx);
                 (b.visible, b.wide, b.panel_width, b.git_open())
             });
-        let fraction = fraction.unwrap_or(0.61);
+        let fraction = fraction.unwrap_or(DEFAULT_FRACTION);
         // The panel is laid out in rems, so one rem size scales all of it.
         let rem = px(theme::REM / PANEL_FONT_SIZE
             * if panel_git {
@@ -1413,12 +1646,6 @@ impl Render for Vyber {
             window.request_animation_frame();
         }
         let full = f32::from(window.viewport_size().width);
-        let floating = (full * fraction).max(PANEL_MIN).min(full - 8.);
-        let narrow = floating + (floating.min(dock_limit(full)) - floating) * dockness;
-        let width = narrow + (full - 8. - narrow) * wideness;
-        // Docked, the terminals give up the panel's width, and keep that size
-        // under a panel expanded to the full width.
-        let reserve = (narrow + 8.) * shown * dockness;
         // Terminals reflow once a slide ends rather than on every frame, and
         // at most every 100 ms while a docked panel's edge is dragged.
         if !cx.has_active_drag() {
@@ -1438,46 +1665,17 @@ impl Render for Vyber {
                     .update(cx, |t, cx| t.set_resize_interval(interval, cx));
             }
         }
-        let mut body = div().relative().size_full().bg(rgb(0x000000)).child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .bottom_0()
-                .w(px(full - reserve))
-                .overflow_hidden()
-                .child(layout),
-        );
-        if let Some(browser) = panel.filter(|_| shown > 0.001) {
-            // Hidden means slid entirely past the right edge, so opening and
-            // closing move the left edge like the full-width transition does.
-            let shift = (1. - shown) * (width + 8.);
-            body = body.child(
-                div()
-                    .absolute()
-                    .when(shown_target, |s| s.occlude())
-                    .top(px(4.))
-                    .bottom(px(4.))
-                    .right(px(4. - shift))
-                    .w(px(width))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .shadow_xl()
-                    .overflow_hidden()
-                    .bg(rgb(theme::PANEL))
-                    .child(theme::rem_scope(rem, browser)),
-            );
-            // Drag the left edge to resize; the full-width panel has no edge to grab.
-            if shown_target && !wide && !motion.running() {
-                body = body.child(
-                    theme::resize_handle("panel-resize", PanelResize)
-                        .top(px(4.))
-                        .bottom(px(4.))
-                        .left(px(full - 4. - width - 4.)),
-                );
-            }
-        }
+        let mut body = WorkspaceBody::new(layout);
+        body.browser = panel;
+        body.visible = shown_target;
+        body.docked = docked;
+        body.dockness = dockness;
+        body.rem = Some(rem);
+        body.wide = wide;
+        body.fraction = fraction;
+        body.shown = shown;
+        body.wideness = wideness;
+        body.resizing = !motion.running();
         let tabs = self
             .tabs
             .iter()
@@ -1620,11 +1818,9 @@ impl Render for Vyber {
                 this.drop_hint = None;
                 this.tab_drag = Some(event.drag(cx).clone());
             }))
-            .on_drag_move(
-                cx.listener(|this, e: &DragMoveEvent<PanelResize>, window, cx| {
-                    this.resize_panel(f32::from(e.event.position.x), window, cx);
-                }),
-            )
+            .on_drag_move(cx.listener(|this, _: &DragMoveEvent<PanelResize>, _, _| {
+                this.resizing_panel = true;
+            }))
             .on_action(cx.listener(|this, _: &CancelTabDrag, window, cx| {
                 if cx.stop_active_drag(window) {
                     this.drop_hint = None;
@@ -1658,8 +1854,12 @@ impl Render for Vyber {
             .on_action(cx.listener(Self::reset_font_size))
             .child(
                 TitleBar::new()
-                    .h(px(36.))
-                    .pl(px(if cfg!(target_os = "macos") { 80. } else { 2. }))
+                    .h(px(theme::TITLE_BAR_HEIGHT))
+                    .pl(px(theme::title_bar_padding(
+                        cfg!(target_os = "macos"),
+                        window.is_fullscreen(),
+                    )))
+                    .pr(px(6.))
                     .bg(rgb(0x000000))
                     .border_color(rgb(0x252525))
                     .child(
@@ -1668,7 +1868,7 @@ impl Render for Vyber {
                             .items_center()
                             .size_full()
                             .min_w_0()
-                            .child(bar_button("menu", "≡").on_click(
+                            .child(icon_bar_button("menu", "menu", false).on_click(
                                 cx.listener(|this, _, w, cx| this.shortcuts(&ShowShortcuts, w, cx)),
                             ))
                             .child(
@@ -1677,6 +1877,7 @@ impl Render for Vyber {
                                     .flex()
                                     .items_center()
                                     .min_w_0()
+                                    .flex_shrink_1()
                                     .max_w(px((full - 270.).max(196.)))
                                     .gap(px(3.))
                                     .h_full()
@@ -1717,7 +1918,7 @@ impl Render for Vyber {
                                     .id("tab-strip-tail")
                                     .flex_1()
                                     .h_full()
-                                    .min_w(px(40.))
+                                    .min_w(px(24.))
                                     .flex()
                                     .items_center()
                                     .px_2()
@@ -1742,19 +1943,10 @@ impl Render for Vyber {
                                     })),
                             )
                             .child(
-                                bar_button("git-toggle", "")
-                                    .relative()
-                                    .child(theme::icon(
-                                        theme::ui("git-branch"),
-                                        if git_open { 0xffffff } else { 0x9b9b9b },
-                                        16.,
-                                    ))
+                                icon_bar_button("git-toggle", "git-branch", git_open)
                                     .when(changes > 0, |s| {
-                                        s.child(
+                                        s.w_auto().px(px(6.)).gap(px(4.)).child(
                                             div()
-                                                .absolute()
-                                                .top(px(3.))
-                                                .right(px(0.))
                                                 .min_w(px(14.))
                                                 .h(px(14.))
                                                 .px(px(3.))
@@ -1764,6 +1956,7 @@ impl Render for Vyber {
                                                 .rounded(px(7.))
                                                 .bg(rgb(0x2f2f2f))
                                                 .text_size(px(9.5))
+                                                .line_height(px(14.))
                                                 .text_color(rgb(0xd6d6d6))
                                                 .child(if changes > 99 {
                                                     "99+".to_string()
@@ -1772,6 +1965,7 @@ impl Render for Vyber {
                                                 }),
                                         )
                                     })
+                                    .when(git_open, |s| s.text_color(rgb(0xffffff)))
                                     .when(git_open, |s| s.bg(rgb(0x1d1d1d)))
                                     .tooltip(|window, cx| {
                                         gpui_kit::component::tooltip::Tooltip::new(
@@ -1784,26 +1978,22 @@ impl Render for Vyber {
                                     })),
                             )
                             .child(
-                                bar_button("files-toggle", "")
-                                    .child(theme::icon(
-                                        theme::ui("panel-right"),
-                                        if visible && !git_open {
-                                            0xffffff
-                                        } else {
-                                            0x9b9b9b
-                                        },
-                                        16.,
-                                    ))
-                                    .when(visible && !git_open, |s| s.bg(rgb(0x1d1d1d)))
-                                    .tooltip(|window, cx| {
-                                        gpui_kit::component::tooltip::Tooltip::new(
-                                            "Files and review  (Ctrl+Shift+B)",
-                                        )
-                                        .build(window, cx)
-                                    })
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.toggle_files(&ToggleFiles, w, cx)
-                                    })),
+                                icon_bar_button(
+                                    "files-toggle",
+                                    "panel-right",
+                                    visible && !git_open,
+                                )
+                                .when(visible && !git_open, |s| s.text_color(rgb(0xffffff)))
+                                .when(visible && !git_open, |s| s.bg(rgb(0x1d1d1d)))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(
+                                        "Files and review  (Ctrl+Shift+B)",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .on_click(cx.listener(
+                                    |this, _, w, cx| this.toggle_files(&ToggleFiles, w, cx),
+                                )),
                             ),
                     ),
             )
@@ -1941,7 +2131,7 @@ pub fn bind_keys(cx: &mut App) {
             Menu::new("File").items([
                 MenuItem::action("New tab", NewTerminal),
                 MenuItem::action("Open folder…", OpenFolder),
-                MenuItem::action("Close terminal", ClosePane),
+                MenuItem::action("Close file, panel or terminal", ClosePane),
             ]),
         ]);
         cx.bind_keys([
@@ -1991,3 +2181,7 @@ mod tests {
         assert_eq!(saved.tabs[0].leaves(), vec![1, 2]);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "app_tests.rs"]
+mod interaction_tests;

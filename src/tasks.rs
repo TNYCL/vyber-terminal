@@ -389,6 +389,14 @@ impl Drop for Monitor {
     }
 }
 impl Monitor {
+    #[cfg(test)]
+    pub fn inactive() -> Self {
+        let (_, receiver) = mpsc::channel();
+        Self {
+            receiver,
+            stop: Arc::new(AtomicBool::new(true)),
+        }
+    }
     pub fn start(roots: Arc<std::sync::Mutex<Vec<PathBuf>>>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));

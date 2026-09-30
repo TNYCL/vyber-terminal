@@ -53,7 +53,7 @@
   TOML, Markdown, Bash, CSS and HTML; search/replace, undo/redo, line numbers and atomic saves.
 - Rendered Markdown preview, image preview (PNG, JPEG, WebP, GIF, BMP, SVG, ICO) with zoom, and an
   info card for binary or oversized files.
-- **Follow** mode opens files as they change on disk; **Pin** keeps the current file in place.
+- **Follow** mode opens files as they change on disk; **Pin** docks the preview beside the terminal.
 
 **Review**
 
@@ -112,7 +112,8 @@
   hard resets keep recovery copies; a running agent turn is pointed out before commands that
   change its files.
 
-Vyber never talks to agents: it doesn't install hooks, use an SDK or scan processes. `claude`, `codex`
+Vyber never talks to agents: it doesn't install hooks or use an SDK. It checks local process names
+only when confirming terminal closure. `claude`, `codex`
 and every other CLI simply run in your terminal.
 
 ## Building
@@ -124,6 +125,10 @@ only needed for content search.
 cargo build --release --locked
 ./target/release/vyber            # or: vyber <folder>
 ```
+
+A fresh launch without a folder opens your home directory. With `restore_workspace` enabled,
+previous tabs and folders are restored instead. Tab labels show the folder name; on macOS,
+the default zsh session reports directory changes without modifying your shell profiles.
 
 On Windows, `scripts/build.ps1` builds, copies the binary to `dist/Vyber.exe` and creates a
 `Vyber.lnk` shortcut with the app icon:
@@ -145,7 +150,8 @@ Run the test suite with `cargo test --locked`.
 | New tab | Ctrl+T / Ctrl+Shift+T | Cmd+T / Cmd+N |
 | Split right (terminal focused) | Ctrl+D | Cmd+D |
 | Split down | Ctrl+Shift+D / Ctrl+Shift+E | Cmd+Shift+D |
-| Close terminal | Ctrl+Shift+W | Cmd+W |
+| Close active preview file, then panel, then focused terminal | Ctrl+Shift+W | Cmd+W |
+| Quit (confirm running terminal processes) | Alt+F4 | Cmd+Q |
 | Next terminal | Ctrl+Shift+] | Cmd+] |
 | Switch tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Go to tab 1–8 / last tab | Ctrl+1…8 / Ctrl+9 | Cmd+1…8 / Cmd+9 |
@@ -164,6 +170,21 @@ Run the test suite with `cargo test --locked`.
 | Settings file | Ctrl+Shift+, | Cmd+, |
 | Shortcut help | Ctrl+Shift+H | Cmd+Shift+H |
 | Font size of the focused terminal or panel: up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 |
+
+Cmd+W closes the displayed file first, keeping the preview panel open. With no file displayed it
+closes the preview or Git panel; with the panel closed it closes only the focused terminal,
+including in a split. The other terminals in that split keep running. The terminal close button
+has the same scope. Closing a complete group is an explicit action and checks every terminal in it.
+Unsaved editor changes block file and terminal closure. Running agent sessions and background jobs
+require confirmation; Cancel leaves the sessions running. Cmd+Q checks all open terminals before
+quitting and saves the open layout and drafts for restoration.
+
+Closing the last terminal leaves an empty workspace where Cmd+T or the New terminal button opens
+a new session. Exiting the last shell has the same behavior. On macOS, closing the window keeps the
+application running; launching it again from the Dock or Finder opens a workspace window. New tab
+and Quit also work from the native menu when no window is open. Closed terminals are removed from
+the saved workspace. The Unix process check reads process names, without command arguments; if
+inspection is unavailable, closing a live terminal requires confirmation.
 
 In the file tree: ↑/↓ to move, →/← to expand or collapse, Enter to open, Space for quick look.
 In the filter box, Enter opens the best match and Shift+Enter searches file contents.

@@ -73,6 +73,9 @@ pub struct BrowserState {
     pub active: Option<PathBuf>,
     pub follow: bool,
     pub pinned: bool,
+    /// Preview terminalin yanına gömülür; eski kayıtlar yüzen modda açılır.
+    #[serde(default)]
+    pub docked: bool,
     #[serde(default)]
     pub wide: bool,
     #[serde(default)]
@@ -188,6 +191,8 @@ enum Menu {
 }
 
 pub enum BrowserEvent {
+    /// Ana yerleşim panelin yeni ölçüsünü ve görünürlüğünü tekrar hesaplar.
+    LayoutChanged,
     /// A review comment to type into this terminal's input.
     Comment(String),
     /// Open a new terminal tab in this folder.
@@ -240,6 +245,7 @@ impl Slide {
 pub struct Browser {
     pub root: PathBuf,
     pub visible: bool,
+    pub docked: bool,
     /// Panel covers the whole terminal area instead of the right side.
     pub wide: bool,
     /// Panel width as a share of the window; `None` is the default.
@@ -269,7 +275,6 @@ pub struct Browser {
     git: scm::GitState,
     checkpoint: Option<Checkpoint>,
     follow: bool,
-    pinned: bool,
     notice: String,
     notice_at: Instant,
     notice_serial: u64,
@@ -330,7 +335,9 @@ impl Browser {
         });
         cx.spawn_in(window, async move |entity, cx| {
             loop {
-                smol::Timer::after(Duration::from_millis(200)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
                 if entity
                     .update_in(cx, |view, window, cx| view.poll(window, cx))
                     .is_err()
@@ -348,6 +355,7 @@ impl Browser {
         Self {
             root,
             visible: false,
+            docked: cx.global::<Config>().panel_mode == PanelMode::Dock,
             wide: false,
             panel_width: None,
             sidebar_width: [260., 250., 340.],
@@ -373,7 +381,6 @@ impl Browser {
             git: scm::GitState::new(),
             checkpoint: None,
             follow: false,
-            pinned: false,
             notice: String::new(),
             notice_at: Instant::now(),
             notice_serial: 0,
@@ -421,22 +428,7 @@ impl Browser {
                 "Dock beside terminal"
             },
         )
-        .on_click(cx.listener(|_, _, _, cx| {
-            Config::update(cx, |c| {
-                c.panel_mode = match c.panel_mode {
-                    PanelMode::Dock => PanelMode::Overlay,
-                    PanelMode::Overlay => PanelMode::Dock,
-                }
-            });
-        }))
-    }
-    /// Hides the panel and hands the keyboard back to the terminal.
-    pub(super) fn close_panel(&mut self, cx: &mut Context<Self>) {
-        self.visible = false;
-        self.menu = None;
-        self.git.menu = None;
-        cx.emit(BrowserEvent::Closed);
-        cx.notify();
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_docked(cx)))
     }
     fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<Self>) {
         self.close_front(window, cx);
@@ -552,13 +544,80 @@ impl Browser {
             .iter()
             .any(|d| d.editor.read(cx).focus_handle(cx).is_focused(window))
     }
+    #[cfg(test)]
+    pub(crate) fn test_document(
+        &mut self,
+        path: PathBuf,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.visible = true;
+        self.view = View::Files;
+        self.loaded(
+            path,
+            Ok(text.as_bytes().to_vec()),
+            text.len() as u64,
+            true,
+            window,
+            cx,
+        );
+        if let Some(doc) = self.docs.get_mut(self.active_doc) {
+            doc.preview = false;
+            doc.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        }
+        cx.notify();
+    }
+    pub fn close_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.view != View::Files || self.active_document().is_none() {
+            return false;
+        }
+        let focused = self.owns_focus(window, cx);
+        // Kirli dosya kapanmayı reddederse komut panel veya terminale geçmez.
+        self.close_doc(self.active_doc, cx);
+        if focused {
+            let focus = self
+                .active_document()
+                .map(|doc| doc.editor.read(cx).focus_handle(cx))
+                .unwrap_or_else(|| self.focus.clone());
+            window.focus(&focus, cx);
+        }
+        true
+    }
+    pub fn close_panel(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        self.menu = None;
+        self.git.menu = None;
+        cx.emit(BrowserEvent::Closed);
+        self.layout_changed(cx);
+    }
+    pub(super) fn layout_changed(&self, cx: &mut Context<Self>) {
+        cx.emit(BrowserEvent::LayoutChanged);
+        cx.notify();
+    }
+    pub(super) fn toggle_docked(&mut self, cx: &mut Context<Self>) {
+        let docked = cx.global::<Config>().panel_mode != PanelMode::Dock;
+        Config::update(cx, |config| {
+            config.panel_mode = if docked {
+                PanelMode::Dock
+            } else {
+                PanelMode::Overlay
+            };
+        });
+        self.docked = docked;
+        if self.docked {
+            self.wide = false;
+        }
+        self.layout_changed(cx);
+    }
     pub fn state(&self, cx: &App) -> BrowserState {
         BrowserState {
             visible: self.visible,
             expanded: self.expanded.clone(),
             active: self.active_document().map(|d| d.path.clone()),
             follow: self.follow,
-            pinned: self.pinned,
+            pinned: false,
+            docked: cx.global::<Config>().panel_mode == PanelMode::Dock,
             wide: self.wide,
             tree_root: self.tree_root.clone(),
             panel_width: self.panel_width,
@@ -588,8 +647,13 @@ impl Browser {
     pub fn restore_state(&mut self, state: BrowserState, cx: &mut Context<Self>) {
         self.visible = state.visible;
         self.expanded = state.expanded;
-        self.follow = state.follow;
-        self.pinned = state.pinned;
+        // Eski dosya kilidi, gömme moduna dönüşmeden takip kapalı olarak korunur.
+        self.follow = state.follow && !state.pinned;
+        // Yerel kayıtlardaki gömülü panel tercihi ortak yapılandırmaya taşınır.
+        if state.docked && cx.global::<Config>().panel_mode != PanelMode::Dock {
+            Config::update(cx, |config| config.panel_mode = PanelMode::Dock);
+        }
+        self.docked = cx.global::<Config>().panel_mode == PanelMode::Dock;
         self.wide = state.wide;
         self.tree_root = state.tree_root;
         self.panel_width = state.panel_width.filter(|w| (0.2..=1.).contains(w));
@@ -673,7 +737,12 @@ impl Browser {
         self.tree_selected = None;
         self.loading = true;
         self.scope = Scope::default();
-        start_watcher(root, self.sender.clone(), self.stop.clone(), self.scope.clone());
+        start_watcher(
+            root,
+            self.sender.clone(),
+            self.stop.clone(),
+            self.scope.clone(),
+        );
         cx.notify();
     }
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -802,7 +871,6 @@ impl Browser {
         changed |= self.review_tick(cx);
         self.git_tick();
         if self.follow
-            && !self.pinned
             && !self
                 .docs
                 .iter()
@@ -862,9 +930,7 @@ impl Browser {
                         (Kind::Text, bytes, text)
                     }
                     Err(_) => (
-                        Kind::Unsupported(
-                            "Not UTF-8 text · Vyber only edits UTF-8 files".into(),
-                        ),
+                        Kind::Unsupported("Not UTF-8 text · Vyber only edits UTF-8 files".into()),
                         vec![],
                         String::new(),
                     ),
@@ -949,8 +1015,7 @@ impl Browser {
         self.view = View::Files;
         self.menu = None;
         let relative = self.relative(&path);
-        self.expanded
-            .extend(workspace::expanded_parents(&relative));
+        self.expanded.extend(workspace::expanded_parents(&relative));
         self.tree_selected = Some(relative);
         self.reveal = true;
         if let Some(i) = self.docs.iter().position(|d| d.path == path) {
@@ -1022,7 +1087,8 @@ impl Browser {
                     doc.text = text.clone().into();
                     doc.dirty = false;
                     doc.conflict = false;
-                    doc.editor.update(cx, |ed, cx| ed.set_value(text, window, cx));
+                    doc.editor
+                        .update(cx, |ed, cx| ed.set_value(text, window, cx));
                 }
             }
         }
@@ -1222,12 +1288,14 @@ impl Render for Browser {
                             .child(theme::resize_handle("sidebar-resize", SidebarResize).left_0()),
                     )
                 })
-                .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
-                    this.sidebar_width[side] = (f32::from(e.bounds.right() - e.event.position.x)
-                        / this.scale)
-                        .clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
-                    cx.notify();
-                }))
+                .on_drag_move(
+                    cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
+                        this.sidebar_width[side] =
+                            (f32::from(e.bounds.right() - e.event.position.x) / this.scale)
+                                .clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
+                        cx.notify();
+                    }),
+                )
                 .with_animation(
                     ("browser-view", self.view_serial),
                     Animation::new(Duration::from_millis(140)),
@@ -1266,7 +1334,9 @@ impl Render for Browser {
                 self.tab_strip(cx).into_any_element()
             })
             .child(div().flex_1().min_h_0().child(main))
-            .when(self.view == View::Git, |s| s.children(self.git_overlays(window, cx)))
+            .when(self.view == View::Git, |s| {
+                s.children(self.git_overlays(window, cx))
+            })
             .when(!self.notice.is_empty(), |s| {
                 s.child(
                     div()
@@ -1333,7 +1403,12 @@ impl Scope {
     }
 }
 
-fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicBool>, scope: Scope) {
+fn start_watcher(
+    root: PathBuf,
+    sender: mpsc::Sender<Message>,
+    stop: Arc<AtomicBool>,
+    scope: Scope,
+) {
     std::thread::spawn(move || {
         let _ = sender.send(Message::Tasks(crate::tasks::history(&root)));
         let (event_tx, event_rx) = mpsc::channel();
@@ -1356,8 +1431,7 @@ fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicB
         let mut paths = BTreeSet::new();
         let mut revision = crate::project::revision();
         while !stop.load(Ordering::Relaxed) {
-            if scope.rescan.swap(false, Ordering::Relaxed)
-                || revision != crate::project::revision()
+            if scope.rescan.swap(false, Ordering::Relaxed) || revision != crate::project::revision()
             {
                 revision = crate::project::revision();
                 refresh = true;
@@ -1381,9 +1455,10 @@ fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicB
                         }
                         continue;
                     }
-                    if relative.components().any(|c| {
-                        matches!(c.as_os_str().to_str(), Some("target" | "node_modules"))
-                    }) {
+                    if relative
+                        .components()
+                        .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "node_modules")))
+                    {
                         continue;
                     }
                     paths.insert(path);
@@ -1417,4 +1492,36 @@ fn start_watcher(root: PathBuf, sender: mpsc::Sender<Message>, stop: Arc<AtomicB
             std::thread::sleep(Duration::from_millis(150));
         }
     });
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::BrowserState;
+
+    #[test]
+    fn legacy_workspace_keeps_overlay_and_document_pin_separate() {
+        let state: BrowserState = serde_json::from_str(
+            r#"{"visible":true,"expanded":[],"docs":[],"active":null,"follow":true,"pinned":true}"#,
+        )
+        .unwrap();
+        assert!(!state.docked);
+        assert!(state.pinned);
+        assert!(state.follow);
+    }
+
+    #[test]
+    fn docked_workspace_preserves_mode_width_and_follow_setting() {
+        let state = BrowserState {
+            visible: true,
+            docked: true,
+            follow: true,
+            panel_width: Some(0.61),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        let restored: BrowserState = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.visible && restored.docked && restored.follow);
+        assert!(!restored.pinned);
+        assert_eq!(restored.panel_width, state.panel_width);
+    }
 }

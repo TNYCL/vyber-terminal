@@ -40,7 +40,7 @@ static ICONS: &[(&str, &[u8])] = embed![
     "ui/folder-open.svg", "ui/folder-plus.svg", "ui/folder-search.svg", "ui/folder.svg",
     "ui/git-branch-plus.svg", "ui/git-branch.svg", "ui/git-commit-horizontal.svg",
     "ui/git-compare.svg", "ui/git-fork.svg", "ui/git-graph.svg", "ui/git-merge.svg", "ui/image.svg",
-    "ui/loader-circle.svg", "ui/maximize-2.svg", "ui/minimize-2.svg", "ui/minus.svg",
+    "ui/loader-circle.svg", "ui/menu.svg", "ui/maximize-2.svg", "ui/minimize-2.svg", "ui/minus.svg",
     "ui/panel-dock.svg", "ui/panel-float.svg",
     "ui/panel-right-close.svg", "ui/panel-right.svg", "ui/pencil.svg", "ui/pin-off.svg",
     "ui/pin.svg", "ui/plus.svg", "ui/refresh-ccw.svg", "ui/refresh-cw.svg", "ui/rotate-ccw.svg",

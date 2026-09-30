@@ -405,7 +405,7 @@ impl Browser {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.wide = !this.wide;
-                    cx.notify();
+                    this.layout_changed(cx);
                 })),
             )
             .child(

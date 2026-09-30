@@ -148,7 +148,7 @@ impl Browser {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.wide = !this.wide;
-                    cx.notify();
+                    this.layout_changed(cx);
                 })),
             )
             .child(
@@ -169,22 +169,6 @@ impl Browser {
                     } else {
                         "Stopped following"
                     });
-                    cx.notify();
-                })),
-            )
-            .child(
-                icon_button(
-                    "pin",
-                    if self.pinned { "pin-off" } else { "pin" },
-                    if self.pinned {
-                        "Unpin preview"
-                    } else {
-                        "Pin preview · keep this file while following"
-                    },
-                )
-                .when(self.pinned, |s| s.bg(rgb(SELECTED)))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.pinned = !this.pinned;
                     cx.notify();
                 })),
             )
