@@ -1952,6 +1952,8 @@ mod tests {
             .prefix("vyber bash Türkçe ")
             .tempdir()?;
         std::fs::create_dir(dir.path().join("child"))?;
+        let expected_root = dir.path().canonicalize()?;
+        let expected_child = dir.path().join("child").canonicalize()?;
         std::fs::write(
             dir.path().join("vyber_bash_probe.txt"),
             "VYBER_BASH_COMPLETE",
@@ -1992,7 +1994,12 @@ mod tests {
                     .map(|c| c.c)
                     .collect();
                 if output.contains(needle)
-                    && expected_cwd.is_none_or(|path| cwd.as_deref() == Some(path))
+                    && expected_cwd.is_none_or(|path| {
+                        cwd.as_deref()
+                            .and_then(|directory| directory.canonicalize().ok())
+                            .as_deref()
+                            == Some(path)
+                    })
                     && (!want_exit || exited)
                     && (!want_prompt || output.trim_end().ends_with('$'))
                 {
@@ -2002,7 +2009,7 @@ mod tests {
             }
             (false, output)
         };
-        let ready = read_until("$", Some(dir.path()), false, true);
+        let ready = read_until("$", Some(&expected_root), false, true);
         if !ready.0 {
             let _ = backend.sender.send(Msg::Shutdown);
             anyhow::bail!(
@@ -2021,11 +2028,11 @@ mod tests {
         ))?;
         let completed = read_until("vyber_bash_probe.txt", None, false, false).0;
         backend.sender.send(Msg::Input(vec![13].into()))?;
-        let success = read_until("VYBER_BASH_COMPLETE", Some(dir.path()), false, true).0;
+        let success = read_until("VYBER_BASH_COMPLETE", Some(&expected_root), false, true).0;
         backend
             .sender
             .send(Msg::Input(b"cd child\r".to_vec().into()))?;
-        let moved = read_until("", Some(&dir.path().join("child")), false, true);
+        let moved = read_until("", Some(&expected_child), false, true);
         backend.sender.send(Msg::Input(b"exit\r".to_vec().into()))?;
         let exited = read_until("", None, true, false).0;
         let _ = backend.sender.send(Msg::Shutdown);
