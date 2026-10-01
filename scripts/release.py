@@ -28,7 +28,7 @@ TARGETS = {
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?")
 
 def run(*args, **kwargs):
-    return subprocess.check_output(args, cwd=ROOT, text=True, **kwargs).strip()
+    return subprocess.check_output(args, cwd=ROOT, text=True, encoding="utf-8", **kwargs).strip()
 
 def version():
     return tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
@@ -263,7 +263,7 @@ def preflight(tag):
     print(json.dumps(values))
 
 def get_release(tag):
-    result = subprocess.run(["gh", "api", f"repos/{REPO}/releases/tags/{tag}"], cwd=ROOT, text=True, capture_output=True)
+    result = subprocess.run(["gh", "api", f"repos/{REPO}/releases/tags/{tag}"], cwd=ROOT, text=True, encoding="utf-8", capture_output=True)
     if result.returncode == 0:
         return json.loads(result.stdout)
     if "HTTP 404" in result.stderr:
