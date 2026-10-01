@@ -247,10 +247,10 @@ impl Browser {
                 let row = &rows[i];
                 if row.directory && row.expanded {
                     self.expanded.remove(&row.relative);
-                } else if let Some((parent, _)) = row.relative.rsplit_once('/') {
-                    if let Some(p) = rows.iter().position(|r| r.relative == parent) {
-                        select(self, p);
-                    }
+                } else if let Some((parent, _)) = row.relative.rsplit_once('/')
+                    && let Some(p) = rows.iter().position(|r| r.relative == parent)
+                {
+                    select(self, p);
                 }
             }
             "enter" => {
@@ -328,16 +328,16 @@ impl Browser {
                             .text_size(rpx(12.5))
                             .text_color(rgb(TEXT))
                             .when(can_switch, |s| {
-                                s.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                s.cursor_pointer().hover(|s| s.bg(rgb(HOVER))).on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.toggle_menu(Menu::Root);
                                         // Worktrees come from the repositories' Git data.
                                         if !this.git.discovered {
                                             this.load_repos();
                                         }
                                         cx.notify();
-                                    }))
+                                    }),
+                                )
                             })
                             .child(icon(ui("folder"), TEXT_2, 14.))
                             .child(div().flex_1().min_w_0().truncate().child(root_name))
@@ -371,7 +371,10 @@ impl Browser {
             )
             .child(body)
             .when(self.menu == Some(Menu::Root), |s| {
-                s.child(menu_in("root-menu-in", self.root_menu(repositories, cx).into_any_element()))
+                s.child(menu_in(
+                    "root-menu-in",
+                    self.root_menu(repositories, cx).into_any_element(),
+                ))
             })
             .into_any_element()
     }
@@ -398,7 +401,11 @@ impl Browser {
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(HOVER)))
                 .child(icon(
-                    ui(if value.is_some() { "folder-git-2" } else { "folder" }),
+                    ui(if value.is_some() {
+                        "folder-git-2"
+                    } else {
+                        "folder"
+                    }),
                     TEXT_2,
                     14.,
                 ))
@@ -508,7 +515,11 @@ impl Browser {
                     .as_deref()
                     .map(crate::project::folder_name)
                     .unwrap_or_default();
-                (super::scm::repo_label(&r.repo, r.status()), format!("worktree of {owner}"), r.repo.path.clone())
+                (
+                    super::scm::repo_label(&r.repo, r.status()),
+                    format!("worktree of {owner}"),
+                    r.repo.path.clone(),
+                )
             })
             .collect();
         if !worktrees.is_empty() {
@@ -529,7 +540,13 @@ impl Browser {
             items.push(heading("PROJECT"));
             for (i, path) in outside.into_iter().enumerate() {
                 let name = crate::project::folder_name(&path);
-                items.push(link(1000 + i, "folder-git-2", name, "project folder".into(), path));
+                items.push(link(
+                    1000 + i,
+                    "folder-git-2",
+                    name,
+                    "project folder".into(),
+                    path,
+                ));
             }
         }
         div()
@@ -560,8 +577,7 @@ impl Browser {
         let rows = self.rows(cx);
         if self.reveal && query.is_empty() {
             if let Some(i) = rows.iter().position(|r| r.selected) {
-                self.tree_scroll
-                    .scroll_to_item(i, ScrollStrategy::Nearest);
+                self.tree_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
             }
             self.reveal = false;
         }
@@ -605,12 +621,7 @@ impl Browser {
                                 .truncate()
                                 .child(format!("Search contents for “{query}”")),
                         )
-                        .child(
-                            div()
-                                .text_size(rpx(11.))
-                                .text_color(rgb(MUTED))
-                                .child("⇧↵"),
-                        )
+                        .child(div().text_size(rpx(11.)).text_color(rgb(MUTED)).child("⇧↵"))
                         .on_click(cx.listener(|this, _, _, cx| this.search_contents(cx))),
                 )
             })
@@ -709,9 +720,7 @@ impl Browser {
                                                 .child(relative),
                                         )
                                         .child(
-                                            div()
-                                                .text_color(rgb(MUTED))
-                                                .child(format!(":{line}")),
+                                            div().text_color(rgb(MUTED)).child(format!(":{line}")),
                                         ),
                                 )
                                 .child(
@@ -823,7 +832,13 @@ fn tree_row(i: usize, row: Row, entity: Entity<Browser>) -> AnyElement {
                     )
                 })
                 .when(row.changed, |s| {
-                    s.child(div().size(rpx(5.)).rounded_full().bg(rgb(MODIFIED)).opacity(0.7))
+                    s.child(
+                        div()
+                            .size(rpx(5.))
+                            .rounded_full()
+                            .bg(rgb(MODIFIED))
+                            .opacity(0.7),
+                    )
                 }),
         )
         .when_some(row.guide, |s, depth| {

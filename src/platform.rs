@@ -10,8 +10,27 @@ pub fn default_shell() -> String {
     }
     #[cfg(not(windows))]
     {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+        let candidates = if cfg!(target_os = "macos") {
+            &["/bin/zsh", "/bin/bash", "/bin/sh"][..]
+        } else {
+            &["/bin/bash", "/usr/bin/bash", "/bin/sh"][..]
+        };
+        unix_shell(std::env::var("SHELL").ok().as_deref(), candidates)
     }
+}
+
+#[cfg(unix)]
+fn unix_shell(shell: Option<&str>, candidates: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    shell
+        .into_iter()
+        .chain(candidates.iter().copied())
+        .find(|path| {
+            std::fs::metadata(path)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or("/bin/sh")
+        .to_owned()
 }
 
 #[cfg(windows)]
@@ -78,18 +97,16 @@ pub fn login_environment() {
             }
         }
     }
-    if let Ok(bytes) = reader.join() {
-        if let Some(path) = bytes
+    if let Ok(bytes) = reader.join()
+        && let Some(path) = bytes
             .split(|b| *b == 0)
             .nth(1)
             .and_then(|b| std::str::from_utf8(b).ok())
-        {
-            if !path.is_empty() {
-                // Called once before the application starts any threads.
-                unsafe {
-                    std::env::set_var("PATH", path);
-                }
-            }
+        && !path.is_empty()
+    {
+        // Called once before the application starts any threads.
+        unsafe {
+            std::env::set_var("PATH", path);
         }
     }
 }
@@ -100,8 +117,10 @@ pub fn login_environment() {}
 pub fn open_default(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
     let mut command = crate::workspace::command("explorer.exe");
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
     command.arg(path).spawn().map(|_| ())
 }
 
@@ -115,13 +134,22 @@ pub fn reveal(path: &std::path::Path) -> std::io::Result<()> {
             .spawn()
             .map(|_| ())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg("-R")
             .arg(path)
             .spawn()
             .map(|_| ())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // XDG has no portable select-file operation; open its containing folder.
+        open_default(if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        })
     }
 }
 
@@ -175,6 +203,19 @@ pub fn folder_name(path: &Path) -> String {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_non_executable_shell_uses_a_working_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("not-a-shell");
+        std::fs::write(&file, "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(unix_shell(Some("/missing/shell"), &["/bin/sh"]), "/bin/sh");
+        assert_eq!(unix_shell(file.to_str(), &["/bin/sh"]), "/bin/sh");
+        assert_eq!(unix_shell(Some("/bin/sh"), &["/missing"]), "/bin/sh");
+    }
 
     #[test]
     fn startup_uses_home_and_respects_an_explicit_folder() {

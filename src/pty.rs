@@ -70,13 +70,12 @@ impl Read for ObservedPty {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.reader().read(bytes)?;
         for osc in self.parser.feed(&bytes[..n]) {
-            if let Some(path) = osc.strip_prefix("7;") {
-                if let Ok(url) = url::Url::parse(path) {
-                    if let Ok(path) = url.to_file_path() {
-                        self.proxy
-                            .send_event(Event::Title(format!("__VYBER_CWD__{}", path.display())));
-                    }
-                }
+            if let Some(path) = osc.strip_prefix("7;")
+                && let Ok(url) = url::Url::parse(path)
+                && let Ok(path) = url.to_file_path()
+            {
+                self.proxy
+                    .send_event(Event::Title(format!("__VYBER_CWD__{}", path.display())));
             }
             let message = osc
                 .strip_prefix("9;")

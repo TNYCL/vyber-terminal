@@ -33,7 +33,13 @@ impl Repo {
 /// Runs git in `dir` for reading: no optional locks, no prompts.
 pub fn read(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = workspace::command("git")
-        .args(["--no-pager", "-c", "core.quotepath=false", "-c", "color.ui=false"])
+        .args([
+            "--no-pager",
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "color.ui=false",
+        ])
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -47,7 +53,9 @@ pub fn read(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 fn read_text(dir: &Path, args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&read(dir, args)?).trim_end().to_owned())
+    Ok(String::from_utf8_lossy(&read(dir, args)?)
+        .trim_end()
+        .to_owned())
 }
 
 /// The main worktree of the repository at `path` (itself unless `path` is a
@@ -107,17 +115,15 @@ pub fn repositories(root: &Path) -> Vec<Repo> {
             continue;
         }
         let worktrees = worktrees(&path).unwrap_or_default();
-        let web = read_text(&path, &["remote"])
-            .ok()
-            .and_then(|remotes| {
-                let remotes: Vec<&str> = remotes.lines().collect();
-                let remote = remotes
-                    .iter()
-                    .find(|r| **r == "origin")
-                    .or(remotes.first())?
-                    .to_string();
-                web_url(&path, &remote)
-            });
+        let web = read_text(&path, &["remote"]).ok().and_then(|remotes| {
+            let remotes: Vec<&str> = remotes.lines().collect();
+            let remote = remotes
+                .iter()
+                .find(|r| **r == "origin")
+                .or(remotes.first())?
+                .to_string();
+            web_url(&path, &remote)
+        });
         repos.push(Repo {
             name: project::folder_name(&path),
             path: path.clone(),
@@ -272,7 +278,9 @@ pub fn parse_status(bytes: &[u8]) -> Status {
             }
             b'2' => {
                 let parts: Vec<&str> = text.splitn(10, ' ').collect();
-                let from = fields.next().map(|f| String::from_utf8_lossy(f).into_owned());
+                let from = fields
+                    .next()
+                    .map(|f| String::from_utf8_lossy(f).into_owned());
                 if parts.len() < 10 {
                     continue;
                 }
@@ -338,7 +346,11 @@ pub fn git_dir(path: &Path) -> Option<PathBuf> {
     }
     let text = fs::read_to_string(&dot).ok()?;
     let dir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
-    Some(if dir.is_absolute() { dir } else { path.join(dir) })
+    Some(if dir.is_absolute() {
+        dir
+    } else {
+        path.join(dir)
+    })
 }
 
 pub fn operation(git_dir: &Path) -> Option<Operation> {
@@ -552,7 +564,13 @@ pub fn refs(path: &Path) -> Result<Vec<Ref>> {
     let format = format!("--format={REF_FORMAT}");
     Ok(parse_refs(&read_text(
         path,
-        &["for-each-ref", &format, "refs/heads", "refs/remotes", "refs/tags"],
+        &[
+            "for-each-ref",
+            &format,
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
     )?))
 }
 
@@ -630,7 +648,9 @@ pub fn parse_labels(text: &str) -> Vec<Label> {
         } else if part == "HEAD" {
             labels.push(Label::Detached);
         } else if let Some(tag) = part.strip_prefix("tag: ") {
-            labels.push(Label::Tag(tag.strip_prefix("refs/tags/").unwrap_or(tag).into()));
+            labels.push(Label::Tag(
+                tag.strip_prefix("refs/tags/").unwrap_or(tag).into(),
+            ));
         } else if let Some(name) = part.strip_prefix("refs/heads/") {
             labels.push(Label::Local(name.into()));
         } else if let Some(name) = part.strip_prefix("refs/remotes/")
@@ -653,7 +673,11 @@ pub fn parse_log(bytes: &[u8]) -> Vec<Commit> {
             let f: Vec<&str> = text.splitn(7, '\x1f').collect();
             (f.len() == 7 && f[0].len() >= 7).then(|| Commit {
                 hash: f[0].into(),
-                parents: f[1].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+                parents: f[1]
+                    .split(' ')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
                 author: f[2].into(),
                 email: f[3].into(),
                 time: f[4].parse().unwrap_or(0),
@@ -666,7 +690,13 @@ pub fn parse_log(bytes: &[u8]) -> Vec<Commit> {
 
 /// A page of history in topological order. `all` covers every branch, tag
 /// and remote; otherwise HEAD and its upstream.
-pub fn log(path: &Path, all: bool, upstream: Option<&str>, skip: usize, count: usize) -> Result<Vec<Commit>> {
+pub fn log(
+    path: &Path,
+    all: bool,
+    upstream: Option<&str>,
+    skip: usize,
+    count: usize,
+) -> Result<Vec<Commit>> {
     let skip = format!("--skip={skip}");
     let count = format!("--max-count={count}");
     let mut args = vec![
@@ -728,7 +758,11 @@ pub fn commit_info(path: &Path, hash: &str) -> Result<CommitInfo> {
     }
     Ok(CommitInfo {
         hash: f[0].into(),
-        parents: f[1].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+        parents: f[1]
+            .split(' ')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect(),
         author: f[2].into(),
         email: f[3].into(),
         authored: f[4].parse().unwrap_or(0),
@@ -809,13 +843,28 @@ u UU N... 100644 100644 100644 100644 a b c both.rs\0\
         assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(status.upstream.as_deref(), Some("origin/main"));
         assert_eq!((status.ahead, status.behind, status.stashes), (2, 1, 3));
-        let staged: Vec<_> = status.staged.iter().map(|e| (e.path.as_str(), e.letter)).collect();
-        assert_eq!(staged, vec![("new name.rs", 'R'), ("new.rs", 'A'), ("src/a b.rs", 'M')]);
+        let staged: Vec<_> = status
+            .staged
+            .iter()
+            .map(|e| (e.path.as_str(), e.letter))
+            .collect();
+        assert_eq!(
+            staged,
+            vec![("new name.rs", 'R'), ("new.rs", 'A'), ("src/a b.rs", 'M')]
+        );
         assert_eq!(status.staged[0].from.as_deref(), Some("old name.rs"));
-        let unstaged: Vec<_> = status.unstaged.iter().map(|e| (e.path.as_str(), e.letter)).collect();
+        let unstaged: Vec<_> = status
+            .unstaged
+            .iter()
+            .map(|e| (e.path.as_str(), e.letter))
+            .collect();
         assert_eq!(
             unstaged,
-            vec![("gone.txt", 'D'), ("new.rs", 'M'), ("untracked file.txt", 'U')]
+            vec![
+                ("gone.txt", 'D'),
+                ("new.rs", 'M'),
+                ("untracked file.txt", 'U')
+            ]
         );
         assert_eq!(status.conflicts[0].conflict, Some("both modified"));
         assert_eq!(status.changes(), 7);
@@ -847,12 +896,67 @@ worktree C:/w/gone\0HEAD ccc\0detached\0prunable gitdir file points to non-exist
     fn refs_skip_symbolic_and_sort_current_first() {
         let row = |fields: [&str; 10]| fields.join("\x1f");
         let text = [
-            row(["refs/heads/old", "old", "a1", "", "", "100", "old work", " ", "", ""]),
-            row(["refs/heads/main", "main", "b2", "origin/main", "ahead 1, behind 2", "50", "main work", "*", "C:/w/cady", ""]),
-            row(["refs/remotes/origin/HEAD", "origin", "b2", "", "", "50", "x", " ", "", "refs/remotes/origin/main"]),
-            row(["refs/remotes/origin/main", "origin/main", "c3", "", "", "70", "remote", " ", "", ""]),
+            row([
+                "refs/heads/old",
+                "old",
+                "a1",
+                "",
+                "",
+                "100",
+                "old work",
+                " ",
+                "",
+                "",
+            ]),
+            row([
+                "refs/heads/main",
+                "main",
+                "b2",
+                "origin/main",
+                "ahead 1, behind 2",
+                "50",
+                "main work",
+                "*",
+                "C:/w/cady",
+                "",
+            ]),
+            row([
+                "refs/remotes/origin/HEAD",
+                "origin",
+                "b2",
+                "",
+                "",
+                "50",
+                "x",
+                " ",
+                "",
+                "refs/remotes/origin/main",
+            ]),
+            row([
+                "refs/remotes/origin/main",
+                "origin/main",
+                "c3",
+                "",
+                "",
+                "70",
+                "remote",
+                " ",
+                "",
+                "",
+            ]),
             row(["refs/tags/v1", "v1", "d4", "", "", "10", "tag", " ", "", ""]),
-            row(["refs/heads/gone", "gone", "e5", "origin/gone", "gone", "200", "g", " ", "C:/w/.worktree/g", ""]),
+            row([
+                "refs/heads/gone",
+                "gone",
+                "e5",
+                "origin/gone",
+                "gone",
+                "200",
+                "g",
+                " ",
+                "C:/w/.worktree/g",
+                "",
+            ]),
         ]
         .join("\n");
         let refs = parse_refs(&text);
@@ -909,7 +1013,14 @@ worktree C:/w/gone\0HEAD ccc\0detached\0prunable gitdir file points to non-exist
         init(&root.join("api"))?;
         workspace::git_text(
             &root.join("api"),
-            &["worktree", "add", "-q", "-b", "feature", "../.worktree/api-feature"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                "../.worktree/api-feature",
+            ],
         )?;
         let repos = repositories(root);
         let names: Vec<_> = repos
@@ -947,9 +1058,18 @@ worktree C:/w/gone\0HEAD ccc\0detached\0prunable gitdir file points to non-exist
         {
             workspace::git_text(root, &["remote", "add", &format!("r{i}"), url])?;
         }
-        assert_eq!(web_url(root, "r0").as_deref(), Some("https://github.com/usecady/cady"));
-        assert_eq!(web_url(root, "r1").as_deref(), Some("https://github.com/usecady/cady"));
-        assert_eq!(web_url(root, "r2").as_deref(), Some("https://gitlab.com/group/repo"));
+        assert_eq!(
+            web_url(root, "r0").as_deref(),
+            Some("https://github.com/usecady/cady")
+        );
+        assert_eq!(
+            web_url(root, "r1").as_deref(),
+            Some("https://github.com/usecady/cady")
+        );
+        assert_eq!(
+            web_url(root, "r2").as_deref(),
+            Some("https://gitlab.com/group/repo")
+        );
         Ok(())
     }
 }

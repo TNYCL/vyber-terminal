@@ -38,6 +38,7 @@ impl ProcessSnapshot {
         }
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn parse(text: &str) -> std::io::Result<Self> {
         let mut processes = Vec::new();
         for line in text.lines().filter(|line| !line.trim().is_empty()) {

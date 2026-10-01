@@ -38,7 +38,10 @@ pub enum Source {
     Unstaged,
     /// Index against HEAD.
     Staged,
-    Commit { hash: String, title: String },
+    Commit {
+        hash: String,
+        title: String,
+    },
     /// Working tree against the merge base with the default branch.
     Branch,
 }
@@ -161,12 +164,14 @@ impl Git {
         let mut input = Vec::new();
         for spec in specs {
             // A newline would split the request; such a path reads as missing.
-            input.extend(if spec.contains('\n') {
-                "vyber-unreadable-path"
-            } else {
-                spec
-            }
-            .as_bytes());
+            input.extend(
+                if spec.contains('\n') {
+                    "vyber-unreadable-path"
+                } else {
+                    spec
+                }
+                .as_bytes(),
+            );
             input.push(b'\n');
         }
         let writer = std::thread::spawn(move || stdin.write_all(&input));
@@ -337,7 +342,10 @@ pub fn git_plan(root: &Path, source: &Source) -> Result<Plan> {
         }
     }
     sort_files(&mut files);
-    let objects = files.iter().map(|f| format!("{prefix}{}", f.path)).collect();
+    let objects = files
+        .iter()
+        .map(|f| format!("{prefix}{}", f.path))
+        .collect();
     Ok(Plan {
         files,
         root: root.to_owned(),
@@ -546,7 +554,12 @@ fn human(bytes: u64) -> String {
     }
 }
 
-pub fn file_diff(path: &str, before: Blob, after: Blob, theme: Option<&HighlightTheme>) -> FileDiff {
+pub fn file_diff(
+    path: &str,
+    before: Blob,
+    after: Blob,
+    theme: Option<&HighlightTheme>,
+) -> FileDiff {
     let old = before.bytes().unwrap_or_default();
     let new = after.bytes().unwrap_or_default();
     let too_large = matches!(before, Blob::TooLarge(_))
@@ -634,7 +647,9 @@ pub fn line_spans(
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &Rope::from_str(text), None);
     for (range, style) in highlighter.styles(&(0..text.len()), theme) {
-        let mut line = starts.partition_point(|s| *s <= range.start).saturating_sub(1);
+        let mut line = starts
+            .partition_point(|s| *s <= range.start)
+            .saturating_sub(1);
         let mut from = range.start;
         while from < range.end && line < starts.len() {
             let start = starts[line];
@@ -1044,9 +1059,11 @@ mod tests {
                 ),
             ]
         );
-        assert!(read(&git_plan(&sub, &Source::Uncommitted)?)?
-            .iter()
-            .all(|f| f.0 == "extra.txt"));
+        assert!(
+            read(&git_plan(&sub, &Source::Uncommitted)?)?
+                .iter()
+                .all(|f| f.0 == "extra.txt")
+        );
         assert_eq!(commits(&sub)?.len(), 2);
         Ok(())
     }
@@ -1160,14 +1177,25 @@ mod tests {
     fn every_hunk_reverts_exactly() -> Result<()> {
         let before = b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj".to_vec();
         let after = b"a\r\nB\r\nc\r\nd\r\ne\r\nf\r\nnew\r\ng\r\nh\r\ni\r\nj\n".to_vec();
-        let diff = file_diff("x.txt", Blob::Bytes(before.clone()), Blob::Bytes(after.clone()), None);
+        let diff = file_diff(
+            "x.txt",
+            Blob::Bytes(before.clone()),
+            Blob::Bytes(after.clone()),
+            None,
+        );
         assert_eq!(diff.hunks.len(), 3);
         let first = revert_hunk(&before, &after, &diff.hunks[0])?;
-        assert_eq!(first, b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\nnew\r\ng\r\nh\r\ni\r\nj\n");
+        assert_eq!(
+            first,
+            b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\nnew\r\ng\r\nh\r\ni\r\nj\n"
+        );
         let second = revert_hunk(&before, &after, &diff.hunks[1])?;
         assert_eq!(second, b"a\r\nB\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\n");
         let third = revert_hunk(&before, &after, &diff.hunks[2])?;
-        assert_eq!(third, b"a\r\nB\r\nc\r\nd\r\ne\r\nf\r\nnew\r\ng\r\nh\r\ni\r\nj");
+        assert_eq!(
+            third,
+            b"a\r\nB\r\nc\r\nd\r\ne\r\nf\r\nnew\r\ng\r\nh\r\ni\r\nj"
+        );
         // Reverting all hunks one after another gives the original bytes.
         let mut current = after.clone();
         for index in (0..diff.hunks.len()).rev() {
@@ -1188,7 +1216,12 @@ mod tests {
     fn pure_insertions_and_deletions_at_the_edges() -> Result<()> {
         let before = b"x\ny\n".to_vec();
         let after = b"top\nx\ny\nbottom\n".to_vec();
-        let diff = file_diff("x.txt", Blob::Bytes(before.clone()), Blob::Bytes(after.clone()), None);
+        let diff = file_diff(
+            "x.txt",
+            Blob::Bytes(before.clone()),
+            Blob::Bytes(after.clone()),
+            None,
+        );
         assert_eq!(
             diff.hunks,
             vec![
@@ -1204,10 +1237,24 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(revert_hunk(&before, &after, &diff.hunks[0])?, b"x\ny\nbottom\n");
-        assert_eq!(revert_hunk(&before, &after, &diff.hunks[1])?, b"top\nx\ny\n");
-        let removed = file_diff("x.txt", Blob::Bytes(after.clone()), Blob::Bytes(before.clone()), None);
-        assert_eq!(revert_hunk(&after, &before, &removed.hunks[0])?, b"top\nx\ny\n");
+        assert_eq!(
+            revert_hunk(&before, &after, &diff.hunks[0])?,
+            b"x\ny\nbottom\n"
+        );
+        assert_eq!(
+            revert_hunk(&before, &after, &diff.hunks[1])?,
+            b"top\nx\ny\n"
+        );
+        let removed = file_diff(
+            "x.txt",
+            Blob::Bytes(after.clone()),
+            Blob::Bytes(before.clone()),
+            None,
+        );
+        assert_eq!(
+            revert_hunk(&after, &before, &removed.hunks[0])?,
+            b"top\nx\ny\n"
+        );
         Ok(())
     }
 
@@ -1229,7 +1276,10 @@ mod tests {
         ];
         assert!(restore(&stale).is_err());
         assert_eq!(fs::read_to_string(root.join("a"))?, "after-a");
-        restore(&[entry("a", "after-a", Blob::Missing), entry("b", "unexpected", bytes("x"))])?;
+        restore(&[
+            entry("a", "after-a", Blob::Missing),
+            entry("b", "unexpected", bytes("x")),
+        ])?;
         assert!(!root.join("a").exists());
         assert_eq!(fs::read_to_string(root.join("b"))?, "x");
         assert!(
@@ -1262,7 +1312,12 @@ mod tests {
         let second = "    let x = \"hi\";";
         assert!(spans[1].iter().any(|(r, _)| &second[r.clone()] == "\"hi\""));
         assert!(spans[1].iter().all(|(r, _)| r.end <= second.len()));
-        let diff = file_diff("a.rs", bytes("fn a() {}\n"), bytes("fn b() {}\n"), Some(&theme));
+        let diff = file_diff(
+            "a.rs",
+            bytes("fn a() {}\n"),
+            bytes("fn b() {}\n"),
+            Some(&theme),
+        );
         assert!(diff.lines.iter().all(|l| !l.spans.is_empty()));
     }
 
@@ -1270,7 +1325,10 @@ mod tests {
     fn tabs_expand_to_four_columns_and_move_spans() {
         let mut line = DiffLine {
             text: "\tab\tc".into(),
-            spans: vec![(1..3, HighlightStyle::default()), (4..5, HighlightStyle::default())],
+            spans: vec![
+                (1..3, HighlightStyle::default()),
+                (4..5, HighlightStyle::default()),
+            ],
             ..Default::default()
         };
         expand_tabs(&mut line);

@@ -2,6 +2,7 @@
 mod app;
 mod browser;
 mod changeset;
+mod cli;
 mod closing;
 mod config;
 mod git;
@@ -16,7 +17,7 @@ mod processes;
 mod project;
 mod project_dialog;
 mod pty;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 mod shell;
 mod tab_state;
 mod tasks;
@@ -25,6 +26,24 @@ mod theme;
 mod workspace;
 use gpui::*;
 fn main() {
+    let directory = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(cli::Command::Version) => {
+            println!("vyber {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Ok(cli::Command::Help) => {
+            println!(
+                "Vyber {}\n\nUsage: vyber [DIRECTORY]\n       vyber --version\n       vyber --help\n\nUse -- before a directory whose name starts with a dash.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return;
+        }
+        Ok(cli::Command::Launch(directory)) => directory,
+        Err(error) => {
+            eprintln!("vyber: {error}\nTry 'vyber --help'.");
+            std::process::exit(2);
+        }
+    };
     platform::login_environment();
     let logs = workspace::data_dir();
     let _ = std::fs::create_dir_all(&logs);
@@ -36,7 +55,7 @@ fn main() {
         env_logger::init();
     }
     std::panic::set_hook(Box::new(|info| log::error!("{info}")));
-    let root = platform::startup_root(std::env::args_os().nth(1).map(std::path::PathBuf::from));
+    let root = platform::startup_root(directory);
     let application = gpui_kit::application()
         .with_assets(icons::Assets)
         .with_quit_mode(if cfg!(target_os = "macos") {

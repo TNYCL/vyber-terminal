@@ -39,14 +39,22 @@ pub const WARNING_BG: u32 = 0x2a2213;
 pub const WARNING: u32 = 0xe8ca8b;
 
 pub fn mono_font() -> &'static str {
-    if cfg!(windows) { "Consolas" } else { "Menlo" }
+    if cfg!(windows) {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    }
 }
 
 pub fn ui_font() -> &'static str {
     if cfg!(windows) {
         "Segoe UI"
-    } else {
+    } else if cfg!(target_os = "macos") {
         ".SystemUIFont"
+    } else {
+        "Noto Sans"
     }
 }
 
@@ -158,9 +166,7 @@ pub fn icon_button(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(HOVER)))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-        .child(
-            icon(ui(name), TEXT_2, 15.).group_hover(group, |s| s.text_color(rgb(TEXT))),
-        )
+        .child(icon(ui(name), TEXT_2, 15.).group_hover(group, |s| s.text_color(rgb(TEXT))))
 }
 
 /// A borderless text row used in menus.

@@ -544,7 +544,7 @@ impl Vyber {
     /// pressed last among those that run the agent or whose typed line
     /// matches the prompt, a match first.
     fn turn_terminal(&mut self, review: &TaskReview, cx: &App) -> Option<usize> {
-        if review.session.is_empty() || !review.from_terminal() {
+        if review.session.is_empty() || !review.is_from_terminal() {
             return None;
         }
         if let Some(id) = self.sessions.get(&review.session)
@@ -639,10 +639,11 @@ impl Vyber {
                 });
                 (msg, t.open_path.take())
             });
-            if let Some(message) = message {
-                if !window.is_window_active() && cx.global::<Config>().notifications {
-                    self.notifications.show(*id, message);
-                }
+            if let Some(message) = message
+                && !window.is_window_active()
+                && cx.global::<Config>().notifications
+            {
+                self.notifications.show(*id, message);
             }
             if let Some((path, line)) = path {
                 slot.browser
@@ -759,10 +760,10 @@ impl Vyber {
             if let Some(dir) = self.state_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes) {
-                if let Err(e) = std::fs::write(&self.state_path, bytes) {
-                    log::warn!("Save workspace: {e}");
-                }
+            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes)
+                && let Err(e) = std::fs::write(&self.state_path, bytes)
+            {
+                log::warn!("Save workspace: {e}");
             }
         }
     }
@@ -879,20 +880,20 @@ impl Vyber {
         let Some(id) = self.keyboard_pane(window, cx) else {
             return;
         };
-        if let Some(slot) = self.slots.get(&id) {
-            if slot.browser.read(cx).visible {
-                let handled = slot
-                    .browser
-                    .update(cx, |browser, cx| browser.close_active_document(window, cx));
-                if !handled {
-                    slot.browser
-                        .update(cx, |browser, cx| browser.close_panel(cx));
-                    window.focus(&slot.terminal.read(cx).focus.clone(), cx);
-                }
-                self.persist(cx);
-                cx.notify();
-                return;
+        if let Some(slot) = self.slots.get(&id)
+            && slot.browser.read(cx).visible
+        {
+            let handled = slot
+                .browser
+                .update(cx, |browser, cx| browser.close_active_document(window, cx));
+            if !handled {
+                slot.browser
+                    .update(cx, |browser, cx| browser.close_panel(cx));
+                window.focus(&slot.terminal.read(cx).focus.clone(), cx);
             }
+            self.persist(cx);
+            cx.notify();
+            return;
         }
         // Split grubundaki komşular aynı Cmd+W isteğine dahil edilmez.
         self.close_pane(id, window, cx);
@@ -926,10 +927,8 @@ impl Vyber {
         }
         self.tab_state.sync(&self.tabs, None);
         self.normalize_selection();
-        if active_removed {
-            if let Some(group) = self.tab_state.groups.get(self.tab) {
-                self.active = group.active;
-            }
+        if active_removed && let Some(group) = self.tab_state.groups.get(self.tab) {
+            self.active = group.active;
         }
         self.tab_state.focus(self.active);
         self.tab_scroll.scroll_to_item(self.tab);
@@ -1377,10 +1376,10 @@ impl Vyber {
                 cx.notify();
             }))
             .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                if let Some(DropHint::Tab { id: target, after }) = this.drop_hint {
-                    if target == id {
-                        this.drop_on_tab(drag, Some(id), after, window, cx);
-                    }
+                if let Some(DropHint::Tab { id: target, after }) = this.drop_hint
+                    && target == id
+                {
+                    this.drop_on_tab(drag, Some(id), after, window, cx);
                 }
             }))
             .when(cx.has_active_drag(), |s| {
@@ -1707,20 +1706,32 @@ impl Render for Vyber {
                 )),
             )
             .child(
-                chip("menu-right", "Split right     Ctrl+D / ⌘D").on_click(cx.listener(
-                    |this, _, w, cx| {
-                        this.show_shortcuts = false;
-                        this.split_right(&SplitRight, w, cx);
+                chip(
+                    "menu-right",
+                    if cfg!(target_os = "linux") {
+                        "Split right     Ctrl+Shift+D"
+                    } else {
+                        "Split right     Ctrl+D / ⌘D"
                     },
-                )),
+                )
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.show_shortcuts = false;
+                    this.split_right(&SplitRight, w, cx);
+                })),
             )
             .child(
-                chip("menu-down", "Split down     Ctrl+Shift+D / ⌘⇧D").on_click(cx.listener(
-                    |this, _, w, cx| {
-                        this.show_shortcuts = false;
-                        this.split_down(&SplitDown, w, cx);
+                chip(
+                    "menu-down",
+                    if cfg!(target_os = "linux") {
+                        "Split down     Ctrl+Shift+E"
+                    } else {
+                        "Split down     Ctrl+Shift+D / ⌘⇧D"
                     },
-                )),
+                )
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.show_shortcuts = false;
+                    this.split_down(&SplitDown, w, cx);
+                })),
             )
             .child(
                 chip("menu-open", "Open folder     Ctrl+Shift+O / ⌘O").on_click(cx.listener(
@@ -1795,11 +1806,7 @@ impl Render for Vyber {
             .flex_col()
             .bg(rgb(0x000000))
             .text_color(rgb(0xdddddd))
-            .font_family(if cfg!(windows) {
-                "Segoe UI"
-            } else {
-                ".SystemUIFont"
-            })
+            .font_family(crate::theme::ui_font())
             .text_size(px(12.))
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -2047,7 +2054,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelTabDrag, None),
         KeyBinding::new(&format!("{prefix}-t"), NewTerminal, None),
         KeyBinding::new(
-            if cfg!(windows) { "ctrl-d" } else { "cmd-d" },
+            if cfg!(target_os = "macos") {
+                "cmd-d"
+            } else if cfg!(windows) {
+                "ctrl-d"
+            } else {
+                "ctrl-shift-d"
+            },
             SplitRight,
             Some("Terminal && !Input"),
         ),
@@ -2081,20 +2094,30 @@ pub fn bind_keys(cx: &mut App) {
             Some("Input"),
         ),
         KeyBinding::new(
-            if cfg!(windows) {
-                "ctrl-shift-h"
-            } else {
+            if cfg!(target_os = "macos") {
                 "cmd-shift-h"
+            } else {
+                "ctrl-shift-h"
             },
             ShowShortcuts,
             None,
         ),
-        KeyBinding::new(if cfg!(windows) { "alt-f4" } else { "cmd-q" }, Quit, None),
         KeyBinding::new(
-            if cfg!(windows) {
-                "ctrl-shift-,"
+            if cfg!(target_os = "macos") {
+                "cmd-q"
+            } else if cfg!(windows) {
+                "alt-f4"
             } else {
+                "ctrl-shift-q"
+            },
+            Quit,
+            None,
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
                 "cmd-,"
+            } else {
+                "ctrl-shift-,"
             },
             Settings,
             None,

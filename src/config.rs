@@ -39,7 +39,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shell: None,
-            font_family: if cfg!(windows) { "Consolas" } else { "Menlo" }.into(),
+            font_family: crate::theme::mono_font().into(),
             font_size: 14.,
             files_font_size: PANEL_FONT_SIZE,
             git_font_size: PANEL_FONT_SIZE,

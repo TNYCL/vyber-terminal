@@ -7,6 +7,8 @@
 /Vyber.lnk
 /.vyber-build.jsonl
 /.vyber-metadata.json
+__pycache__/
+*.pyc
 
 # Internal working notes, kept out of the public repository
 /PLAN.md

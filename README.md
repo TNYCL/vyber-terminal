@@ -14,8 +14,13 @@
   <img src="assets/screenshot.png" alt="Vyber with a split terminal and the file panel open" width="900">
 </p>
 
-> **Status:** early (0.1). Developed and tested on Windows 11. The macOS build script exists but the
-> macOS build has not been verified yet.
+> **Status:** alpha. GitHub CI builds Windows x64, macOS Apple Silicon/Intel and Linux x64/ARM64.
+> Desktop acceptance is separate from CI: Windows 11 is the development platform; macOS/Linux
+> desktop and GPU compatibility are being verified. Preview packages are unsigned on Windows
+> and ad-hoc-signed (not notarized) on macOS.
+
+See [Releasing Vyber](docs/RELEASING.md) for the five workflows/configuration files, packaging,
+download verification and the manual publication gate. Releases are prepared as drafts.
 
 ## Features
 
@@ -145,31 +150,31 @@ Run the test suite with `cargo test --locked`.
 
 ## Keyboard shortcuts
 
-| Action | Windows | macOS |
-| --- | --- | --- |
-| New tab | Ctrl+T / Ctrl+Shift+T | Cmd+T / Cmd+N |
-| Split right (terminal focused) | Ctrl+D | Cmd+D |
-| Split down | Ctrl+Shift+D / Ctrl+Shift+E | Cmd+Shift+D |
-| Close active preview file, then panel, then focused terminal | Ctrl+Shift+W | Cmd+W |
-| Quit (confirm running terminal processes) | Alt+F4 | Cmd+Q |
-| Next terminal | Ctrl+Shift+] | Cmd+] |
-| Switch tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
-| Go to tab 1–8 / last tab | Ctrl+1…8 / Ctrl+9 | Cmd+1…8 / Cmd+9 |
-| Maximize terminal | Ctrl+Shift+Enter | Cmd+Enter |
-| File panel | Ctrl+Shift+B | Cmd+B |
-| Source control | Ctrl+Shift+G | Cmd+Shift+G |
-| Find file | Ctrl+Shift+P | Cmd+P |
-| Search terminal history | Ctrl+Shift+F | Cmd+F |
-| Open folder | Ctrl+Shift+O | Cmd+O |
-| Manual checkpoint | Ctrl+Shift+K | Cmd+Shift+K |
-| Save in editor | Ctrl+S | Cmd+S |
-| Close the file in the panel (the panel when no file is open) | Ctrl+W | Cmd+W |
-| Next / previous panel tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp | Ctrl+Tab / Ctrl+Shift+Tab |
-| Find in the Review diff | Ctrl+F | Cmd+F |
-| Copy / paste in terminal | Ctrl+Shift+C / V | Cmd+C / V |
-| Settings file | Ctrl+Shift+, | Cmd+, |
-| Shortcut help | Ctrl+Shift+H | Cmd+Shift+H |
-| Font size of the focused terminal or panel: up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 |
+| Action | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| New tab | Ctrl+T / Ctrl+Shift+T | Cmd+T / Cmd+N | Ctrl+Shift+T |
+| Split right (terminal focused) | Ctrl+D | Cmd+D | Ctrl+Shift+D |
+| Split down | Ctrl+Shift+D / Ctrl+Shift+E | Cmd+Shift+D | Ctrl+Shift+E |
+| Close active preview file, then panel, then focused terminal | Ctrl+Shift+W | Cmd+W | Ctrl+Shift+W |
+| Quit (confirm running terminal processes) | Alt+F4 | Cmd+Q | Ctrl+Shift+Q |
+| Next terminal | Ctrl+Shift+] | Cmd+] | Ctrl+Shift+] |
+| Switch tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
+| Go to tab 1–8 / last tab | Ctrl+1…8 / Ctrl+9 | Cmd+1…8 / Cmd+9 | Ctrl+1…8 / Ctrl+9 |
+| Maximize terminal | Ctrl+Shift+Enter | Cmd+Enter | Ctrl+Shift+Enter |
+| File panel | Ctrl+Shift+B | Cmd+B | Ctrl+Shift+B |
+| Source control | Ctrl+Shift+G | Cmd+Shift+G | Ctrl+Shift+G |
+| Find file | Ctrl+Shift+P | Cmd+P | Ctrl+Shift+P |
+| Search terminal history | Ctrl+Shift+F | Cmd+F | Ctrl+Shift+F |
+| Open folder | Ctrl+Shift+O | Cmd+O | Ctrl+Shift+O |
+| Manual checkpoint | Ctrl+Shift+K | Cmd+Shift+K | Ctrl+Shift+K |
+| Save in editor | Ctrl+S | Cmd+S | Ctrl+S |
+| Close the file in the panel (the panel when no file is open) | Ctrl+W | Cmd+W | Ctrl+W |
+| Next / previous panel tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp |
+| Find in the Review diff | Ctrl+F | Cmd+F | Ctrl+F |
+| Copy / paste in terminal | Ctrl+Shift+C / V | Cmd+C / V | Ctrl+Shift+C / V |
+| Settings file | Ctrl+Shift+, | Cmd+, | Ctrl+Shift+, |
+| Shortcut help | Ctrl+Shift+H | Cmd+Shift+H | Ctrl+Shift+H |
+| Font size of the focused terminal or panel: up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 | Ctrl++ / Ctrl+- / Ctrl+0 |
 
 Cmd+W closes the displayed file first, keeping the preview panel open. With no file displayed it
 closes the preview or Git panel; with the panel closed it closes only the focused terminal,
@@ -192,7 +197,7 @@ In the filter box, Enter opens the best match and Shift+Enter searches file cont
 ## Configuration and data
 
 Vyber stores its data in `%LOCALAPPDATA%\Vyber` on Windows and in the user application data
-directory on macOS.
+directory on macOS/Linux (`$XDG_DATA_HOME/Vyber` or `~/.local/share/Vyber` on Linux).
 
 | File | Contents |
 | --- | --- |

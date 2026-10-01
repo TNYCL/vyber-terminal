@@ -128,6 +128,10 @@ pub fn quit_application(cx: &mut App) {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Used by macOS interaction tests.")
+)]
 pub fn workspace_content(cx: &App) -> Option<Entity<Vyber>> {
     cx.global::<ApplicationWindows>()
         .workspace
@@ -137,6 +141,10 @@ pub fn workspace_content(cx: &App) -> Option<Entity<Vyber>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Used by macOS interaction tests.")
+)]
 pub fn quit_requested(cx: &App) -> bool {
     cx.global::<ApplicationWindows>().quit_requested
 }

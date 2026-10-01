@@ -1,0 +1,40 @@
+name: Dependency audit
+
+on:
+  schedule:
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dependencies:
+    name: Advisories, licenses and sources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: '1.98.1'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install pinned dependency checker
+        run: python scripts/install-ci-tool.py cargo-deny "$RUNNER_TEMP/tools"
+      - name: Audit locked dependencies
+        run: |
+          "$RUNNER_TEMP/tools/cargo-deny" --locked check advisories licenses sources

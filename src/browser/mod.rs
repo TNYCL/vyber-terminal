@@ -545,6 +545,10 @@ impl Browser {
             .any(|d| d.editor.read(cx).focus_handle(cx).is_focused(window))
     }
     #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "Used by macOS interaction tests.")
+    )]
     pub(crate) fn test_document(
         &mut self,
         path: PathBuf,
@@ -782,22 +786,23 @@ impl Browser {
                 }
                 Message::Changed(path, bytes) => {
                     self.review_worktree_changed(false);
-                    if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
-                        if doc.kind == Kind::Text && bytes.as_ref() != Some(&doc.baseline) {
-                            if doc.dirty || bytes.is_none() {
-                                doc.conflict = true;
-                            } else if let Some(bytes) = bytes {
-                                if let Ok(text) = String::from_utf8(bytes.clone()) {
-                                    let text = text.trim_start_matches('\u{feff}').to_owned();
-                                    doc.baseline = bytes;
-                                    doc.text = text.clone().into();
-                                    doc.editor.update(cx, |ed, cx| {
-                                        let offset = ed.scroll_offset();
-                                        ed.set_value(text, window, cx);
-                                        ed.set_scroll_offset(offset, cx);
-                                    });
-                                }
-                            }
+                    if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path)
+                        && doc.kind == Kind::Text
+                        && bytes.as_ref() != Some(&doc.baseline)
+                    {
+                        if doc.dirty || bytes.is_none() {
+                            doc.conflict = true;
+                        } else if let Some(bytes) = bytes
+                            && let Ok(text) = String::from_utf8(bytes.clone())
+                        {
+                            let text = text.trim_start_matches('\u{feff}').to_owned();
+                            doc.baseline = bytes;
+                            doc.text = text.clone().into();
+                            doc.editor.update(cx, |ed, cx| {
+                                let offset = ed.scroll_offset();
+                                ed.set_value(text, window, cx);
+                                ed.set_scroll_offset(offset, cx);
+                            });
                         }
                     }
                     follow_path = Some(path);
@@ -875,12 +880,10 @@ impl Browser {
                 .docs
                 .iter()
                 .any(|d| d.dirty || d.editor.read(cx).focus_handle(cx).is_focused(window))
+            && let Some(path) = follow_path
+            && path.is_file()
         {
-            if let Some(path) = follow_path {
-                if path.is_file() {
-                    self.open(path, false, cx);
-                }
-            }
+            self.open(path, false, cx);
         }
         if !self.notice.is_empty() && self.notice_at.elapsed() > NOTICE_TIME {
             self.notice.clear();
@@ -993,20 +996,20 @@ impl Browser {
             self.docs.push(doc);
             self.active_doc = self.docs.len() - 1;
         }
-        if let Some(active) = &self.restore_active {
-            if let Some(i) = self.docs.iter().position(|d| &d.path == active) {
-                self.active_doc = i;
-            }
+        if let Some(active) = &self.restore_active
+            && let Some(i) = self.docs.iter().position(|d| &d.path == active)
+        {
+            self.active_doc = i;
         }
-        if let Some((path, line)) = &self.pending_line {
-            if let Some(doc) = self.docs.iter_mut().find(|d| &d.path == path) {
-                doc.preview = false;
-                let position =
-                    gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0);
-                doc.editor
-                    .update(cx, |ed, cx| ed.set_cursor_position(position, window, cx));
-                self.pending_line = None;
-            }
+        if let Some((path, line)) = &self.pending_line
+            && let Some(doc) = self.docs.iter_mut().find(|d| &d.path == path)
+        {
+            doc.preview = false;
+            let position =
+                gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0);
+            doc.editor
+                .update(cx, |ed, cx| ed.set_cursor_position(position, window, cx));
+            self.pending_line = None;
         }
         self.tab_scroll.scroll_to_item(self.active_doc);
     }
@@ -1079,18 +1082,17 @@ impl Browser {
         cx.notify();
     }
     fn reload_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(doc) = self.docs.get_mut(self.active_doc) {
-            if let Ok(bytes) = fs::read(&doc.path) {
-                if let Ok(text) = String::from_utf8(bytes.clone()) {
-                    let text = text.trim_start_matches('\u{feff}').to_owned();
-                    doc.baseline = bytes;
-                    doc.text = text.clone().into();
-                    doc.dirty = false;
-                    doc.conflict = false;
-                    doc.editor
-                        .update(cx, |ed, cx| ed.set_value(text, window, cx));
-                }
-            }
+        if let Some(doc) = self.docs.get_mut(self.active_doc)
+            && let Ok(bytes) = fs::read(&doc.path)
+            && let Ok(text) = String::from_utf8(bytes.clone())
+        {
+            let text = text.trim_start_matches('\u{feff}').to_owned();
+            doc.baseline = bytes;
+            doc.text = text.clone().into();
+            doc.dirty = false;
+            doc.conflict = false;
+            doc.editor
+                .update(cx, |ed, cx| ed.set_value(text, window, cx));
         }
         cx.notify();
     }
@@ -1136,24 +1138,24 @@ impl Browser {
                     .lines()
                     .map_while(Result::ok)
                 {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if v["type"] == "match" {
-                            let data = &v["data"];
-                            if let (Some(path), Some(line)) =
-                                (data["path"]["text"].as_str(), data["line_number"].as_u64())
-                            {
-                                results.push((
-                                    root.join(path.trim_start_matches("./")),
-                                    line as usize,
-                                    data["lines"]["text"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .chars()
-                                        .take(160)
-                                        .collect(),
-                                ));
-                            }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                        && v["type"] == "match"
+                    {
+                        let data = &v["data"];
+                        if let (Some(path), Some(line)) =
+                            (data["path"]["text"].as_str(), data["line_number"].as_u64())
+                        {
+                            results.push((
+                                root.join(path.trim_start_matches("./")),
+                                line as usize,
+                                data["lines"]["text"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .chars()
+                                    .take(160)
+                                    .collect(),
+                            ));
                         }
                     }
                     if results.len() >= 200 {

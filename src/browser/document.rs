@@ -122,9 +122,8 @@ impl Browser {
                     .children(tabs),
             )
             .child(
-                icon_button("new-doc", "plus", "Find file  (Ctrl+Shift+P)").on_click(
-                    cx.listener(|this, _, window, cx| this.focus_filter(window, cx)),
-                ),
+                icon_button("new-doc", "plus", "Find file  (Ctrl+Shift+P)")
+                    .on_click(cx.listener(|this, _, window, cx| this.focus_filter(window, cx))),
             )
             .child(div().flex_1().min_w(rpx(8.)))
             .child(self.dock_button(cx))
@@ -143,8 +142,16 @@ impl Browser {
             .child(
                 icon_button(
                     "panel-width",
-                    if self.wide { "minimize-2" } else { "maximize-2" },
-                    if self.wide { "Restore panel" } else { "Expand panel" },
+                    if self.wide {
+                        "minimize-2"
+                    } else {
+                        "maximize-2"
+                    },
+                    if self.wide {
+                        "Restore panel"
+                    } else {
+                        "Expand panel"
+                    },
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.wide = !this.wide;
@@ -247,21 +254,15 @@ impl Browser {
                                     .selectable(true),
                             ),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_3()
-                            .right_4()
-                            .child(icon_button("copy-markdown", "copy", "Copy Markdown").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy.to_string(),
-                                    ));
-                                    this.say("Markdown copied");
-                                    cx.notify();
-                                }),
-                            )),
-                    )
+                    .child(div().absolute().top_3().right_4().child(
+                        icon_button("copy-markdown", "copy", "Copy Markdown").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()));
+                                this.say("Markdown copied");
+                                cx.notify();
+                            }),
+                        ),
+                    ))
                     .into_any_element()
             }
             Kind::Text => div()
@@ -310,7 +311,10 @@ impl Browser {
             })
             .child(div().flex_1().min_h_0().overflow_hidden().child(body))
             .when(self.menu == Some(Menu::Open), |s| {
-                s.child(menu_in("open-menu-in", self.open_menu(path.clone(), cx).into_any_element()))
+                s.child(menu_in(
+                    "open-menu-in",
+                    self.open_menu(path.clone(), cx).into_any_element(),
+                ))
             })
             .into_any_element()
     }
@@ -400,12 +404,14 @@ impl Browser {
                     .children(crumbs),
             )
             .when(*kind == Kind::Image, |s| {
-                s.child(icon_button("zoom-out", "zoom-out", "Zoom out").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.zoom = (this.zoom / 1.25).max(0.25);
-                        cx.notify();
-                    },
-                )))
+                s.child(
+                    icon_button("zoom-out", "zoom-out", "Zoom out").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.zoom = (this.zoom / 1.25).max(0.25);
+                            cx.notify();
+                        },
+                    )),
+                )
                 .child(
                     div()
                         .w(rpx(40.))
@@ -414,18 +420,22 @@ impl Browser {
                         .text_color(rgb(MUTED))
                         .child(format!("{:.0}%", self.zoom * 100.)),
                 )
-                .child(icon_button("zoom-in", "zoom-in", "Zoom in").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.zoom = (this.zoom * 1.25).min(8.);
-                        cx.notify();
-                    },
-                )))
-                .child(icon_button("zoom-fit", "scan", "Fit to panel").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.zoom = 1.;
-                        cx.notify();
-                    },
-                )))
+                .child(
+                    icon_button("zoom-in", "zoom-in", "Zoom in").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.zoom = (this.zoom * 1.25).min(8.);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    icon_button("zoom-fit", "scan", "Fit to panel").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.zoom = 1.;
+                            cx.notify();
+                        },
+                    )),
+                )
             })
             .when(markdown, |s| {
                 s.child(
@@ -449,13 +459,15 @@ impl Browser {
                         .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                 )
             })
-            .child(icon_button("copy-path", "copy", "Copy relative path").on_click(
-                cx.listener(move |this, _, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
-                    this.say(format!("Copied {copy_path}"));
-                    cx.notify();
-                }),
-            ))
+            .child(
+                icon_button("copy-path", "copy", "Copy relative path").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                        this.say(format!("Copied {copy_path}"));
+                        cx.notify();
+                    },
+                )),
+            )
             .child(
                 div()
                     .id("open-with")
@@ -486,11 +498,18 @@ impl Browser {
     fn open_menu(&self, path: std::path::PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
         let reveal_label = if cfg!(target_os = "macos") {
             "Reveal in Finder"
-        } else {
+        } else if cfg!(windows) {
             "Reveal in File Explorer"
+        } else {
+            "Open containing folder"
         };
-        let items: [(&str, &str, fn(&std::path::Path) -> std::io::Result<()>); 3] = [
-            ("app-window", "Open with default app", platform::open_default),
+        type OpenAction = fn(&std::path::Path) -> std::io::Result<()>;
+        let items: [(&str, &str, OpenAction); 3] = [
+            (
+                "app-window",
+                "Open with default app",
+                platform::open_default,
+            ),
             ("folder-search", reveal_label, platform::reveal),
             ("code", "Open in VS Code", platform::open_in_code),
         ];
@@ -509,27 +528,32 @@ impl Browser {
             .border_1()
             .border_color(rgb(BORDER))
             .shadow_xl()
-            .children(items.into_iter().enumerate().map(|(i, (name, label, run))| {
-                let path = path.clone();
-                div()
-                    .id(("open-option", i))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(rpx(30.))
-                    .px_2()
-                    .rounded_md()
-                    .text_size(rpx(12.5))
-                    .text_color(rgb(TEXT))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(HOVER)))
-                    .child(icon(ui(name), TEXT_2, 14.))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.launch(run, path.clone());
-                        cx.notify();
-                    }))
-            }))
+            .children(
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (name, label, run))| {
+                        let path = path.clone();
+                        div()
+                            .id(("open-option", i))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(rpx(30.))
+                            .px_2()
+                            .rounded_md()
+                            .text_size(rpx(12.5))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child(icon(ui(name), TEXT_2, 14.))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.launch(run, path.clone());
+                                cx.notify();
+                            }))
+                    }),
+            )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.dismiss_menu();
                 cx.notify();
@@ -578,22 +602,30 @@ impl Browser {
                     .flex()
                     .gap_2()
                     .child(
-                        text_button("unsupported-open", Some("app-window"), "Open with default app")
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.launch(platform::open_default, open.clone());
-                                cx.notify();
-                            })),
+                        text_button(
+                            "unsupported-open",
+                            Some("app-window"),
+                            "Open with default app",
+                        )
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.launch(platform::open_default, open.clone());
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        text_button("unsupported-reveal", Some("folder-search"), "Show in folder")
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.launch(platform::reveal, reveal.clone());
-                                cx.notify();
-                            })),
+                        text_button(
+                            "unsupported-reveal",
+                            Some("folder-search"),
+                            "Show in folder",
+                        )
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.launch(platform::reveal, reveal.clone());
+                            cx.notify();
+                        })),
                     ),
             )
             .into_any_element()
@@ -626,12 +658,7 @@ fn tab(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         })
 }
 
-pub(super) fn empty_state(
-    name: &str,
-    title: &str,
-    detail: &str,
-    hint: Option<&str>,
-) -> AnyElement {
+pub(super) fn empty_state(name: &str, title: &str, detail: &str, hint: Option<&str>) -> AnyElement {
     div()
         .size_full()
         .flex()

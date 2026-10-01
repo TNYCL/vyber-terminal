@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Vyber
+Comment=Native terminal workspace with files and Git review
+Exec=vyber
+Icon=dev.vyber.terminal
+Terminal=false
+Categories=System;TerminalEmulator;Development;
+StartupNotify=true
+StartupWMClass=Vyber

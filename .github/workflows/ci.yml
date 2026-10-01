@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Validated commit to build
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  quality:
+    name: Format and workflow checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt, clippy
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: cargo fmt --all -- --check
+      - run: python -m unittest discover -s scripts/tests -v
+      - name: Validate workflows
+        run: |
+          python scripts/install-ci-tool.py actionlint "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/actionlint" -shellcheck= -pyflakes=
+      - name: Check shell scripts
+        run: bash -n scripts/package-macos.sh scripts/package-linux.sh scripts/install-linux-deps.sh scripts/build-macos.sh
+
+  audit:
+    name: Dependency audit
+    uses: ./.github/workflows/security.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
+  native:
+    name: Native (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: '1.98.1'
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - if: runner.os == 'Linux'
+        name: Install Linux build and test dependencies
+        run: bash scripts/install-linux-deps.sh
+      - name: Restore native build cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: native-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          restore-keys: native-${{ runner.os }}-${{ matrix.target }}-
+      - name: Check all targets and lint
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Native tests
+        env:
+          VYBER_DATA_DIR: ${{ runner.temp }}/vyber-test-data
+        run: cargo test --locked --bin vyber --target ${{ matrix.target }} -- --test-threads=1
+      - name: Build optimized binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - if: runner.os == 'Windows'
+        name: Package Windows
+        run: ./scripts/package-windows.ps1 -Target '${{ matrix.target }}' -SkipBuild
+      - if: runner.os == 'macOS'
+        name: Package macOS
+        run: bash scripts/package-macos.sh '${{ matrix.target }}' --skip-build
+      - if: runner.os == 'Linux'
+        name: Package Linux
+        run: bash scripts/package-linux.sh '${{ matrix.target }}' --skip-build
+      - name: Check package contents and binary version
+        run: python scripts/release.py verify-package --target ${{ matrix.target }}
+      - name: Upload packaged candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 3
+      - name: Save branch-scoped native build cache
+        if: >-
+          !cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  ready:
+    name: ready
+    if: always()
+    needs: [quality, audit, native]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ['RESULTS'])
+          failed = {name: job['result'] for name, job in results.items() if job['result'] != 'success'}
+          if failed:
+              print(f'CI failed: {failed}')
+              sys.exit(1)
+          print('All required checks passed.')
+          PY
