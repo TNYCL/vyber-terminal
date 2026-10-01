@@ -17,7 +17,10 @@ preview: Windows binaries are unsigned and macOS bundles are ad-hoc-signed, not 
 
 No long-lived PAT or signing secret is required. PR jobs have read-only access.
 Release write/OIDC/attestation permissions are restricted to the draft assembly job.
-The initial implementation uses clean hosted runners without writable dependency caches.
+Native caches are keyed by OS, target, toolchain, lockfile and build configuration. GitHub's
+branch scoping keeps PR caches separate from main and release tags; only main and same-repo
+PRs save caches. Releases can restore trusted main caches and still rerun every check.
+Keep the included cache capacity at its default; eviction or a cache miss only costs build time.
 
 ## Cut a version
 

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -58,6 +59,28 @@ def binary_path(target):
 def digest(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+def verify_binary_arch(path, target):
+    platform, architecture, _ = TARGETS[target]
+    with Path(path).open("rb") as stream:
+        header = stream.read(64)
+        if len(header) < 64:
+            raise ValueError("Truncated executable")
+        if platform == "windows":
+            if header[:2] != b"MZ":
+                raise ValueError("Expected a Windows PE executable")
+            stream.seek(struct.unpack_from("<I", header, 60)[0])
+            pe = stream.read(6)
+            if len(pe) != 6 or pe[:4] != b"PE\0\0" or struct.unpack_from("<H", pe, 4)[0] != 0x8664:
+                raise ValueError("Expected a Windows x64 executable")
+        elif platform == "linux":
+            expected = 62 if architecture == "x86_64" else 183
+            if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != expected:
+                raise ValueError(f"Expected a Linux {architecture} ELF executable")
+        else:
+            expected = 0x01000007 if architecture == "x86_64" else 0x0100000C
+            if header[:4] != b"\xcf\xfa\xed\xfe" or struct.unpack_from("<I", header, 4)[0] != expected:
+                raise ValueError(f"Expected a macOS {architecture} Mach-O executable")
 
 def stage(target, directory):
     directory = Path(directory).resolve()
@@ -131,6 +154,7 @@ def installation(platform):
     return common + "Run ./bin/vyber, or install bin/vyber to ~/.local/bin, share/applications/dev.vyber.terminal.desktop to ~/.local/share/applications, and the icon under ~/.local/share/icons/hicolor/256x256/apps. Requires a desktop session, a compatible GPU/driver, XDG utilities, fontconfig, DejaVu Sans Mono and Noto fonts. Desktop notifications require a session D-Bus notification service. Start from a terminal to diagnose missing runtime libraries.\n"
 
 def record(target):
+    verify_binary_arch(binary_path(target), target)
     path = release_directory() / asset_name(target)
     if not path.is_file() or path.stat().st_size == 0:
         raise ValueError(f"Missing package: {path.name}")
@@ -152,6 +176,8 @@ def verify_package(target):
                 raise ValueError("Incomplete Windows ZIP")
             if any(name.lower().endswith(".lnk") for name in archive.namelist()):
                 raise ValueError("Local shortcuts must not be shipped")
+            if hashlib.sha256(archive.read("Vyber.exe")).hexdigest() != digest(binary):
+                raise ValueError("ZIP contains a different executable")
     elif platform == "linux":
         with tarfile.open(path, "r:gz") as archive:
             entries = {Path(name).name for name in archive.getnames()}
@@ -160,8 +186,24 @@ def verify_package(target):
             executable = next(entry for entry in archive if entry.name.endswith("/bin/vyber"))
             if not executable.mode & 0o111:
                 raise ValueError("Linux binary lost executable permissions")
+            if hashlib.sha256(archive.extractfile(executable).read()).hexdigest() != digest(binary):
+                raise ValueError("Linux archive contains a different executable")
     else:
         run("hdiutil", "verify", str(path))
+        with tempfile.TemporaryDirectory(prefix="vyber-dmg-check-") as mount:
+            run("hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, str(path))
+            try:
+                app = Path(mount) / "Vyber.app"
+                resources = app / "Contents" / "Resources"
+                if not all((resources / name).is_file() for name in required):
+                    raise ValueError("Incomplete macOS app resources")
+                packaged_binary = app / "Contents" / "MacOS" / "vyber"
+                verify_binary_arch(packaged_binary, target)
+                if run(str(packaged_binary), "--version") != f"vyber {version()}":
+                    raise ValueError("DMG contains a different executable version")
+                run("codesign", "--verify", "--deep", "--strict", str(app))
+            finally:
+                run("hdiutil", "detach", mount)
     data = json.loads((path.parent / (path.name + ".metadata.json")).read_text(encoding="utf-8"))
     if data["sha256"] != digest(path) or data["target"] != target or data["version"] != version():
         raise ValueError("Package metadata mismatch")
@@ -254,6 +296,11 @@ def draft(tag, sha):
     release = get_release(tag)
     if release and (not release["draft"] or release["target_commitish"] != sha):
         raise ValueError("Refusing to overwrite a published or different-source release")
+    generated = json.loads(run("gh", "api", "--method", "POST", f"repos/{REPO}/releases/generate-notes", "-f", f"tag_name={tag}", "-f", f"target_commitish={sha}"))
+    notes_path = ROOT / "dist" / "release-notes.md"
+    if generated.get("body"):
+        with notes_path.open("a", encoding="utf-8") as notes:
+            notes.write("\n## Changes\n\n" + generated["body"] + "\n")
     if not release:
         args = ["gh", "release", "create", tag, "--repo", REPO, "--verify-tag", "--target", sha, "--draft", "--title", f"Vyber {tag[1:]}", "--notes-file", str(ROOT / "dist" / "release-notes.md")]
         if "-" in tag.split("+", 1)[0]:

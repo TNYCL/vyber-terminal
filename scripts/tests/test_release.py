@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import struct
 import unittest
 
 spec = importlib.util.spec_from_file_location("release", Path(__file__).parents[1] / "release.py")
@@ -9,6 +10,22 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class ReleaseGuards(unittest.TestCase):
+    def test_wrong_architecture_or_non_executable_is_rejected(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "vyber"
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            struct.pack_into("<H", header, 18, 62)
+            path.write_bytes(header)
+            release.verify_binary_arch(path, "x86_64-unknown-linux-gnu")
+            with self.assertRaises(ValueError):
+                release.verify_binary_arch(path, "aarch64-unknown-linux-gnu")
+            with self.assertRaises(ValueError):
+                release.verify_binary_arch(path, "x86_64-pc-windows-msvc")
+            path.write_bytes(b"truncated")
+            with self.assertRaises(ValueError):
+                release.verify_binary_arch(path, "x86_64-unknown-linux-gnu")
+
     def test_only_semver_tags_are_accepted(self):
         for tag in ("v0.1.0", "v1.2.3-alpha.1", "v1.0.0+build.7"):
             self.assertEqual(release.validate_tag(tag), tag[1:])

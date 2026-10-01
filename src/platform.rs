@@ -97,18 +97,16 @@ pub fn login_environment() {
             }
         }
     }
-    if let Ok(bytes) = reader.join() {
-        if let Some(path) = bytes
+    if let Ok(bytes) = reader.join()
+        && let Some(path) = bytes
             .split(|b| *b == 0)
             .nth(1)
             .and_then(|b| std::str::from_utf8(b).ok())
-        {
-            if !path.is_empty() {
-                // Called once before the application starts any threads.
-                unsafe {
-                    std::env::set_var("PATH", path);
-                }
-            }
+        && !path.is_empty()
+    {
+        // Called once before the application starts any threads.
+        unsafe {
+            std::env::set_var("PATH", path);
         }
     }
 }

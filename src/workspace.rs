@@ -11,12 +11,14 @@ use std::{
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let cmd = Command::new(program);
     #[cfg(windows)]
-    {
+    let cmd = {
         use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
         cmd.creation_flags(0x08000000);
-    }
+        cmd
+    };
     cmd
 }
 
