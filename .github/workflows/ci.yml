@@ -99,7 +99,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: native-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.github/workflows/ci.yml') }}
+          key: native-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
+          restore-keys: native-${{ runner.os }}-${{ matrix.target }}-
       - name: Check all targets and lint
         run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Native tests

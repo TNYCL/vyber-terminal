@@ -3,6 +3,8 @@
 The five supported build targets are Windows x64, macOS ARM64/Intel and Linux x64/ARM64.
 Native build/test success is separate from real desktop acceptance. The first release is a
 preview: Windows binaries are unsigned and macOS bundles are ad-hoc-signed, not notarized.
+Windows x64 uses a static CRT. Packaging checks the PE import table and rejects a separate
+Visual C++ runtime DLL dependency. System DLLs remain listed in `runtime-libraries.txt`.
 
 ## Workflows
 

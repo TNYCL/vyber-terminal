@@ -1706,20 +1706,32 @@ impl Render for Vyber {
                 )),
             )
             .child(
-                chip("menu-right", "Split right     Ctrl+D / ⌘D").on_click(cx.listener(
-                    |this, _, w, cx| {
-                        this.show_shortcuts = false;
-                        this.split_right(&SplitRight, w, cx);
+                chip(
+                    "menu-right",
+                    if cfg!(target_os = "linux") {
+                        "Split right     Ctrl+Shift+D"
+                    } else {
+                        "Split right     Ctrl+D / ⌘D"
                     },
-                )),
+                )
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.show_shortcuts = false;
+                    this.split_right(&SplitRight, w, cx);
+                })),
             )
             .child(
-                chip("menu-down", "Split down     Ctrl+Shift+D / ⌘⇧D").on_click(cx.listener(
-                    |this, _, w, cx| {
-                        this.show_shortcuts = false;
-                        this.split_down(&SplitDown, w, cx);
+                chip(
+                    "menu-down",
+                    if cfg!(target_os = "linux") {
+                        "Split down     Ctrl+Shift+E"
+                    } else {
+                        "Split down     Ctrl+Shift+D / ⌘⇧D"
                     },
-                )),
+                )
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.show_shortcuts = false;
+                    this.split_down(&SplitDown, w, cx);
+                })),
             )
             .child(
                 chip("menu-open", "Open folder     Ctrl+Shift+O / ⌘O").on_click(cx.listener(
@@ -2042,7 +2054,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelTabDrag, None),
         KeyBinding::new(&format!("{prefix}-t"), NewTerminal, None),
         KeyBinding::new(
-            if cfg!(windows) { "ctrl-d" } else { "cmd-d" },
+            if cfg!(target_os = "macos") {
+                "cmd-d"
+            } else if cfg!(windows) {
+                "ctrl-d"
+            } else {
+                "ctrl-shift-d"
+            },
             SplitRight,
             Some("Terminal && !Input"),
         ),
@@ -2076,20 +2094,30 @@ pub fn bind_keys(cx: &mut App) {
             Some("Input"),
         ),
         KeyBinding::new(
-            if cfg!(windows) {
-                "ctrl-shift-h"
-            } else {
+            if cfg!(target_os = "macos") {
                 "cmd-shift-h"
+            } else {
+                "ctrl-shift-h"
             },
             ShowShortcuts,
             None,
         ),
-        KeyBinding::new(if cfg!(windows) { "alt-f4" } else { "cmd-q" }, Quit, None),
         KeyBinding::new(
-            if cfg!(windows) {
-                "ctrl-shift-,"
+            if cfg!(target_os = "macos") {
+                "cmd-q"
+            } else if cfg!(windows) {
+                "alt-f4"
             } else {
+                "ctrl-shift-q"
+            },
+            Quit,
+            None,
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
                 "cmd-,"
+            } else {
+                "ctrl-shift-,"
             },
             Settings,
             None,

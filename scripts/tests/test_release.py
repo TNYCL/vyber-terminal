@@ -10,6 +10,29 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class ReleaseGuards(unittest.TestCase):
+    def test_windows_package_rejects_external_vc_runtime(self):
+        data = bytearray(1024)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 60, 128)
+        data[128:132] = b"PE\0\0"
+        struct.pack_into("<H", data, 132, 0x8664)
+        struct.pack_into("<H", data, 134, 1)
+        struct.pack_into("<H", data, 148, 240)
+        struct.pack_into("<H", data, 152, 0x20B)
+        struct.pack_into("<I", data, 272, 0x1000)
+        struct.pack_into("<IIII", data, 400, 256, 0x1000, 256, 512)
+        struct.pack_into("<I", data, 524, 0x1040)
+        data[576:589] = b"KERNEL32.dll\0"
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "vyber.exe"
+            path.write_bytes(data)
+            release.verify_binary_arch(path, "x86_64-pc-windows-msvc")
+            self.assertEqual(release.windows_imports(path), ["KERNEL32.dll"])
+            data[576:593] = b"VCRUNTIME140.dll\0"
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                release.verify_binary_arch(path, "x86_64-pc-windows-msvc")
+
     def test_wrong_architecture_or_non_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "vyber"

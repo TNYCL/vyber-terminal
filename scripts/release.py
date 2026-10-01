@@ -60,6 +60,34 @@ def digest(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
+def windows_imports(path):
+    data = Path(path).read_bytes()
+    try:
+        pe = struct.unpack_from("<I", data, 60)[0]
+        sections = struct.unpack_from("<H", data, pe + 6)[0]
+        optional = pe + 24
+        if data[:2] != b"MZ" or data[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, optional)[0] != 0x20B:
+            raise ValueError("Expected a PE64 executable")
+        section_table = optional + struct.unpack_from("<H", data, pe + 20)[0]
+        ranges = [struct.unpack_from("<IIII", data, section_table + index * 40 + 8) for index in range(sections)]
+        def offset(rva):
+            for virtual_size, virtual_address, raw_size, raw in ranges:
+                if virtual_address <= rva < virtual_address + min(virtual_size, raw_size):
+                    return raw + rva - virtual_address
+            raise ValueError("Invalid PE import address")
+        import_rva = struct.unpack_from("<I", data, optional + 120)[0]
+        if not import_rva:
+            return []
+        position = offset(import_rva)
+        libraries = []
+        while any(struct.unpack_from("<IIIII", data, position)):
+            name = offset(struct.unpack_from("<I", data, position + 12)[0])
+            libraries.append(data[name:data.index(b"\0", name)].decode("ascii"))
+            position += 20
+        return sorted(libraries, key=str.lower)
+    except (struct.error, UnicodeDecodeError, IndexError) as error:
+        raise ValueError("Invalid PE import table") from error
+
 def verify_binary_arch(path, target):
     platform, architecture, _ = TARGETS[target]
     with Path(path).open("rb") as stream:
@@ -73,6 +101,9 @@ def verify_binary_arch(path, target):
             pe = stream.read(6)
             if len(pe) != 6 or pe[:4] != b"PE\0\0" or struct.unpack_from("<H", pe, 4)[0] != 0x8664:
                 raise ValueError("Expected a Windows x64 executable")
+            runtime = [name for name in windows_imports(path) if re.match(r"(?:vcruntime|msvcp|msvcr)[0-9]", name, re.I)]
+            if runtime:
+                raise ValueError(f"Windows ZIP requires a static CRT; external runtime found: {runtime}")
         elif platform == "linux":
             expected = 62 if architecture == "x86_64" else 183
             if header[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", header, 18)[0] != expected:
@@ -144,11 +175,13 @@ def stage(target, directory):
     }
     (directory / "sbom.spdx.json").write_text(json.dumps(sbom, indent=2) + "\n", encoding="utf-8")
     (directory / "INSTALL.md").write_text(installation(TARGETS[target][0]), encoding="utf-8")
+    if TARGETS[target][0] == "windows":
+        (directory / "runtime-libraries.txt").write_text("\n".join(windows_imports(binary_path(target))) + "\n", encoding="utf-8")
 
 def installation(platform):
     common = "# Vyber\n\nGit is required for source-control features. ripgrep (rg) is optional for content search.\n\n"
     if platform == "windows":
-        return common + "Extract this ZIP and run Vyber.exe. Git Bash is preferred when installed; PowerShell is the fallback. This preview is not Authenticode-signed. SmartScreen or local policy may warn or block it.\n"
+        return common + "Extract this ZIP and run Vyber.exe on Windows 11 x64. The Visual C++ runtime is statically linked; no separate VC++ Redistributable installer is required. Git Bash is preferred when installed; PowerShell is the fallback. This preview is not Authenticode-signed. SmartScreen or local policy may warn or block it.\n"
     if platform == "macos":
         return common + "Drag Vyber.app to Applications. This preview is ad-hoc-signed and has not been Apple-notarized. Gatekeeper may block first launch. See Apple's supported Open Anyway flow in Privacy & Security after checking the release source. macOS 12 is a deployment target, not a verified minimum.\n"
     return common + "Run ./bin/vyber, or install bin/vyber to ~/.local/bin, share/applications/dev.vyber.terminal.desktop to ~/.local/share/applications, and the icon under ~/.local/share/icons/hicolor/256x256/apps. Requires a desktop session, a compatible GPU/driver, XDG utilities, fontconfig, DejaVu Sans Mono and Noto fonts. Desktop notifications require a session D-Bus notification service. Start from a terminal to diagnose missing runtime libraries.\n"
@@ -167,7 +200,7 @@ def verify_package(target):
     if output != f"vyber {version()}":
         raise ValueError(f"Binary version mismatch: {output}")
     path = release_directory() / asset_name(target)
-    required = {"INSTALL.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md", "dependency-licenses.json", "sbom.spdx.json"}
+    required = {"INSTALL.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md", "dependency-licenses.json", "sbom.spdx.json", "runtime-libraries.txt"}
     platform = TARGETS[target][0]
     if platform == "windows":
         with zipfile.ZipFile(path) as archive:
