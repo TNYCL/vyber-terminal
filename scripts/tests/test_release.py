@@ -13,6 +13,20 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class ReleaseGuards(unittest.TestCase):
+    def test_existing_draft_is_found_across_release_pages(self):
+        tag = "v0.1.0-alpha.1"
+        draft = {"tag_name": tag, "draft": True, "target_commitish": "a" * 40}
+        unrelated = {"tag_name": "v0.0.1", "draft": False}
+        with patch.object(release, "run", return_value=json.dumps([[unrelated], [draft]])):
+            self.assertEqual(release.get_release(tag), draft)
+            self.assertIsNone(release.get_release("v9.9.9"))
+        published = {**draft, "draft": False}
+        with patch.object(release, "run", return_value=json.dumps([[published]])):
+            self.assertEqual(release.get_release(tag), published)
+        with patch.object(release, "run", return_value=json.dumps([[draft, draft]])):
+            with self.assertRaises(ValueError):
+                release.get_release(tag)
+
     def test_zip_preserves_old_license_and_hidden_files(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

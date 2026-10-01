@@ -272,12 +272,13 @@ def preflight(tag):
     print(json.dumps(values))
 
 def get_release(tag):
-    result = subprocess.run(["gh", "api", f"repos/{REPO}/releases/tags/{tag}"], cwd=ROOT, text=True, encoding="utf-8", capture_output=True)
-    if result.returncode == 0:
-        return json.loads(result.stdout)
-    if "HTTP 404" in result.stderr:
-        return None
-    raise RuntimeError(result.stderr)
+    # The tag endpoint only returns published releases. Listing also exposes
+    # drafts to authorized tokens, so a retry can find its existing draft.
+    pages = json.loads(run("gh", "api", "--paginate", "--slurp", f"repos/{REPO}/releases?per_page=100"))
+    matches = [release for page in pages for release in page if release["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple releases use {tag}; resolve them before retrying")
+    return matches[0] if matches else None
 
 def validate_packages(directory, release_version, sha):
     expected = {asset_name(target, release_version) for target in TARGETS}
