@@ -1,15 +1,36 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import struct
 import unittest
+from unittest.mock import patch
+import zipfile
 
 spec = importlib.util.spec_from_file_location("release", Path(__file__).parents[1] / "release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 class ReleaseGuards(unittest.TestCase):
+    def test_zip_preserves_old_license_and_hidden_files(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "Cargo.toml").write_text('[package]\nversion = "0.1.0-alpha.1"\n', encoding="utf-8")
+            staging = root / "dist" / "staging"
+            staging.mkdir(parents=True)
+            license_file = staging / "LICENSE"
+            license_file.write_bytes(b"upstream license")
+            os.utime(license_file, (1, 1))
+            (staging / ".notice").write_bytes(b"hidden notice")
+            with patch.object(release, "ROOT", root):
+                target = "x86_64-pc-windows-msvc"
+                release.zip_package(target, staging)
+                with zipfile.ZipFile(release.release_directory() / release.asset_name(target)) as archive:
+                    self.assertEqual(archive.read("LICENSE"), b"upstream license")
+                    self.assertEqual(archive.getinfo("LICENSE").date_time[0], 1980)
+                    self.assertEqual(archive.read(".notice"), b"hidden notice")
+
     def test_windows_package_rejects_external_vc_runtime(self):
         data = bytearray(1024)
         data[:2] = b"MZ"
