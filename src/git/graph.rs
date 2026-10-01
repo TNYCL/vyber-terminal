@@ -119,7 +119,14 @@ pub fn layout<'a>(
                     (lane, own)
                 }
                 // The parent already has a line: join it.
-                Some(k) => (k, if n == 0 { own } else { lanes[k].as_ref().map_or(own, |(_, c)| *c) }),
+                Some(k) => (
+                    k,
+                    if n == 0 {
+                        own
+                    } else {
+                        lanes[k].as_ref().map_or(own, |(_, c)| *c)
+                    },
+                ),
                 None if n == 0 && lanes.get(lane).is_some_and(Option::is_none) => {
                     lanes[lane] = Some((parent.clone(), own));
                     (lane, own)

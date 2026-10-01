@@ -544,7 +544,7 @@ impl Vyber {
     /// pressed last among those that run the agent or whose typed line
     /// matches the prompt, a match first.
     fn turn_terminal(&mut self, review: &TaskReview, cx: &App) -> Option<usize> {
-        if review.session.is_empty() || !review.from_terminal() {
+        if review.session.is_empty() || !review.is_from_terminal() {
             return None;
         }
         if let Some(id) = self.sessions.get(&review.session)
@@ -639,10 +639,11 @@ impl Vyber {
                 });
                 (msg, t.open_path.take())
             });
-            if let Some(message) = message {
-                if !window.is_window_active() && cx.global::<Config>().notifications {
-                    self.notifications.show(*id, message);
-                }
+            if let Some(message) = message
+                && !window.is_window_active()
+                && cx.global::<Config>().notifications
+            {
+                self.notifications.show(*id, message);
             }
             if let Some((path, line)) = path {
                 slot.browser
@@ -759,10 +760,10 @@ impl Vyber {
             if let Some(dir) = self.state_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes) {
-                if let Err(e) = std::fs::write(&self.state_path, bytes) {
-                    log::warn!("Save workspace: {e}");
-                }
+            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes)
+                && let Err(e) = std::fs::write(&self.state_path, bytes)
+            {
+                log::warn!("Save workspace: {e}");
             }
         }
     }
@@ -879,20 +880,20 @@ impl Vyber {
         let Some(id) = self.keyboard_pane(window, cx) else {
             return;
         };
-        if let Some(slot) = self.slots.get(&id) {
-            if slot.browser.read(cx).visible {
-                let handled = slot
-                    .browser
-                    .update(cx, |browser, cx| browser.close_active_document(window, cx));
-                if !handled {
-                    slot.browser
-                        .update(cx, |browser, cx| browser.close_panel(cx));
-                    window.focus(&slot.terminal.read(cx).focus.clone(), cx);
-                }
-                self.persist(cx);
-                cx.notify();
-                return;
+        if let Some(slot) = self.slots.get(&id)
+            && slot.browser.read(cx).visible
+        {
+            let handled = slot
+                .browser
+                .update(cx, |browser, cx| browser.close_active_document(window, cx));
+            if !handled {
+                slot.browser
+                    .update(cx, |browser, cx| browser.close_panel(cx));
+                window.focus(&slot.terminal.read(cx).focus.clone(), cx);
             }
+            self.persist(cx);
+            cx.notify();
+            return;
         }
         // Split grubundaki komşular aynı Cmd+W isteğine dahil edilmez.
         self.close_pane(id, window, cx);
@@ -926,10 +927,8 @@ impl Vyber {
         }
         self.tab_state.sync(&self.tabs, None);
         self.normalize_selection();
-        if active_removed {
-            if let Some(group) = self.tab_state.groups.get(self.tab) {
-                self.active = group.active;
-            }
+        if active_removed && let Some(group) = self.tab_state.groups.get(self.tab) {
+            self.active = group.active;
         }
         self.tab_state.focus(self.active);
         self.tab_scroll.scroll_to_item(self.tab);
@@ -1377,10 +1376,10 @@ impl Vyber {
                 cx.notify();
             }))
             .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                if let Some(DropHint::Tab { id: target, after }) = this.drop_hint {
-                    if target == id {
-                        this.drop_on_tab(drag, Some(id), after, window, cx);
-                    }
+                if let Some(DropHint::Tab { id: target, after }) = this.drop_hint
+                    && target == id
+                {
+                    this.drop_on_tab(drag, Some(id), after, window, cx);
                 }
             }))
             .when(cx.has_active_drag(), |s| {
@@ -1795,11 +1794,7 @@ impl Render for Vyber {
             .flex_col()
             .bg(rgb(0x000000))
             .text_color(rgb(0xdddddd))
-            .font_family(if cfg!(windows) {
-                "Segoe UI"
-            } else {
-                ".SystemUIFont"
-            })
+            .font_family(crate::theme::ui_font())
             .text_size(px(12.))
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {

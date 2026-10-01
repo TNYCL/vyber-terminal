@@ -186,10 +186,10 @@ pub fn reorder_group(
     let Some(from) = tabs.iter().position(|t| t.contains(anchor)) else {
         return false;
     };
-    if let Some(target) = target {
-        if tabs[from].contains(target) || !tabs.iter().any(|t| t.contains(target)) {
-            return false;
-        }
+    if let Some(target) = target
+        && (tabs[from].contains(target) || !tabs.iter().any(|t| t.contains(target)))
+    {
+        return false;
     }
     let tree = tabs.remove(from);
     let to = target

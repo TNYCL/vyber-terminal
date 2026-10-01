@@ -82,7 +82,17 @@ fn show(_: usize, message: &str, _: mpsc::Sender<usize>) -> anyhow::Result<()> {
         .spawn()?;
     Ok(())
 }
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn show(_: usize, message: &str, _: mpsc::Sender<usize>) -> anyhow::Result<()> {
+    notify_rust::Notification::new()
+        .summary("Vyber")
+        .body(message)
+        .appname("Vyber")
+        .icon("dev.vyber.terminal")
+        .show()?;
+    Ok(())
+}
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn show(_: usize, _: &str, _: mpsc::Sender<usize>) -> anyhow::Result<()> {
     Ok(())
 }

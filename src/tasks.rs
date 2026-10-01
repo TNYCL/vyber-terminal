@@ -44,7 +44,7 @@ pub struct TaskReview {
 impl TaskReview {
     /// Whether the agent may run in a terminal. Codex's desktop app and the
     /// editor extensions log their turns in the same place as the CLIs.
-    pub fn from_terminal(&self) -> bool {
+    pub fn is_from_terminal(&self) -> bool {
         let client = self.client.to_lowercase();
         client.is_empty() || ["tui", "cli", "exec"].iter().any(|k| client.contains(k))
     }
@@ -163,35 +163,35 @@ impl Parser {
                     });
                 }
             }
-            if matches!(typ, "task_complete" | "turn_complete" | "turn_aborted") {
-                if let Some(id) = self.current.clone() {
-                    if turn.is_empty() || id.ends_with(&format!(":{turn}")) {
-                        self.current = None;
-                        events.push(Boundary::End {
-                            id,
-                            interrupted: typ == "turn_aborted",
-                        });
-                    }
-                }
+            if matches!(typ, "task_complete" | "turn_complete" | "turn_aborted")
+                && let Some(id) = self.current.clone()
+                && (turn.is_empty() || id.ends_with(&format!(":{turn}")))
+            {
+                self.current = None;
+                events.push(Boundary::End {
+                    id,
+                    interrupted: typ == "turn_aborted",
+                });
             }
-            if typ == "user_message" && !self.paginated {
-                if let Some(id) = &self.current {
-                    events.push(Boundary::Label {
-                        id: id.clone(),
-                        label: label(&text_content(&p["message"])),
-                    });
-                }
+            if typ == "user_message"
+                && !self.paginated
+                && let Some(id) = &self.current
+            {
+                events.push(Boundary::Label {
+                    id: id.clone(),
+                    label: label(&text_content(&p["message"])),
+                });
             }
             if typ == "item_completed" {
                 let item = &p["item"];
-                if matches!(item["type"].as_str(), Some("UserMessage" | "user_message")) {
-                    if let Some(id) = &self.current {
-                        let text = text_content(item.get("content").unwrap_or(&item["text"]));
-                        events.push(Boundary::Label {
-                            id: id.clone(),
-                            label: label(&text),
-                        });
-                    }
+                if matches!(item["type"].as_str(), Some("UserMessage" | "user_message"))
+                    && let Some(id) = &self.current
+                {
+                    let text = text_content(item.get("content").unwrap_or(&item["text"]));
+                    events.push(Boundary::Label {
+                        id: id.clone(),
+                        label: label(&text),
+                    });
                 }
             }
         }
@@ -202,39 +202,38 @@ impl Parser {
                     a.iter().any(|i| i["type"] == "text")
                         && !a.iter().any(|i| i["type"] == "tool_result")
                 });
-            if prompt {
-                if let Some(prompt_id) = v["promptId"].as_str().or(v["uuid"].as_str()) {
-                    let queued = v["isQueued"] == true || v["isQueuedMessage"] == true;
-                    if queued && self.current.is_some() {
-                        return events;
-                    }
-                    let id = format!("claude:{}:{prompt_id}", self.session);
-                    if self.current.as_ref() != Some(&id) {
-                        if let Some(old) = self.current.replace(id.clone()) {
-                            events.push(Boundary::End {
-                                id: old,
-                                interrupted: true,
-                            });
-                        }
-                        events.push(Boundary::Start {
-                            id,
-                            agent: "Claude".into(),
-                            session: self.session.clone(),
-                            client: self.client.clone(),
-                            root: self.root.clone(),
-                            label: label(&text_content(content)),
+            if prompt && let Some(prompt_id) = v["promptId"].as_str().or(v["uuid"].as_str()) {
+                let queued = v["isQueued"] == true || v["isQueuedMessage"] == true;
+                if queued && self.current.is_some() {
+                    return events;
+                }
+                let id = format!("claude:{}:{prompt_id}", self.session);
+                if self.current.as_ref() != Some(&id) {
+                    if let Some(old) = self.current.replace(id.clone()) {
+                        events.push(Boundary::End {
+                            id: old,
+                            interrupted: true,
                         });
                     }
+                    events.push(Boundary::Start {
+                        id,
+                        agent: "Claude".into(),
+                        session: self.session.clone(),
+                        client: self.client.clone(),
+                        root: self.root.clone(),
+                        label: label(&text_content(content)),
+                    });
                 }
             }
         }
-        if kind == "system" && v["subtype"] == "turn_duration" {
-            if let Some(id) = self.current.take() {
-                events.push(Boundary::End {
-                    id,
-                    interrupted: false,
-                });
-            }
+        if kind == "system"
+            && v["subtype"] == "turn_duration"
+            && let Some(id) = self.current.take()
+        {
+            events.push(Boundary::End {
+                id,
+                interrupted: false,
+            });
         }
         events
     }
@@ -358,6 +357,10 @@ pub fn history(root: &Path) -> Vec<TaskReview> {
     }
     reviews
 }
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "Live agent monitoring is disabled in UI tests.")
+)]
 fn capture_end(review: &mut TaskReview, interrupted: bool) {
     review.active = false;
     if interrupted {
@@ -397,6 +400,10 @@ impl Monitor {
             stop: Arc::new(AtomicBool::new(true)),
         }
     }
+    #[cfg_attr(
+        test,
+        allow(dead_code, reason = "Live agent monitoring is disabled in UI tests.")
+    )]
     pub fn start(roots: Arc<std::sync::Mutex<Vec<PathBuf>>>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -420,17 +427,17 @@ impl Monitor {
             while !done.load(Ordering::Relaxed) {
                 if discovery.elapsed() > Duration::from_secs(3) {
                     for root in roots.lock().unwrap().iter() {
-                        if watched.insert(root.clone()) {
-                            if let Some(w) = &mut watcher {
-                                let _ = w.watch(root, notify::RecursiveMode::Recursive);
-                            }
+                        if watched.insert(root.clone())
+                            && let Some(w) = &mut watcher
+                        {
+                            let _ = w.watch(root, notify::RecursiveMode::Recursive);
                         }
                     }
                     for path in recent_logs() {
-                        if !tails.contains_key(&path) {
-                            if let Some(tail) = Tail::initial(&path, first) {
-                                tails.insert(path, tail);
-                            }
+                        if !tails.contains_key(&path)
+                            && let Some(tail) = Tail::initial(&path, first)
+                        {
+                            tails.insert(path, tail);
                         }
                     }
                     first = false;
@@ -514,11 +521,11 @@ impl Monitor {
                             reviews.insert(id, review);
                         }
                         Boundary::Label { id, label } => {
-                            if !label.is_empty() {
-                                if let Some(r) = reviews.get_mut(&id) {
-                                    r.label = format!("{} · {label}", r.agent);
-                                    let _ = sender.send(r.clone());
-                                }
+                            if !label.is_empty()
+                                && let Some(r) = reviews.get_mut(&id)
+                            {
+                                r.label = format!("{} · {label}", r.agent);
+                                let _ = sender.send(r.clone());
                             }
                         }
                         Boundary::End { id, interrupted } => {
@@ -561,6 +568,10 @@ impl Monitor {
         Self { receiver, stop }
     }
 }
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "Live agent monitoring is disabled in UI tests.")
+)]
 fn recent_logs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
@@ -575,22 +586,19 @@ fn recent_logs() -> Vec<PathBuf> {
             .build()
             .flatten()
         {
-            if entry.path().extension().is_some_and(|e| e == "jsonl") {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if SystemTime::now()
-                            .duration_since(modified)
-                            .unwrap_or_default()
-                            < Duration::from_secs(24 * 3600)
-                        {
-                            result.push((modified, entry.path().to_owned()));
-                        }
-                    }
-                }
+            if entry.path().extension().is_some_and(|e| e == "jsonl")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default()
+                    < Duration::from_secs(24 * 3600)
+            {
+                result.push((modified, entry.path().to_owned()));
             }
         }
     }
-    result.sort_by(|a, b| b.0.cmp(&a.0));
+    result.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     result.into_iter().take(64).map(|(_, p)| p).collect()
 }
 #[cfg(test)]
@@ -700,10 +708,10 @@ mod tests {
             warning: String::new(),
         };
         for client in ["codex-tui", "codex_cli_rs", "codex_exec", "cli", ""] {
-            assert!(review(client).from_terminal(), "{client}");
+            assert!(review(client).is_from_terminal(), "{client}");
         }
         for client in ["Codex Desktop", "codex_vscode", "claude-vscode"] {
-            assert!(!review(client).from_terminal(), "{client}");
+            assert!(!review(client).is_from_terminal(), "{client}");
         }
     }
 }

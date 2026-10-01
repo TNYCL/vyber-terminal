@@ -14,8 +14,13 @@
   <img src="assets/screenshot.png" alt="Vyber with a split terminal and the file panel open" width="900">
 </p>
 
-> **Status:** early (0.1). Developed and tested on Windows 11. The macOS build script exists but the
-> macOS build has not been verified yet.
+> **Status:** alpha. GitHub CI builds Windows x64, macOS Apple Silicon/Intel and Linux x64/ARM64.
+> Desktop acceptance is separate from CI: Windows 11 is the development platform; macOS/Linux
+> desktop and GPU compatibility are being verified. Preview packages are unsigned on Windows
+> and ad-hoc-signed (not notarized) on macOS.
+
+See [Releasing Vyber](docs/RELEASING.md) for the five workflows/configuration files, packaging,
+download verification and the manual publication gate. Releases are prepared as drafts.
 
 ## Features
 

@@ -280,7 +280,10 @@ mod tests {
             folders: vec![PathBuf::from("/w/play"), PathBuf::from("/w/play/api")],
         };
         assert_eq!(project.primary(), Some(Path::new("/w/play")));
-        assert!(matches_root(Path::new("/w/play/api/src"), &project.folders[1]));
+        assert!(matches_root(
+            Path::new("/w/play/api/src"),
+            &project.folders[1]
+        ));
         assert!(!matches_root(Path::new("/w/player"), &project.folders[0]));
     }
 }

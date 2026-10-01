@@ -45,10 +45,8 @@ impl BadgeAnchorMemory {
                 self.last = Some((row, right, rows, columns));
                 return Some(BadgePosition::Cell { row, right });
             }
-            if active {
-                if let Some((row, right, _, _)) = self.last {
-                    return Some(BadgePosition::Cell { row, right });
-                }
+            if active && let Some((row, right, _, _)) = self.last {
+                return Some(BadgePosition::Cell { row, right });
             }
         }
         active.then_some(BadgePosition::Corner)

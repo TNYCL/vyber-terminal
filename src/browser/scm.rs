@@ -169,18 +169,35 @@ pub(super) enum GitAction {
     Push(bool, bool),
     Sync(bool),
     Publish(Option<String>),
-    Commit { amend: bool, then: Option<Box<GitAction>>, stage_all: bool },
+    Commit {
+        amend: bool,
+        then: Option<Box<GitAction>>,
+        stage_all: bool,
+    },
     UndoCommit(bool),
     StageAll(PathBuf),
     UnstageAll(PathBuf),
     DiscardAll(PathBuf, bool),
     Stage(PathBuf, Vec<String>),
     Unstage(PathBuf, Vec<String>),
-    Discard { repo: PathBuf, tracked: Vec<String>, untracked: Vec<String>, confirmed: bool },
+    Discard {
+        repo: PathBuf,
+        tracked: Vec<String>,
+        untracked: Vec<String>,
+        confirmed: bool,
+    },
     TakeSide(PathBuf, String, bool),
     Ask(Ask),
-    Checkout { target: String, kind: CheckoutKind, mode: CheckoutMode, confirmed: bool },
-    CreateBranch { name: String, from: Option<String> },
+    Checkout {
+        target: String,
+        kind: CheckoutKind,
+        mode: CheckoutMode,
+        confirmed: bool,
+    },
+    CreateBranch {
+        name: String,
+        from: Option<String>,
+    },
     RenameBranch(String, String),
     DeleteBranch(String, bool),
     DeleteRemoteBranch(String, bool),
@@ -189,16 +206,37 @@ pub(super) enum GitAction {
     Sequence(Operation, &'static str),
     CherryPick(String),
     RevertCommit(String),
-    Reset { target: String, mode: &'static str, confirmed: bool },
-    CreateTag { name: String, target: Option<String>, message: Option<String> },
+    Reset {
+        target: String,
+        mode: &'static str,
+        confirmed: bool,
+    },
+    CreateTag {
+        name: String,
+        target: Option<String>,
+        message: Option<String>,
+    },
     DeleteTag(String, bool),
     PushTags,
-    Stash { message: String, untracked: bool, staged: bool, confirmed: bool },
-    StashAct { action: &'static str, name: String, confirmed: bool },
+    Stash {
+        message: String,
+        untracked: bool,
+        staged: bool,
+        confirmed: bool,
+    },
+    StashAct {
+        action: &'static str,
+        name: String,
+        confirmed: bool,
+    },
     StashClear(bool),
     AddRemote(String, String),
     RemoveRemote(String, bool),
-    AddWorktree { branch: String, new: bool, path: PathBuf },
+    AddWorktree {
+        branch: String,
+        new: bool,
+        path: PathBuf,
+    },
     RemoveWorktree(PathBuf, bool, bool),
     PruneWorktrees,
     OpenTab(PathBuf),
@@ -517,7 +555,12 @@ impl Browser {
         });
     }
 
-    pub(super) fn git_repos_loaded(&mut self, repos: Vec<Repo>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn git_repos_loaded(
+        &mut self,
+        repos: Vec<Repo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.git.discovering = false;
         self.git.discovered = true;
         let mut old: HashMap<PathBuf, RepoView> = self
@@ -556,7 +599,12 @@ impl Browser {
         self.git.stale = true;
     }
 
-    pub(super) fn select_repo(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_repo(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let changed = self.git.selected.as_ref() != Some(&path);
         self.git.selected = Some(path.clone());
         self.message_input(&path, window, cx);
@@ -640,33 +688,44 @@ impl Browser {
                 .default_value(text)
         });
         let key = repo.to_path_buf();
-        let subscription = cx.subscribe_in(&input, window, move |this, input, event, window, cx| {
-            match event {
-                InputEvent::Change => set_draft(&key, &input.read(cx).value()),
-                InputEvent::PressEnter { secondary: true, .. } => {
-                    // Ctrl+Enter also typed a newline; the commit trims it.
-                    this.git.selected = Some(key.clone());
-                    this.perform(
-                        GitAction::Commit {
-                            amend: false,
-                            then: None,
-                            stage_all: false,
-                        },
-                        window,
-                        cx,
-                    );
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, input, event, window, cx| {
+                match event {
+                    InputEvent::Change => set_draft(&key, &input.read(cx).value()),
+                    InputEvent::PressEnter {
+                        secondary: true, ..
+                    } => {
+                        // Ctrl+Enter also typed a newline; the commit trims it.
+                        this.git.selected = Some(key.clone());
+                        this.perform(
+                            GitAction::Commit {
+                                amend: false,
+                                then: None,
+                                stage_all: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        });
+            });
         self.git.subscriptions.push(subscription);
         self.git.messages.insert(repo.to_path_buf(), input.clone());
         input
     }
 
-    fn set_message(&mut self, repo: &Path, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_message(
+        &mut self,
+        repo: &Path,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = self.message_input(repo, window, cx);
-        input.update(cx, |input, cx| input.set_value(text.to_string(), window, cx));
+        input.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx)
+        });
         set_draft(repo, text);
     }
 
@@ -741,7 +800,9 @@ impl Browser {
         for (path, status) in results {
             if let Some(view) = self.git.repos.iter_mut().find(|r| r.repo.path == path) {
                 if self.git.graph.repo.as_ref() == Some(&path) {
-                    let old = view.status().map(|s| (s.oid.clone(), s.upstream.clone(), s.behind));
+                    let old = view
+                        .status()
+                        .map(|s| (s.oid.clone(), s.upstream.clone(), s.behind));
                     let new = status
                         .as_ref()
                         .ok()
@@ -845,7 +906,12 @@ impl Browser {
     }
 
     pub(super) fn load_commit_info(&mut self, repo: PathBuf, hash: String) {
-        if self.git.info.as_ref().is_some_and(|(h, i)| *h == hash && i.is_ok()) {
+        if self
+            .git
+            .info
+            .as_ref()
+            .is_some_and(|(h, i)| *h == hash && i.is_ok())
+        {
             return;
         }
         let sender = self.sender.clone();
@@ -1010,7 +1076,11 @@ impl Browser {
 
     fn show_failure(&mut self, repo: &Path, failure: ops::Failure) {
         let name = project::folder_name(repo);
-        let mut buttons = vec![Button::new("Show Output", Style::Plain, Some(GitAction::ShowOutput))];
+        let mut buttons = vec![Button::new(
+            "Show Output",
+            Style::Plain,
+            Some(GitAction::ShowOutput),
+        )];
         let last = ops::log().pop();
         if failure.auth
             && let Some(last) = &last
@@ -1094,7 +1164,12 @@ impl Browser {
         }
     }
 
-    pub(super) fn perform(&mut self, action: GitAction, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn perform(
+        &mut self,
+        action: GitAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.git.menu = None;
         self.dismiss_confirm();
         let Some(repo) = self.git.selected.clone().or_else(|| match &action {
@@ -1145,20 +1220,29 @@ impl Browser {
                 }
                 self.git.detail = Detail::Diff;
                 self.git.graph.selected = None;
-                let source = if staged { Source::Staged } else { Source::Unstaged };
-                if self.review.source.as_ref() != Some(&source) || self.review.repo.as_ref() != Some(&path) {
+                let source = if staged {
+                    Source::Staged
+                } else {
+                    Source::Unstaged
+                };
+                if self.review.source.as_ref() != Some(&source)
+                    || self.review.repo.as_ref() != Some(&path)
+                {
                     self.review.repo = Some(path.clone());
                     self.set_source(source, false, cx);
                 }
                 self.review.reveal_path = file;
                 self.review.rows_dirty = true;
             }
-            GitAction::Fetch => self.run_git(repo.clone(), Some("Fetching…"), OnError::Show, |repo| {
-                ops::fetch(repo, true)?;
-                Ok(After::Notice("Fetched".into()))
-            }),
+            GitAction::Fetch => {
+                self.run_git(repo.clone(), Some("Fetching…"), OnError::Show, |repo| {
+                    ops::fetch(repo, true)?;
+                    Ok(After::Notice("Fetched".into()))
+                })
+            }
             GitAction::Pull(rebase, confirmed) => {
-                if !confirmed && self.confirm_agent(&repo, "Pulling", GitAction::Pull(rebase, true)) {
+                if !confirmed && self.confirm_agent(&repo, "Pulling", GitAction::Pull(rebase, true))
+                {
                     return;
                 }
                 self.run_git(repo, Some("Pulling…"), OnError::Conflicts, move |repo| {
@@ -1182,7 +1266,11 @@ impl Browser {
                         detail: None,
                         buttons: vec![
                             Button::cancel(),
-                            Button::new("Force Push", Style::Danger, Some(GitAction::Push(true, true))),
+                            Button::new(
+                                "Force Push",
+                                Style::Danger,
+                                Some(GitAction::Push(true, true)),
+                            ),
                         ],
                     });
                     return;
@@ -1258,7 +1346,11 @@ impl Browser {
                         detail: None,
                         buttons: vec![
                             Button::cancel(),
-                            Button::new("Undo Commit", Style::Danger, Some(GitAction::UndoCommit(true))),
+                            Button::new(
+                                "Undo Commit",
+                                Style::Danger,
+                                Some(GitAction::UndoCommit(true)),
+                            ),
                         ],
                     });
                 } else {
@@ -1299,10 +1391,12 @@ impl Browser {
                 ops::stage(repo, &paths)?;
                 Ok(After::Nothing)
             }),
-            GitAction::Unstage(path, paths) => self.run_git(path, None, OnError::Show, move |repo| {
-                ops::unstage(repo, &paths)?;
-                Ok(After::Nothing)
-            }),
+            GitAction::Unstage(path, paths) => {
+                self.run_git(path, None, OnError::Show, move |repo| {
+                    ops::unstage(repo, &paths)?;
+                    Ok(After::Nothing)
+                })
+            }
             GitAction::Discard {
                 repo,
                 tracked,
@@ -1329,7 +1423,11 @@ impl Browser {
                         format!(
                             " {} untracked {} will be deleted.",
                             untracked.len(),
-                            if untracked.len() == 1 { "file" } else { "files" }
+                            if untracked.len() == 1 {
+                                "file"
+                            } else {
+                                "files"
+                            }
                         )
                     };
                     self.git.confirm = Some(Confirm {
@@ -1362,13 +1460,15 @@ impl Browser {
                     )))
                 });
             }
-            GitAction::TakeSide(path, file, ours) => self.run_git(path, None, OnError::Show, move |repo| {
-                ops::take_side(repo, &file, ours)?;
-                Ok(After::Notice(format!(
-                    "Kept {} version of {file}",
-                    if ours { "the current" } else { "the incoming" }
-                )))
-            }),
+            GitAction::TakeSide(path, file, ours) => {
+                self.run_git(path, None, OnError::Show, move |repo| {
+                    ops::take_side(repo, &file, ours)?;
+                    Ok(After::Notice(format!(
+                        "Kept {} version of {file}",
+                        if ours { "the current" } else { "the incoming" }
+                    )))
+                })
+            }
             GitAction::Ask(ask) => self.open_quick(ask, window, cx),
             GitAction::Checkout {
                 target,
@@ -1378,15 +1478,22 @@ impl Browser {
             } => self.checkout(repo, target, kind, mode, confirmed, cx),
             GitAction::CreateBranch { name, from } => {
                 let name = name.trim().to_string();
-                self.run_git(repo, Some("Creating branch…"), OnError::Show, move |repo| {
-                    ops::create_branch(repo, &name, from.as_deref(), true)?;
-                    Ok(After::Notice(format!("Switched to new branch {name}")))
-                });
+                self.run_git(
+                    repo,
+                    Some("Creating branch…"),
+                    OnError::Show,
+                    move |repo| {
+                        ops::create_branch(repo, &name, from.as_deref(), true)?;
+                        Ok(After::Notice(format!("Switched to new branch {name}")))
+                    },
+                );
             }
-            GitAction::RenameBranch(old, new) => self.run_git(repo, None, OnError::Show, move |repo| {
-                ops::rename_branch(repo, &old, new.trim())?;
-                Ok(After::Notice(format!("Renamed {old} to {}", new.trim())))
-            }),
+            GitAction::RenameBranch(old, new) => {
+                self.run_git(repo, None, OnError::Show, move |repo| {
+                    ops::rename_branch(repo, &old, new.trim())?;
+                    Ok(After::Notice(format!("Renamed {old} to {}", new.trim())))
+                })
+            }
             GitAction::DeleteBranch(name, force) => {
                 let error = OnError::DeleteBranch(name.clone());
                 self.run_git(repo, None, error, move |repo| {
@@ -1395,7 +1502,10 @@ impl Browser {
                 });
             }
             GitAction::DeleteRemoteBranch(name, confirmed) => {
-                let Some((remote, branch)) = name.split_once('/').map(|(r, b)| (r.to_string(), b.to_string())) else {
+                let Some((remote, branch)) = name
+                    .split_once('/')
+                    .map(|(r, b)| (r.to_string(), b.to_string()))
+                else {
                     return;
                 };
                 if !confirmed {
@@ -1419,10 +1529,12 @@ impl Browser {
                     Ok(After::Notice(format!("Deleted {remote}/{branch}")))
                 });
             }
-            GitAction::Merge(target) => self.run_git(repo, Some("Merging…"), OnError::Conflicts, move |repo| {
-                ops::merge(repo, &target)?;
-                Ok(After::Notice(format!("Merged {target}")))
-            }),
+            GitAction::Merge(target) => {
+                self.run_git(repo, Some("Merging…"), OnError::Conflicts, move |repo| {
+                    ops::merge(repo, &target)?;
+                    Ok(After::Notice(format!("Merged {target}")))
+                })
+            }
             GitAction::Rebase(onto, confirmed) => {
                 if !confirmed
                     && self.confirm_agent(&repo, "Rebasing", GitAction::Rebase(onto.clone(), true))
@@ -1452,15 +1564,24 @@ impl Browser {
                         return Ok(After::Committed(None));
                     }
                     ops::sequence(repo, operation, step)?;
-                    Ok(After::Notice(format!("{} {}", operation.label(), step_label(step))))
+                    Ok(After::Notice(format!(
+                        "{} {}",
+                        operation.label(),
+                        step_label(step)
+                    )))
                 });
             }
             GitAction::CherryPick(hash) => {
                 let merge = self.commit_is_merge(&hash);
-                self.run_git(repo, Some("Cherry-picking…"), OnError::Conflicts, move |repo| {
-                    ops::cherry_pick(repo, &hash, merge)?;
-                    Ok(After::Notice(format!("Cherry-picked {}", short(&hash))))
-                });
+                self.run_git(
+                    repo,
+                    Some("Cherry-picking…"),
+                    OnError::Conflicts,
+                    move |repo| {
+                        ops::cherry_pick(repo, &hash, merge)?;
+                        Ok(After::Notice(format!("Cherry-picked {}", short(&hash))))
+                    },
+                );
             }
             GitAction::RevertCommit(hash) => {
                 let merge = self.commit_is_merge(&hash);
@@ -1482,10 +1603,16 @@ impl Browser {
                         _ => "Commits after it and every uncommitted change are thrown away. Vyber keeps recovery copies of changed files.".into(),
                     };
                     if let Some(agent) = self.agent_in(&repo).filter(|_| hard) {
-                        message.push_str(&format!(" {agent} is working in this repository right now."));
+                        message.push_str(&format!(
+                            " {agent} is working in this repository right now."
+                        ));
                     }
                     self.git.confirm = Some(Confirm {
-                        title: format!("Reset {} to {}?", status.map(|s| s.head_label()).unwrap_or_default(), short(&target)),
+                        title: format!(
+                            "Reset {} to {}?",
+                            status.map(|s| s.head_label()).unwrap_or_default(),
+                            short(&target)
+                        ),
                         message,
                         detail: None,
                         buttons: vec![
@@ -1524,7 +1651,11 @@ impl Browser {
                         detail: None,
                         buttons: vec![
                             Button::cancel(),
-                            Button::new("Delete Tag", Style::Danger, Some(GitAction::DeleteTag(name, true))),
+                            Button::new(
+                                "Delete Tag",
+                                Style::Danger,
+                                Some(GitAction::DeleteTag(name, true)),
+                            ),
                         ],
                     });
                     return;
@@ -1608,7 +1739,11 @@ impl Browser {
                         detail: None,
                         buttons: vec![
                             Button::cancel(),
-                            Button::new("Drop All", Style::Danger, Some(GitAction::StashClear(true))),
+                            Button::new(
+                                "Drop All",
+                                Style::Danger,
+                                Some(GitAction::StashClear(true)),
+                            ),
                         ],
                     });
                     return;
@@ -1618,10 +1753,12 @@ impl Browser {
                     Ok(After::Notice("Stashes dropped".into()))
                 });
             }
-            GitAction::AddRemote(name, url) => self.run_git(repo, None, OnError::Show, move |repo| {
-                ops::add_remote(repo, name.trim(), url.trim())?;
-                Ok(After::Notice(format!("Added remote {}", name.trim())))
-            }),
+            GitAction::AddRemote(name, url) => {
+                self.run_git(repo, None, OnError::Show, move |repo| {
+                    ops::add_remote(repo, name.trim(), url.trim())?;
+                    Ok(After::Notice(format!("Added remote {}", name.trim())))
+                })
+            }
             GitAction::RemoveRemote(name, confirmed) => {
                 if !confirmed {
                     self.git.confirm = Some(Confirm {
@@ -1646,18 +1783,27 @@ impl Browser {
                     .repo(&repo)
                     .and_then(|r| r.repo.worktree_of.clone())
                     .unwrap_or(repo);
-                self.run_git(main, Some("Creating worktree…"), OnError::Show, move |repo| {
-                    ops::add_worktree(repo, &path, &branch, new, None)?;
-                    Ok(After::Ask(Confirm {
-                        title: "Worktree created".into(),
-                        message: format!("{branch} is checked out in {}.", path.display()),
-                        detail: None,
-                        buttons: vec![
-                            Button::new("Done", Style::Plain, None),
-                            Button::new("Open in New Tab", Style::Primary, Some(GitAction::OpenTab(path))),
-                        ],
-                    }))
-                });
+                self.run_git(
+                    main,
+                    Some("Creating worktree…"),
+                    OnError::Show,
+                    move |repo| {
+                        ops::add_worktree(repo, &path, &branch, new, None)?;
+                        Ok(After::Ask(Confirm {
+                            title: "Worktree created".into(),
+                            message: format!("{branch} is checked out in {}.", path.display()),
+                            detail: None,
+                            buttons: vec![
+                                Button::new("Done", Style::Plain, None),
+                                Button::new(
+                                    "Open in New Tab",
+                                    Style::Primary,
+                                    Some(GitAction::OpenTab(path)),
+                                ),
+                            ],
+                        }))
+                    },
+                );
                 self.git.discovered = false;
             }
             GitAction::RemoveWorktree(path, force, confirmed) => {
@@ -1696,10 +1842,15 @@ impl Browser {
                 if self.git.selected.as_ref() == Some(&path) {
                     self.git.selected = Some(owner.clone());
                 }
-                self.run_git(owner, Some("Removing worktree…"), OnError::Show, move |repo| {
-                    ops::remove_worktree(repo, &path, force)?;
-                    Ok(After::Notice("Worktree removed".into()))
-                });
+                self.run_git(
+                    owner,
+                    Some("Removing worktree…"),
+                    OnError::Show,
+                    move |repo| {
+                        ops::remove_worktree(repo, &path, force)?;
+                        Ok(After::Notice("Worktree removed".into()))
+                    },
+                );
                 self.git.discovered = false;
             }
             GitAction::PruneWorktrees => {
@@ -1732,7 +1883,14 @@ impl Browser {
             GitAction::Init => {}
             GitAction::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                self.say(format!("Copied {}", if text.len() > 40 { "to clipboard" } else { &text }));
+                self.say(format!(
+                    "Copied {}",
+                    if text.len() > 40 {
+                        "to clipboard"
+                    } else {
+                        &text
+                    }
+                ));
             }
             GitAction::OpenUrl(url) => cx.open_url(&url),
             GitAction::RunInTerminal(command) => {
@@ -1852,17 +2010,21 @@ impl Browser {
                 detail: None,
                 buttons: vec![
                     Button::cancel(),
-                    Button::new("Open in New Tab", Style::Primary, Some(GitAction::OpenTab(place))),
+                    Button::new(
+                        "Open in New Tab",
+                        Style::Primary,
+                        Some(GitAction::OpenTab(place)),
+                    ),
                 ],
             });
             cx.notify();
             return;
         }
         let local_exists = local.as_ref().is_some_and(|b| {
-            self.git
-                .refs
-                .get(&repo)
-                .is_some_and(|refs| refs.iter().any(|r| r.kind == RefKind::Local && &r.name == b))
+            self.git.refs.get(&repo).is_some_and(|refs| {
+                refs.iter()
+                    .any(|r| r.kind == RefKind::Local && &r.name == b)
+            })
         });
         let label = format!("Switching to {target}…");
         let error = OnError::Checkout(target.clone(), kind);
@@ -1943,19 +2105,24 @@ impl Browser {
                 .default_value(value)
         });
         input.update(cx, |input, cx| input.focus(window, cx));
-        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
-            InputEvent::PressEnter { .. } => this.accept_quick(window, cx),
-            InputEvent::Change => {
-                if let Some(quick) = &mut this.git.quick {
-                    quick.selected = 0;
-                    quick.scroll.scroll_to_item(0);
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.accept_quick(window, cx),
+                InputEvent::Change => {
+                    if let Some(quick) = &mut this.git.quick {
+                        quick.selected = 0;
+                        quick.scroll.scroll_to_item(0);
+                    }
+                    cx.notify();
                 }
-                cx.notify();
-            }
-            _ => {}
-        });
+                _ => {}
+            });
         let needs_refs = ask.needs_refs() && !self.git.refs.contains_key(&repo);
-        let items = if needs_refs { vec![] } else { self.quick_items(&ask) };
+        let items = if needs_refs {
+            vec![]
+        } else {
+            self.quick_items(&ask)
+        };
         if needs_refs || matches!(ask, Ask::Checkout) {
             self.load_refs(repo);
         }
@@ -2028,7 +2195,8 @@ impl Browser {
             text_action(&ask, typed)
         } else {
             let visible = self.quick_visible(cx);
-            let Some(index) = visible.get(quick.selected.min(visible.len().saturating_sub(1))) else {
+            let Some(index) = visible.get(quick.selected.min(visible.len().saturating_sub(1)))
+            else {
                 return;
             };
             Some(quick.items[*index].action.clone())
@@ -2044,14 +2212,15 @@ impl Browser {
             return vec![];
         };
         let refs = self.git.refs.get(&repo).cloned().unwrap_or_default();
-        let item = |icon, label: String, detail: String, right: String, section, action| QuickItem {
-            icon,
-            label,
-            detail,
-            right,
-            section,
-            action,
-        };
+        let item =
+            |icon, label: String, detail: String, right: String, section, action| QuickItem {
+                icon,
+                label,
+                detail,
+                right,
+                section,
+                action,
+            };
         let ref_item = |r: &Ref, section: Option<&'static str>, action: GitAction| {
             let mut detail = r.subject.clone();
             if r.kind == RefKind::Local && (r.ahead > 0 || r.behind > 0) {
@@ -2084,9 +2253,30 @@ impl Browser {
         };
         match ask {
             Ask::Checkout => {
-                items.push(item("plus", "Create new branch…".into(), String::new(), String::new(), None, GitAction::Ask(Ask::NewBranch(None))));
-                items.push(item("plus", "Create new branch from…".into(), String::new(), String::new(), None, GitAction::Ask(Ask::NewBranchFrom)));
-                items.push(item("git-commit-horizontal", "Checkout detached…".into(), String::new(), String::new(), None, GitAction::Ask(Ask::Detached)));
+                items.push(item(
+                    "plus",
+                    "Create new branch…".into(),
+                    String::new(),
+                    String::new(),
+                    None,
+                    GitAction::Ask(Ask::NewBranch(None)),
+                ));
+                items.push(item(
+                    "plus",
+                    "Create new branch from…".into(),
+                    String::new(),
+                    String::new(),
+                    None,
+                    GitAction::Ask(Ask::NewBranchFrom),
+                ));
+                items.push(item(
+                    "git-commit-horizontal",
+                    "Checkout detached…".into(),
+                    String::new(),
+                    String::new(),
+                    None,
+                    GitAction::Ask(Ask::Detached),
+                ));
                 for r in refs_of(&[RefKind::Local, RefKind::Remote, RefKind::Tag], false) {
                     let kind = match r.kind {
                         RefKind::Local => CheckoutKind::Local,
@@ -2112,7 +2302,10 @@ impl Browser {
                 }
             }
             Ask::NewBranchFrom | Ask::Detached | Ask::Merge | Ask::Rebase => {
-                for r in refs_of(&[RefKind::Local, RefKind::Remote, RefKind::Tag], matches!(ask, Ask::Merge | Ask::Rebase)) {
+                for r in refs_of(
+                    &[RefKind::Local, RefKind::Remote, RefKind::Tag],
+                    matches!(ask, Ask::Merge | Ask::Rebase),
+                ) {
                     let action = match ask {
                         Ask::NewBranchFrom => GitAction::Ask(Ask::NewBranch(Some(r.name.clone()))),
                         Ask::Detached => GitAction::Checkout {
@@ -2129,32 +2322,59 @@ impl Browser {
             }
             Ask::RenameBranch => {
                 for r in refs_of(&[RefKind::Local], false) {
-                    items.push(ref_item(r, None, GitAction::Ask(Ask::RenameTo(r.name.clone()))));
+                    items.push(ref_item(
+                        r,
+                        None,
+                        GitAction::Ask(Ask::RenameTo(r.name.clone())),
+                    ));
                 }
             }
             Ask::DeleteBranch => {
                 for r in refs_of(&[RefKind::Local], true) {
-                    items.push(ref_item(r, None, GitAction::DeleteBranch(r.name.clone(), false)));
+                    items.push(ref_item(
+                        r,
+                        None,
+                        GitAction::DeleteBranch(r.name.clone(), false),
+                    ));
                 }
             }
             Ask::DeleteRemoteBranch => {
                 for r in refs_of(&[RefKind::Remote], false) {
-                    items.push(ref_item(r, None, GitAction::DeleteRemoteBranch(r.name.clone(), false)));
+                    items.push(ref_item(
+                        r,
+                        None,
+                        GitAction::DeleteRemoteBranch(r.name.clone(), false),
+                    ));
                 }
             }
             Ask::DeleteTag => {
                 for r in refs_of(&[RefKind::Tag], false) {
-                    items.push(ref_item(r, None, GitAction::DeleteTag(r.name.clone(), false)));
+                    items.push(ref_item(
+                        r,
+                        None,
+                        GitAction::DeleteTag(r.name.clone(), false),
+                    ));
                 }
             }
             Ask::Publish | Ask::RemoveRemote => {
-                for remote in self.selected_status().map(|s| s.remotes).unwrap_or_default() {
+                for remote in self
+                    .selected_status()
+                    .map(|s| s.remotes)
+                    .unwrap_or_default()
+                {
                     let action = if *ask == Ask::Publish {
                         GitAction::Publish(Some(remote.clone()))
                     } else {
                         GitAction::RemoveRemote(remote.clone(), false)
                     };
-                    items.push(item("cloud", remote, String::new(), String::new(), None, action));
+                    items.push(item(
+                        "cloud",
+                        remote,
+                        String::new(),
+                        String::new(),
+                        None,
+                        action,
+                    ));
                 }
             }
             Ask::Stash(action) => {
@@ -2204,17 +2424,31 @@ impl Browser {
                     } else {
                         GitAction::OpenTab(view.repo.path.clone())
                     };
-                    items.push(item("git-fork", label, view.repo.path.display().to_string(), String::new(), None, action));
+                    items.push(item(
+                        "git-fork",
+                        label,
+                        view.repo.path.display().to_string(),
+                        String::new(),
+                        None,
+                        action,
+                    ));
                 }
             }
             Ask::Reset(target) => {
                 for (mode, detail) in [
                     ("soft", "Keep the changes of later commits staged"),
                     ("mixed", "Keep the changes of later commits, unstaged"),
-                    ("hard", "Throw away later commits and every uncommitted change"),
+                    (
+                        "hard",
+                        "Throw away later commits and every uncommitted change",
+                    ),
                 ] {
                     items.push(item(
-                        if mode == "hard" { "triangle-alert" } else { "rotate-ccw" },
+                        if mode == "hard" {
+                            "triangle-alert"
+                        } else {
+                            "rotate-ccw"
+                        },
                         format!("Reset ({mode})"),
                         detail.into(),
                         String::new(),
@@ -2233,10 +2467,22 @@ impl Browser {
                     let branch = status.map(Status::head_label).unwrap_or_default();
                     let changes = status.map(Status::changes).unwrap_or(0);
                     items.push(item(
-                        if view.repo.is_worktree() { "git-fork" } else { "folder-git-2" },
+                        if view.repo.is_worktree() {
+                            "git-fork"
+                        } else {
+                            "folder-git-2"
+                        },
                         repo_label(&view.repo, status),
-                        if view.repo.is_worktree() { view.repo.name.clone() } else { branch },
-                        if changes > 0 { format!("{changes} changed") } else { String::new() },
+                        if view.repo.is_worktree() {
+                            view.repo.name.clone()
+                        } else {
+                            branch
+                        },
+                        if changes > 0 {
+                            format!("{changes} changed")
+                        } else {
+                            String::new()
+                        },
                         None,
                         GitAction::SelectRepo(view.repo.path.clone()),
                     ));
@@ -2262,23 +2508,49 @@ fn step_label(step: &str) -> &'static str {
 
 /// Title, placeholder, whether Enter takes typed text, and a starting value.
 fn quick_prompt(ask: &Ask, browser: &Browser) -> (String, String, bool, String) {
-    let text = |title: &str, placeholder: &str, value: String| (title.to_string(), placeholder.to_string(), true, value);
-    let pick = |title: &str, placeholder: &str| (title.to_string(), placeholder.to_string(), false, String::new());
+    let text = |title: &str, placeholder: &str, value: String| {
+        (title.to_string(), placeholder.to_string(), true, value)
+    };
+    let pick = |title: &str, placeholder: &str| {
+        (
+            title.to_string(),
+            placeholder.to_string(),
+            false,
+            String::new(),
+        )
+    };
     match ask {
         Ask::Checkout => pick("Switch branch", "Select a branch or tag to check out"),
-        Ask::NewBranch(Some(from)) => text(&format!("New branch from {from}"), "Branch name", String::new()),
+        Ask::NewBranch(Some(from)) => text(
+            &format!("New branch from {from}"),
+            "Branch name",
+            String::new(),
+        ),
         Ask::NewBranch(None) => text("New branch", "Branch name", String::new()),
-        Ask::NewBranchFrom => pick("Create branch from…", "Select a ref to start the branch from"),
-        Ask::Detached => pick("Checkout detached", "Select a ref to check out without a branch"),
+        Ask::NewBranchFrom => pick(
+            "Create branch from…",
+            "Select a ref to start the branch from",
+        ),
+        Ask::Detached => pick(
+            "Checkout detached",
+            "Select a ref to check out without a branch",
+        ),
         Ask::Merge => pick("Merge into the current branch", "Select a branch to merge"),
-        Ask::Rebase => pick("Rebase the current branch", "Select a branch to rebase onto"),
+        Ask::Rebase => pick(
+            "Rebase the current branch",
+            "Select a branch to rebase onto",
+        ),
         Ask::RenameBranch => pick("Rename branch", "Select a branch to rename"),
         Ask::RenameTo(old) => text(&format!("Rename {old}"), "New branch name", old.clone()),
         Ask::DeleteBranch => pick("Delete branch", "Select a branch to delete"),
         Ask::DeleteRemoteBranch => pick("Delete remote branch", "Select a remote branch to delete"),
         Ask::Publish => pick("Publish branch", "Select a remote to publish to"),
         Ask::AddRemote => text("Add remote", "Remote name, such as origin", String::new()),
-        Ask::RemoteUrl(name) => text(&format!("URL of {name}"), "https://… or git@…", String::new()),
+        Ask::RemoteUrl(name) => text(
+            &format!("URL of {name}"),
+            "https://… or git@…",
+            String::new(),
+        ),
         Ask::RemoveRemote => pick("Remove remote", "Select a remote"),
         Ask::StashMessage { .. } => text("Stash", "Message (optional)", String::new()),
         Ask::Stash(action) => pick(
@@ -2290,9 +2562,16 @@ fn quick_prompt(ask: &Ask, browser: &Browser) -> (String, String, bool, String) 
             "Select a stash",
         ),
         Ask::CreateTag(_) => text("Create tag", "Tag name", String::new()),
-        Ask::TagMessage(name, _) => text(&format!("Message for {name}"), "Message (optional; empty makes a lightweight tag)", String::new()),
+        Ask::TagMessage(name, _) => text(
+            &format!("Message for {name}"),
+            "Message (optional; empty makes a lightweight tag)",
+            String::new(),
+        ),
         Ask::DeleteTag => pick("Delete tag", "Select a tag"),
-        Ask::Worktree => pick("Create worktree", "Select the branch the worktree checks out"),
+        Ask::Worktree => pick(
+            "Create worktree",
+            "Select the branch the worktree checks out",
+        ),
         Ask::WorktreeNewBranch => text("New branch for the worktree", "Branch name", String::new()),
         Ask::WorktreePath { branch, .. } => {
             let repo = browser.git.selected.clone().unwrap_or_default();
@@ -2309,7 +2588,10 @@ fn quick_prompt(ask: &Ask, browser: &Browser) -> (String, String, bool, String) 
         }
         Ask::RemoveWorktree => pick("Remove worktree", "Select a worktree"),
         Ask::OpenWorktree => pick("Open worktree", "Select a worktree to open in a new tab"),
-        Ask::Reset(target) => pick(&format!("Reset to {}", short(target)), "Select how to reset"),
+        Ask::Reset(target) => pick(
+            &format!("Reset to {}", short(target)),
+            "Select how to reset",
+        ),
         Ask::SelectRepo => pick("Repository", "Select a repository"),
     }
 }

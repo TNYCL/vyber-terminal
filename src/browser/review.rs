@@ -263,7 +263,10 @@ impl Browser {
 
     /// Folder the review's Git sources read from.
     pub(super) fn review_root(&self) -> PathBuf {
-        self.review.repo.clone().unwrap_or_else(|| self.root.clone())
+        self.review
+            .repo
+            .clone()
+            .unwrap_or_else(|| self.root.clone())
     }
 
     fn shown_task(&self) -> Option<&TaskReview> {
@@ -479,7 +482,10 @@ impl Browser {
                         return;
                     }
                 };
-                if sender.send(Message::ReviewDiffs(generation, diffs)).is_err() {
+                if sender
+                    .send(Message::ReviewDiffs(generation, diffs))
+                    .is_err()
+                {
                     return;
                 }
                 start = end;
@@ -604,7 +610,10 @@ impl Browser {
             };
             let lines = &diff.lines;
             let split = review.split && file.change.letter == 'M';
-            let comment = review.comment.filter(|(f, _)| *f == i).map(|(_, line)| line);
+            let comment = review
+                .comment
+                .filter(|(f, _)| *f == i)
+                .map(|(_, line)| line);
             let mut visible = vec![review.all_lines; lines.len()];
             if !review.all_lines {
                 for (j, line) in lines.iter().enumerate() {
@@ -665,7 +674,11 @@ impl Browser {
         self.update_matches(cx);
         if let Some(path) = self.review.reveal_path.clone()
             && let Some(file) = self.review.files.iter().position(|f| f.change.path == path)
-            && let Some(row) = self.review.rows.iter().position(|r| *r == Row::Header(file))
+            && let Some(row) = self
+                .review
+                .rows
+                .iter()
+                .position(|r| *r == Row::Header(file))
         {
             self.review.reveal_path = None;
             self.review.list.scroll_to(ListOffset {
@@ -694,7 +707,13 @@ impl Browser {
     }
 
     fn update_matches(&mut self, cx: &App) {
-        let query = self.review.find.read(cx).value().trim().to_ascii_lowercase();
+        let query = self
+            .review
+            .find
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
         let matches = if query.is_empty() {
             vec![]
         } else {
@@ -777,7 +796,12 @@ impl Browser {
     }
 
     fn reveal_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        if let Some(row) = self.review.rows.iter().position(|r| *r == Row::Header(file)) {
+        if let Some(row) = self
+            .review
+            .rows
+            .iter()
+            .position(|r| *r == Row::Header(file))
+        {
             self.review.list.scroll_to(ListOffset {
                 item_ix: row,
                 offset_in_item: px(0.),
@@ -818,7 +842,13 @@ impl Browser {
 
     // ---- Comments -------------------------------------------------------------
 
-    fn open_comment(&mut self, file: usize, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_comment(
+        &mut self,
+        file: usize,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.review.comment = Some((file, line));
         self.review.rows_dirty = true;
         self.review
@@ -838,7 +868,13 @@ impl Browser {
         let Some((file, index)) = self.review.comment else {
             return;
         };
-        let text = self.review.comment_input.read(cx).value().trim().to_string();
+        let text = self
+            .review
+            .comment_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -879,7 +915,11 @@ impl Browser {
         true
     }
 
-    fn run_revert(&mut self, done: String, work: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
+    fn run_revert(
+        &mut self,
+        done: String,
+        work: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) {
         let sender = self.sender.clone();
         std::thread::spawn(move || {
             let _ = sender.send(Message::Reverted(match work() {
@@ -899,23 +939,36 @@ impl Browser {
         };
         let task = self.shown_task().cloned();
         let root = self.review.root.clone();
-        let name = file.change.path.rsplit('/').next().unwrap_or_default().to_string();
-        self.run_revert(format!("Reverted {name} · recovery copy saved"), move || {
-            if let Some(task) = task {
-                let before = task.before.ok_or_else(|| anyhow::anyhow!("No start snapshot"))?;
-                let after = task.after.ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
-                return before.restore_file(&after, &file.change.path);
-            }
-            let diff = file
-                .diff
-                .ok_or_else(|| anyhow::anyhow!("Wait until the file has loaded"))?;
-            changeset::restore(&[Restore {
-                root,
-                path: file.change.path.clone(),
-                expected: diff.after.clone(),
-                target: diff.before.clone(),
-            }])
-        });
+        let name = file
+            .change
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        self.run_revert(
+            format!("Reverted {name} · recovery copy saved"),
+            move || {
+                if let Some(task) = task {
+                    let before = task
+                        .before
+                        .ok_or_else(|| anyhow::anyhow!("No start snapshot"))?;
+                    let after = task
+                        .after
+                        .ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
+                    return before.restore_file(&after, &file.change.path);
+                }
+                let diff = file
+                    .diff
+                    .ok_or_else(|| anyhow::anyhow!("Wait until the file has loaded"))?;
+                changeset::restore(&[Restore {
+                    root,
+                    path: file.change.path.clone(),
+                    expected: diff.after.clone(),
+                    target: diff.before.clone(),
+                }])
+            },
+        );
         cx.notify();
     }
 
@@ -974,8 +1027,12 @@ impl Browser {
         let done = format!("Reverted {count} files · recovery copies saved");
         if let Some(task) = self.shown_task().cloned() {
             self.run_revert(done, move || {
-                let before = task.before.ok_or_else(|| anyhow::anyhow!("No start snapshot"))?;
-                let after = task.after.ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
+                let before = task
+                    .before
+                    .ok_or_else(|| anyhow::anyhow!("No start snapshot"))?;
+                let after = task
+                    .after
+                    .ok_or_else(|| anyhow::anyhow!("No end snapshot"))?;
                 before.restore_task(&after)
             });
         } else {
@@ -1014,7 +1071,11 @@ impl Browser {
             return;
         };
         let root = self.review.root.clone();
-        let done = if stage { "Change staged" } else { "Change unstaged" };
+        let done = if stage {
+            "Change staged"
+        } else {
+            "Change unstaged"
+        };
         self.run_revert(done.into(), move || {
             let (top, path) = changeset::repository_path(&root, &file.change.path)?;
             let before = diff.before.bytes().unwrap_or_default();
@@ -1036,7 +1097,13 @@ impl Browser {
             return;
         };
         let root = self.review.root.clone();
-        let name = file.change.path.rsplit('/').next().unwrap_or_default().to_string();
+        let name = file
+            .change
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let done = format!("{} {name}", if stage { "Staged" } else { "Unstaged" });
         self.run_revert(done, move || {
             let (top, path) = changeset::repository_path(&root, &file.change.path)?;
@@ -1119,24 +1186,20 @@ impl Browser {
             Some(Source::Turn(id)) => {
                 let task = self.tasks.iter().find(|t| &t.id == id);
                 let detail = task.map(|t| t.label.clone()).unwrap_or_default();
-                let label = if self.review.follow_last
-                    && self.latest_turn().is_some_and(|t| &t.id == id)
-                {
-                    "Last Turn".to_string()
-                } else if task.is_some_and(|t| t.agent == "Manual") {
-                    "Checkpoint".to_string()
-                } else {
-                    "Turn".to_string()
-                };
+                let label =
+                    if self.review.follow_last && self.latest_turn().is_some_and(|t| &t.id == id) {
+                        "Last Turn".to_string()
+                    } else if task.is_some_and(|t| t.agent == "Manual") {
+                        "Checkpoint".to_string()
+                    } else {
+                        "Turn".to_string()
+                    };
                 (label, detail)
             }
             Some(Source::Uncommitted) => ("Uncommitted".into(), "vs HEAD".into()),
             Some(Source::Unstaged) => ("Unstaged".into(), "vs index".into()),
             Some(Source::Staged) => ("Staged".into(), "vs HEAD".into()),
-            Some(Source::Commit { hash, title }) => (
-                hash.chars().take(7).collect(),
-                title.clone(),
-            ),
+            Some(Source::Commit { hash, title }) => (hash.chars().take(7).collect(), title.clone()),
             Some(Source::Branch) => (
                 "Branch".into(),
                 if base.is_empty() {
@@ -1286,35 +1349,46 @@ impl Browser {
                     .border_1()
                     .border_color(rgb(BORDER))
                     .child(
-                        tool("review-more", "ellipsis", "More actions", self.menu == Some(Menu::More))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_menu(Menu::More);
-                                this.review.confirm_revert = None;
-                                cx.notify();
-                            })),
+                        tool(
+                            "review-more",
+                            "ellipsis",
+                            "More actions",
+                            self.menu == Some(Menu::More),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_menu(Menu::More);
+                            this.review.confirm_revert = None;
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        tool("review-find", "text-search", "Find in diff  (Ctrl+F)", find_open).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                if !this.review.find_open {
-                                    this.open_find(window, cx);
-                                } else {
-                                    this.review.find_open = false;
-                                    this.review
-                                        .find
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
-                                    this.review.matches.clear();
-                                }
-                                cx.notify();
+                        tool(
+                            "review-find",
+                            "text-search",
+                            "Find in diff  (Ctrl+F)",
+                            find_open,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if !this.review.find_open {
+                                this.open_find(window, cx);
+                            } else {
+                                this.review.find_open = false;
+                                this.review
+                                    .find
+                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                                this.review.matches.clear();
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        tool("review-refresh", "refresh-cw", "Refresh", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.review.pending.get_or_insert(false);
+                                this.review_tick(cx);
                             }),
                         ),
                     )
-                    .child(tool("review-refresh", "refresh-cw", "Refresh", false).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.review.pending.get_or_insert(false);
-                            this.review_tick(cx);
-                        }),
-                    ))
                     .child(
                         tool("review-prev", "arrow-up", "Previous change", false)
                             .on_click(cx.listener(|this, _, _, cx| this.jump_change(false, cx))),
@@ -1326,7 +1400,11 @@ impl Browser {
                     .child(
                         tool(
                             "review-context",
-                            if all_lines { "fold-vertical" } else { "unfold-vertical" },
+                            if all_lines {
+                                "fold-vertical"
+                            } else {
+                                "unfold-vertical"
+                            },
                             if all_lines {
                                 "Fold unchanged lines"
                             } else {
@@ -1357,7 +1435,11 @@ impl Browser {
                         tool(
                             "review-wrap",
                             "wrap-text",
-                            if wrap { "Don't wrap long lines" } else { "Wrap long lines" },
+                            if wrap {
+                                "Don't wrap long lines"
+                            } else {
+                                "Wrap long lines"
+                            },
                             wrap,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1398,7 +1480,11 @@ impl Browser {
                 .text_size(rpx(11.5))
                 .text_color(rgb(color))
                 .child(icon(
-                    ui(if color == WARNING { "triangle-alert" } else { "circle-dot" }),
+                    ui(if color == WARNING {
+                        "triangle-alert"
+                    } else {
+                        "circle-dot"
+                    }),
                     color,
                     13.,
                 ))
@@ -1453,7 +1539,12 @@ impl Browser {
         let body = if self.review.files.is_empty() {
             self.empty_review()
         } else if self.review.rows.is_empty() {
-            empty_state("search", "No files match", "Change the filter to see more files", None)
+            empty_state(
+                "search",
+                "No files match",
+                "Change the filter to see more files",
+                None,
+            )
         } else {
             self.review_list(cx)
         };
@@ -1474,20 +1565,22 @@ impl Browser {
             .children(card)
             .child(div().flex_1().min_h_0().child(body))
             .when(self.menu == Some(Menu::Source), |s| {
-                s.child(menu_in("review-source-in", self.source_menu(cx).into_any_element()))
+                s.child(menu_in(
+                    "review-source-in",
+                    self.source_menu(cx).into_any_element(),
+                ))
             })
             .when(self.menu == Some(Menu::More), |s| {
-                s.child(menu_in("review-more-in", self.more_menu(cx).into_any_element()))
+                s.child(menu_in(
+                    "review-more-in",
+                    self.more_menu(cx).into_any_element(),
+                ))
             })
             .into_any_element()
     }
 
     fn review_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let editable = self
-            .review
-            .source
-            .as_ref()
-            .is_some_and(Source::editable);
+        let editable = self.review.source.as_ref().is_some_and(Source::editable);
         let (stage_files, stage_hunks) = match self.review.source {
             Some(Source::Unstaged) => (Some(true), Some(true)),
             Some(Source::Uncommitted) => (Some(true), None),
@@ -1504,7 +1597,12 @@ impl Browser {
             stage_files,
             stage_hunks,
             query: if self.review.find_open {
-                self.review.find.read(cx).value().trim().to_ascii_lowercase()
+                self.review
+                    .find
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_ascii_lowercase()
             } else {
                 String::new()
             },
@@ -1523,49 +1621,54 @@ impl Browser {
         let latest = self.latest_turn().cloned();
         let turn_count = self.tasks.len();
         let is = |s: &Source| source.as_ref() == Some(s);
-        let last_checked = follow && latest.as_ref().is_some_and(|t| is(&Source::Turn(t.id.clone())));
+        let last_checked = follow
+            && latest
+                .as_ref()
+                .is_some_and(|t| is(&Source::Turn(t.id.clone())));
         // Agent turns belong to the terminal, not to a repository of the Git view.
         let turns = !self.review.git;
         let mut menu = menu_panel("review-source-menu").w(rpx(250.));
         if turns {
-        menu = menu.child(
-            menu_item(
-                "source-last",
-                "Last Turn",
-                Some(
-                    latest
-                        .as_ref()
-                        .map(|t| t.label.clone())
-                        .unwrap_or_else(|| "No agent turns yet".into()),
-                ),
-                last_checked,
-                latest.is_some(),
-                false,
-            )
-            .when_some(latest.map(|t| t.id), |s, id| {
-                s.on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_source(Source::Turn(id.clone()), true, cx)
-                }))
-            }),
-        );
-        if turn_count > 1 {
             menu = menu.child(
                 menu_item(
-                    "source-turns",
-                    "Earlier turns",
-                    None,
-                    !last_checked && matches!(source, Some(Source::Turn(_))),
-                    true,
-                    true,
+                    "source-last",
+                    "Last Turn",
+                    Some(
+                        latest
+                            .as_ref()
+                            .map(|t| t.label.clone())
+                            .unwrap_or_else(|| "No agent turns yet".into()),
+                    ),
+                    last_checked,
+                    latest.is_some(),
+                    false,
                 )
-                .when(self.review.submenu == Some(Submenu::Turns), |s| s.bg(rgb(HOVER)))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.review.submenu = Some(Submenu::Turns);
-                    cx.notify();
-                })),
+                .when_some(latest.map(|t| t.id), |s, id| {
+                    s.on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_source(Source::Turn(id.clone()), true, cx)
+                    }))
+                }),
             );
-        }
-        menu = menu.child(separator());
+            if turn_count > 1 {
+                menu = menu.child(
+                    menu_item(
+                        "source-turns",
+                        "Earlier turns",
+                        None,
+                        !last_checked && matches!(source, Some(Source::Turn(_))),
+                        true,
+                        true,
+                    )
+                    .when(self.review.submenu == Some(Submenu::Turns), |s| {
+                        s.bg(rgb(HOVER))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.review.submenu = Some(Submenu::Turns);
+                        cx.notify();
+                    })),
+                );
+            }
+            menu = menu.child(separator());
         }
         for (id, label, value) in [
             ("source-uncommitted", "Uncommitted", Source::Uncommitted),
@@ -1573,11 +1676,9 @@ impl Browser {
             ("source-staged", "Staged", Source::Staged),
         ] {
             let checked = is(&value);
-            menu = menu.child(
-                menu_item(id, label, None, checked, true, false).on_click(cx.listener(
-                    move |this, _, _, cx| this.set_source(value.clone(), false, cx),
-                )),
-            );
+            menu = menu.child(menu_item(id, label, None, checked, true, false).on_click(
+                cx.listener(move |this, _, _, cx| this.set_source(value.clone(), false, cx)),
+            ));
         }
         menu = menu
             .child(separator())
@@ -1590,7 +1691,9 @@ impl Browser {
                     true,
                     true,
                 )
-                .when(self.review.submenu == Some(Submenu::Commits), |s| s.bg(rgb(HOVER)))
+                .when(self.review.submenu == Some(Submenu::Commits), |s| {
+                    s.bg(rgb(HOVER))
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.review.submenu = Some(Submenu::Commits);
                     this.load_commits();
@@ -1652,7 +1755,11 @@ impl Browser {
             .map(|(i, task)| {
                 let id = task.id.clone();
                 let files = task.changes.len();
-                let time = task.before.as_ref().map(|b| b.created.clone()).unwrap_or_default();
+                let time = task
+                    .before
+                    .as_ref()
+                    .map(|b| b.created.clone())
+                    .unwrap_or_default();
                 let detail = format!(
                     "{time} · {files} {}{}",
                     if files == 1 { "file" } else { "files" },
@@ -1684,37 +1791,40 @@ impl Browser {
             Some(Source::Commit { hash, .. }) => Some(hash.clone()),
             _ => None,
         };
-        let body: Vec<AnyElement> = match &self.review.commits {
-            None => vec![menu_note("Reading commits…")],
-            Some(Err(e)) => vec![menu_note(if e.contains("does not have any commits") {
-                "No commits yet"
-            } else {
-                "Commits are unavailable here"
-            })],
-            Some(Ok(commits)) if commits.is_empty() => vec![menu_note("No commits touch this folder")],
-            Some(Ok(commits)) => commits
-                .iter()
-                .enumerate()
-                .map(|(i, commit)| {
-                    let source = Source::Commit {
-                        hash: commit.hash.clone(),
-                        title: commit.title.clone(),
-                    };
-                    menu_item(
-                        ("commit", i),
-                        commit.title.clone(),
-                        Some(format!("{} · {}", commit.short, commit.when)),
-                        shown.as_ref() == Some(&commit.hash),
-                        true,
-                        false,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_source(source.clone(), false, cx)
-                    }))
-                    .into_any_element()
-                })
-                .collect(),
-        };
+        let body: Vec<AnyElement> =
+            match &self.review.commits {
+                None => vec![menu_note("Reading commits…")],
+                Some(Err(e)) => vec![menu_note(if e.contains("does not have any commits") {
+                    "No commits yet"
+                } else {
+                    "Commits are unavailable here"
+                })],
+                Some(Ok(commits)) if commits.is_empty() => {
+                    vec![menu_note("No commits touch this folder")]
+                }
+                Some(Ok(commits)) => commits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, commit)| {
+                        let source = Source::Commit {
+                            hash: commit.hash.clone(),
+                            title: commit.title.clone(),
+                        };
+                        menu_item(
+                            ("commit", i),
+                            commit.title.clone(),
+                            Some(format!("{} · {}", commit.short, commit.when)),
+                            shown.as_ref() == Some(&commit.hash),
+                            true,
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_source(source.clone(), false, cx)
+                        }))
+                        .into_any_element()
+                    })
+                    .collect(),
+            };
         menu_panel("review-commits-menu")
             .w(rpx(330.))
             .max_h(rpx(420.))
@@ -1723,11 +1833,7 @@ impl Browser {
     }
 
     fn more_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editable = self
-            .review
-            .source
-            .as_ref()
-            .is_some_and(Source::editable);
+        let editable = self.review.source.as_ref().is_some_and(Source::editable);
         let count = self.review.files.len();
         let confirming = self.review.confirm_revert.is_some();
         let revert_label = if confirming {
@@ -1765,35 +1871,39 @@ impl Browser {
                         }),
                     )
                     .when(checkpoints, |s| s.child(separator()))
-                    .when(checkpoints, |s| s.child(
-                        menu_item(
-                            "more-checkpoint",
-                            "Take checkpoint",
-                            Some("Ctrl+Shift+K".into()),
-                            false,
-                            true,
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.menu = None;
-                            this.checkpoint(cx);
-                        })),
-                    ))
-                    .when(checkpoints, |s| s.child(
-                        menu_item(
-                            "more-since",
-                            "Review since checkpoint",
-                            (!has_checkpoint).then(|| "Take a checkpoint first".to_string()),
-                            false,
-                            has_checkpoint,
-                            false,
-                        )
-                        .when(has_checkpoint, |s| {
-                            s.on_click(
-                                cx.listener(|this, _, _, cx| this.review_since_checkpoint(cx)),
+                    .when(checkpoints, |s| {
+                        s.child(
+                            menu_item(
+                                "more-checkpoint",
+                                "Take checkpoint",
+                                Some("Ctrl+Shift+K".into()),
+                                false,
+                                true,
+                                false,
                             )
-                        }),
-                    )),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.menu = None;
+                                this.checkpoint(cx);
+                            })),
+                        )
+                    })
+                    .when(checkpoints, |s| {
+                        s.child(
+                            menu_item(
+                                "more-since",
+                                "Review since checkpoint",
+                                (!has_checkpoint).then(|| "Take a checkpoint first".to_string()),
+                                false,
+                                has_checkpoint,
+                                false,
+                            )
+                            .when(has_checkpoint, |s| {
+                                s.on_click(
+                                    cx.listener(|this, _, _, cx| this.review_since_checkpoint(cx)),
+                                )
+                            }),
+                        )
+                    }),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.dismiss_menu();
@@ -2002,11 +2112,27 @@ fn push_lines(
                 }
             }
             '+' => {
-                push(rows, Row::Pair { file, old: None, new: Some(k) }, [Some(k), None]);
+                push(
+                    rows,
+                    Row::Pair {
+                        file,
+                        old: None,
+                        new: Some(k),
+                    },
+                    [Some(k), None],
+                );
                 k += 1;
             }
             _ => {
-                push(rows, Row::Pair { file, old: Some(k), new: Some(k) }, [Some(k), None]);
+                push(
+                    rows,
+                    Row::Pair {
+                        file,
+                        old: Some(k),
+                        new: Some(k),
+                    },
+                    [Some(k), None],
+                );
                 k += 1;
             }
         }
@@ -2060,7 +2186,11 @@ fn header_row(ix: usize, index: usize, context: &RowContext) -> AnyElement {
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0x101010)))
         .child(icon(
-            ui(if collapsed { "chevron-right" } else { "chevron-down" }),
+            ui(if collapsed {
+                "chevron-right"
+            } else {
+                "chevron-down"
+            }),
             MUTED,
             14.,
         ))
@@ -2385,7 +2515,10 @@ fn hunk_button(ix: usize, file: usize, line: usize, context: &RowContext) -> Opt
         return None;
     }
     let diff = context.files[file].diff.as_ref()?;
-    let position = diff.hunks.partition_point(|h| h.lines.start <= line).checked_sub(1)?;
+    let position = diff
+        .hunks
+        .partition_point(|h| h.lines.start <= line)
+        .checked_sub(1)?;
     if !diff.hunks[position].lines.contains(&line) {
         return None;
     }
@@ -2406,9 +2539,8 @@ fn hunk_button(ix: usize, file: usize, line: usize, context: &RowContext) -> Opt
                     if stage { "plus" } else { "minus" },
                     if stage { "Stage" } else { "Unstage" },
                     move |cx| {
-                        stage_entity.update(cx, |view, cx| {
-                            view.stage_hunk(file, position, stage, cx)
-                        })
+                        stage_entity
+                            .update(cx, |view, cx| view.stage_hunk(file, position, stage, cx))
                     },
                 ))
             })
@@ -2446,7 +2578,9 @@ fn line_row(ix: usize, file: usize, index: usize, context: &RowContext) -> AnyEl
         .children(line_lead(line.kind, number))
         .child(code_text(line, context))
         .child(comment_button(ix, file, index, context))
-        .when(changed, |s| s.children(hunk_button(ix, file, index, context)))
+        .when(changed, |s| {
+            s.children(hunk_button(ix, file, index, context))
+        })
         .into_any_element()
 }
 
@@ -2596,7 +2730,11 @@ fn tree_row(
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(HOVER)))
                         .child(icon(
-                            ui(if *open { "chevron-down" } else { "chevron-right" }),
+                            ui(if *open {
+                                "chevron-down"
+                            } else {
+                                "chevron-right"
+                            }),
                             MUTED,
                             14.,
                         ))
@@ -2625,7 +2763,12 @@ fn tree_row(
         TreeRow::File { file, depth } => {
             let index = *file;
             let change = &files[index].change;
-            let name = change.path.rsplit('/').next().unwrap_or_default().to_string();
+            let name = change
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
             let (icon_path, color) = icons::file_icon(Path::new(&change.path));
             let active = current == Some(index);
             let deleted = change.letter == 'D';
@@ -2798,18 +2941,45 @@ mod tests {
 
     #[test]
     fn split_rows_pair_removed_and_added_lines() {
-        let lines = [line(' '), line('-'), line('-'), line('+'), line(' '), line('+')];
+        let lines = [
+            line(' '),
+            line('-'),
+            line('-'),
+            line('+'),
+            line(' '),
+            line('+'),
+        ];
         let mut rows = vec![];
         push_lines(&mut rows, 0, &lines, 0..lines.len(), true, Some(3));
         assert_eq!(
             rows,
             vec![
-                Row::Pair { file: 0, old: Some(0), new: Some(0) },
-                Row::Pair { file: 0, old: Some(1), new: Some(3) },
+                Row::Pair {
+                    file: 0,
+                    old: Some(0),
+                    new: Some(0)
+                },
+                Row::Pair {
+                    file: 0,
+                    old: Some(1),
+                    new: Some(3)
+                },
                 Row::Comment { file: 0, line: 3 },
-                Row::Pair { file: 0, old: Some(2), new: None },
-                Row::Pair { file: 0, old: Some(4), new: Some(4) },
-                Row::Pair { file: 0, old: None, new: Some(5) },
+                Row::Pair {
+                    file: 0,
+                    old: Some(2),
+                    new: None
+                },
+                Row::Pair {
+                    file: 0,
+                    old: Some(4),
+                    new: Some(4)
+                },
+                Row::Pair {
+                    file: 0,
+                    old: None,
+                    new: Some(5)
+                },
             ]
         );
     }

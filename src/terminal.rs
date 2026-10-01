@@ -136,7 +136,7 @@ pub struct Terminal {
     search_visible: bool,
     search_origin: Option<TermPoint>,
     search_subscription: Option<Subscription>,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     _shell_integration: Option<tempfile::TempDir>,
 }
 pub struct Backend {
@@ -147,7 +147,7 @@ pub struct Backend {
     program: String,
     shell: Option<u32>,
     process: crate::processes::TerminalProcess,
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     shell_integration: Option<tempfile::TempDir>,
 }
 impl Drop for Terminal {
@@ -185,10 +185,10 @@ impl Terminal {
         let program = shell
             .map(str::to_owned)
             .unwrap_or_else(crate::platform::default_shell);
-        let is_windows_bash = cfg!(windows)
-            && Path::new(&program)
-                .file_stem()
-                .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("bash"));
+        let is_bash = Path::new(&program)
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("bash"));
+        let is_windows_bash = cfg!(windows) && is_bash;
         let args = if program.to_lowercase().contains("powershell")
             || program.to_lowercase().contains("pwsh")
         {
@@ -229,7 +229,15 @@ impl Terminal {
                 ),
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
+        if is_bash {
+            let inherited = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+            env.insert(
+                "PROMPT_COMMAND".into(),
+                format!("{inherited}\n__vyber_status=$?; printf '\\033]0;__VYBER_CWD__%s\\007' \"$PWD\"; (exit \"$__vyber_status\")"),
+            );
+        }
+        #[cfg(unix)]
         let shell_integration = if Path::new(&program)
             .file_stem()
             .is_some_and(|name| name == "zsh")
@@ -241,6 +249,10 @@ impl Terminal {
         } else {
             None
         };
+        #[allow(
+            clippy::needless_update,
+            reason = "Unix PTY options have additional fields."
+        )]
         let options = tty::Options {
             shell: Some(tty::Shell::new(program.clone(), args)),
             working_directory: Some(root.to_owned()),
@@ -280,7 +292,7 @@ impl Terminal {
             program,
             shell,
             process,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             shell_integration,
         })
     }
@@ -293,7 +305,7 @@ impl Terminal {
             program,
             shell,
             process,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             shell_integration,
         } = backend;
         let config = cx.global::<crate::config::Config>();
@@ -354,7 +366,7 @@ impl Terminal {
             search_visible: false,
             search_origin: None,
             search_subscription: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             _shell_integration: shell_integration,
         }
     }
@@ -425,12 +437,12 @@ impl Terminal {
                 cx.open_url(uri);
                 return true;
             }
-            if let Ok(url) = url::Url::parse(uri) {
-                if let Ok(path) = url.to_file_path() {
-                    drop(term);
-                    self.open_path = Some((path, 1));
-                    return true;
-                }
+            if let Ok(url) = url::Url::parse(uri)
+                && let Ok(path) = url.to_file_path()
+            {
+                drop(term);
+                self.open_path = Some((path, 1));
+                return true;
             }
         }
         let mut start = p.column.0;
@@ -738,8 +750,10 @@ impl Terminal {
         let mut font = font(self.font_family.clone());
         font.fallbacks = Some(FontFallbacks::from_fonts(if cfg!(windows) {
             vec!["Segoe UI Symbol".into(), "Segoe UI Emoji".into()]
-        } else {
+        } else if cfg!(target_os = "macos") {
             vec!["Apple Symbols".into(), "Apple Color Emoji".into()]
+        } else {
+            vec!["DejaVu Sans".into(), "Noto Color Emoji".into()]
         }));
         let font_id = window.text_system().resolve_font(&font);
         if let Ok(advance) = window
@@ -1327,10 +1341,10 @@ pub fn key_bytes(
                 }
             }
         };
-        if let Some(code) = code {
-            if modified || key == "escape" || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
-                return Some(format!("\x1b[{code};{modifier}u").into_bytes());
-            }
+        if let Some(code) = code
+            && (modified || key == "escape" || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+        {
+            return Some(format!("\x1b[{code};{modifier}u").into_bytes());
         }
     }
 
@@ -1411,10 +1425,11 @@ pub fn key_bytes(
                     return Some(vec![0]);
                 }
             }
-            if alt && !ctrl {
-                if let Some(text) = text {
-                    return Some(format!("\x1b{text}").into_bytes());
-                }
+            if alt
+                && !ctrl
+                && let Some(text) = text
+            {
+                return Some(format!("\x1b{text}").into_bytes());
             }
             return None;
         }
@@ -1424,16 +1439,16 @@ pub fn key_bytes(
 pub fn local_link(text: &str, root: &Path) -> Option<(PathBuf, usize)> {
     let mut path = text;
     let mut line = 1;
-    if let Some((p, n)) = path.rsplit_once(':') {
-        if let Ok(value) = n.parse::<usize>() {
+    if let Some((p, n)) = path.rsplit_once(':')
+        && let Ok(value) = n.parse::<usize>()
+    {
+        path = p;
+        line = value;
+        if let Some((p, n)) = path.rsplit_once(':')
+            && let Ok(value) = n.parse::<usize>()
+        {
             path = p;
             line = value;
-            if let Some((p, n)) = path.rsplit_once(':') {
-                if let Ok(value) = n.parse::<usize>() {
-                    path = p;
-                    line = value;
-                }
-            }
         }
     }
     let path = PathBuf::from(path);
@@ -1825,6 +1840,49 @@ mod tests {
         assert!(
             output.contains("VYBER_PROBE_OK"),
             "ConPTY output not parsed: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn real_unix_pty_roundtrip_and_shutdown() -> anyhow::Result<()> {
+        use super::{Event, Msg, Terminal};
+        let root = tempfile::tempdir()?;
+        let backend = Terminal::prepare(9000, root.path(), Some("/bin/sh"))?;
+        backend.sender.send(Msg::Input(
+            b"printf 'VYBER_%s\\n' PROBE_OK; exit\r".to_vec().into(),
+        ))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut exited = false;
+        let mut output = String::new();
+        while std::time::Instant::now() < deadline {
+            for event in backend.events.try_iter() {
+                match event {
+                    Event::ChildExit(_) | Event::Exit => exited = true,
+                    Event::PtyWrite(text) => {
+                        let _ = backend.sender.send(Msg::Input(text.into_bytes().into()));
+                    }
+                    _ => {}
+                }
+            }
+            output = backend
+                .term
+                .lock()
+                .renderable_content()
+                .display_iter
+                .map(|c| c.c)
+                .collect();
+            if exited && output.contains("VYBER_PROBE_OK") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let _ = backend.sender.send(Msg::Shutdown);
+        assert!(exited, "Unix PTY child did not exit");
+        assert!(
+            output.contains("VYBER_PROBE_OK"),
+            "Unix PTY output not parsed: {output}"
         );
         Ok(())
     }

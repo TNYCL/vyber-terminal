@@ -112,7 +112,7 @@ fn rects(c: char, cell: [i32; 4], light: i32) -> Option<Vec<Rect>> {
             dashes(
                 &mut out,
                 cell,
-                (i / 2) % 2 == 0,
+                (i / 2).is_multiple_of(2),
                 if i < 4 { 3 } else { 4 },
                 light * (1 + (i % 2) as i32),
             );
@@ -427,7 +427,7 @@ fn path(c: char, [x0, y0, x1, y1]: [i32; 4], light: i32, scale: f32) -> Option<P
             path
         }
         0xE0B4..=0xE0B7 => {
-            let filled = code % 2 == 0;
+            let filled = code.is_multiple_of(2);
             let inset = if filled { 0. } else { line / 2. };
             let (base, dir) = if code <= 0xE0B5 { (l, 1.) } else { (r, -1.) };
             let (rx, ry) = (r - l - inset, (b - t) / 2.);

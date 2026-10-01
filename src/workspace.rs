@@ -49,9 +49,17 @@ thread_local! {
     static TEST_DATA_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Used by macOS interaction tests.")
+)]
 pub struct TestDataDir(Option<PathBuf>);
 #[cfg(test)]
 impl TestDataDir {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "Used by macOS interaction tests.")
+    )]
     pub fn set(path: PathBuf) -> Self {
         Self(TEST_DATA_DIR.with(|value| value.replace(Some(path))))
     }
@@ -691,7 +699,9 @@ impl Checkpoint {
             .map(|out| parse_numstat(&out.stdout))
             .unwrap_or_default();
         Ok(parts
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| {
                 let path: String = String::from_utf8_lossy(p[1]).into();
                 let (additions, deletions) = stats.get(&path).copied().unwrap_or_default();
@@ -912,7 +922,8 @@ fn repository_entries(root: &Path, folder: &str) -> Result<Vec<(String, String)>
 /// Snapshot entries (mode, path under `root`) for the tracked and untracked,
 /// not ignored, regular files of the repository at `root/folder`, and the
 /// folders under `root` of the repositories embedded in it.
-fn nested_entries(root: &Path, folder: &str) -> Result<(Vec<(String, String)>, Vec<String>)> {
+type NestedEntries = (Vec<(String, String)>, Vec<String>);
+fn nested_entries(root: &Path, folder: &str) -> Result<NestedEntries> {
     let dir = root.join(folder);
     let is_file = |relative: &str| {
         fs::symlink_metadata(dir.join(relative)).is_ok_and(|m| m.file_type().is_file())

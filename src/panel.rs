@@ -121,8 +121,10 @@ impl Element for WorkspaceBody {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let mut style = Style::default();
-        style.size = size(relative(1.).into(), relative(1.).into());
+        let style = Style {
+            size: size(relative(1.).into(), relative(1.).into()),
+            ..Default::default()
+        };
         (window.request_layout(style, None, cx), ())
     }
 
@@ -154,17 +156,17 @@ impl Element for WorkspaceBody {
             .h(bounds.size.height)
             .overflow_hidden()
             .bg(rgb(0x000000));
-        if let Some(terminal) = self.terminal.take() {
-            if geometry.terminal > 0. {
-                body = body.child(
-                    div()
-                        .w(px(geometry.terminal))
-                        .h_full()
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .child(terminal),
-                );
-            }
+        if let Some(terminal) = self.terminal.take()
+            && geometry.terminal > 0.
+        {
+            body = body.child(
+                div()
+                    .w(px(geometry.terminal))
+                    .h_full()
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(terminal),
+            );
         }
         if let Some(browser) = self.browser.take().filter(|_| self.shown > 0.001) {
             let resize_browser = browser.clone();

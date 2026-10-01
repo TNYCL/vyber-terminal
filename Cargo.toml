@@ -1,6 +1,6 @@
 [package]
 name = "vyber-terminal"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 description = "A native terminal workspace with files, previews, and review."
 license = "MIT OR Apache-2.0"
@@ -37,6 +37,9 @@ windows = { version = "0.61.3", features = ["Data_Xml_Dom", "UI_Notifications", 
 
 [build-dependencies]
 embed-resource = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"
 
 [dev-dependencies]
 gpui-kit = { version = "=0.7.0", features = ["test-support"] }

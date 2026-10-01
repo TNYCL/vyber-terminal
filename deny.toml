@@ -1,0 +1,31 @@
+[graph]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# Published vulnerability advisories fail. Unmaintained dependencies remain visible.
+unmaintained = "all"
+ignore = [
+    { id = "RUSTSEC-2024-0384", reason = "instant is inherited through pinned GPUI Kit 0.7.0; maintenance-only advisory, replace on upstream upgrade." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is inherited through pinned GPUI 0.3.7; maintenance-only advisory, replace on upstream upgrade." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz is inherited through pinned GPUI; maintenance-only advisory, reviewed for this preview." },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is inherited through pinned GPUI; maintenance-only advisory, reviewed for this preview." },
+]
+
+[licenses]
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause",
+    "BSD-3-Clause", "ISC", "0BSD", "Zlib", "CC0-1.0", "Unlicense",
+    "Unicode-3.0", "Unicode-DFS-2016", "BSL-1.0", "MPL-2.0", "bzip2-1.0.6",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

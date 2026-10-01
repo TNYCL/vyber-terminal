@@ -6,13 +6,13 @@ use crate::{
     workspace,
 };
 use gpui::{prelude::*, *};
-use std::time::Duration;
 use gpui_kit::component::{
     Sizable,
     input::{Input, InputEvent, InputState},
     tooltip::Tooltip,
 };
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // Colors sampled from the Codex dialog.
 const CARD: u32 = 0x2a2a2a;
@@ -59,13 +59,17 @@ impl ProjectDialog {
                         .is_some_and(|f| crate::git::same_path(f, &primary))
                 });
                 match codex {
-                    Some(p) => (None, p.name, p.folders, Some("Folders from your Codex project".into())),
+                    Some(p) => (
+                        None,
+                        p.name,
+                        p.folders,
+                        Some("Folders from your Codex project".into()),
+                    ),
                     None => {
                         let mut folders = vec![primary.clone()];
                         folders.extend(project::discover(&primary));
-                        let source = (folders.len() > 1).then(|| {
-                            format!("{} repositories found inside", folders.len() - 1)
-                        });
+                        let source = (folders.len() > 1)
+                            .then(|| format!("{} repositories found inside", folders.len() - 1));
                         (None, project::folder_name(&primary), folders, source)
                     }
                 }
@@ -79,7 +83,11 @@ impl ProjectDialog {
                 .default_value(name)
         });
         input.update(cx, |input, cx| {
-            input.set_cursor_position(gpui_kit::component::input::Position::new(0, end), window, cx)
+            input.set_cursor_position(
+                gpui_kit::component::input::Position::new(0, end),
+                window,
+                cx,
+            )
         });
         let subscription = cx.subscribe_in(&input, window, |this, _, event, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -186,7 +194,11 @@ impl ProjectDialog {
             .pr(px(12.))
             .when(index > 0, |s| s.border_t_1().border_color(rgb(LINE)))
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .child(icon(ui(if repository { "folder-git-2" } else { "folder" }), 0xb0b0b0, 16.))
+            .child(icon(
+                ui(if repository { "folder-git-2" } else { "folder" }),
+                0xb0b0b0,
+                16.,
+            ))
             .child(
                 div()
                     .flex_1()

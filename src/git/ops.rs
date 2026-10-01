@@ -131,7 +131,10 @@ fn describe(args: &[&str], paths: usize) -> String {
         }
     }
     if paths > 0 {
-        text.push_str(&format!(" ({paths} {})", if paths == 1 { "path" } else { "paths" }));
+        text.push_str(&format!(
+            " ({paths} {})",
+            if paths == 1 { "path" } else { "paths" }
+        ));
     }
     text
 }
@@ -186,14 +189,17 @@ fn git(repo: &Path, args: &[&str], access: Access, input: Option<&[u8]>, paths: 
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let combined = format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string();
+    let combined = format!("{}\n{}", stdout.trim(), stderr.trim())
+        .trim()
+        .to_string();
     record(repo, described, out.status.success(), &combined);
     if out.status.success() {
         Ok(stdout)
     } else {
         let lower = combined.to_lowercase();
         Err(Failure {
-            auth: matches!(access, Access::Network(_)) && AUTH_HINTS.iter().any(|h| lower.contains(h)),
+            auth: matches!(access, Access::Network(_))
+                && AUTH_HINTS.iter().any(|h| lower.contains(h)),
             // Conflict reports go to standard output, errors to standard error.
             message: combined,
         })
@@ -267,7 +273,12 @@ pub fn discard(repo: &Path, tracked: &[String], untracked: &[String]) -> Outcome
         if full.is_file() {
             std::fs::remove_file(&full)?;
         }
-        record(repo, format!("delete {path}"), true, "untracked file removed; recovery copy kept");
+        record(
+            repo,
+            format!("delete {path}"),
+            true,
+            "untracked file removed; recovery copy kept",
+        );
     }
     Ok(String::new())
 }
@@ -287,11 +298,17 @@ pub fn take_side(repo: &Path, path: &str, ours: bool) -> Outcome {
 
 /// The index content of `path`, or `None` when the index has no such file.
 pub fn index_bytes(repo: &Path, path: &str) -> Outcome<Option<Vec<u8>>> {
-    let listed = super::read(repo, &["ls-files", "-s", "-z", "--", &format!(":(literal){path}")])?;
+    let listed = super::read(
+        repo,
+        &["ls-files", "-s", "-z", "--", &format!(":(literal){path}")],
+    )?;
     if listed.is_empty() {
         return Ok(None);
     }
-    Ok(Some(super::read(repo, &["cat-file", "blob", &format!(":{path}")])?))
+    Ok(Some(super::read(
+        repo,
+        &["cat-file", "blob", &format!(":{path}")],
+    )?))
 }
 
 /// Writes `bytes` as the staged content of `path`, if the index still holds
@@ -302,11 +319,19 @@ pub fn write_index(repo: &Path, path: &str, expected: Option<&[u8]>, bytes: &[u8
             "{path} changed in the index since this diff was read. Refresh and try again."
         )));
     }
-    let mode = super::read(repo, &["ls-files", "-s", "--", &format!(":(literal){path}")])
-        .ok()
-        .and_then(|out| String::from_utf8_lossy(&out).split(' ').next().map(str::to_owned))
-        .filter(|m| m.len() == 6)
-        .unwrap_or_else(|| "100644".into());
+    let mode = super::read(
+        repo,
+        &["ls-files", "-s", "--", &format!(":(literal){path}")],
+    )
+    .ok()
+    .and_then(|out| {
+        String::from_utf8_lossy(&out)
+            .split(' ')
+            .next()
+            .map(str::to_owned)
+    })
+    .filter(|m| m.len() == 6)
+    .unwrap_or_else(|| "100644".into());
     let path_arg = format!("--path={path}");
     let hash = git(
         repo,
@@ -336,7 +361,9 @@ fn message_file(message: &str) -> Outcome<PathBuf> {
 /// Commits the index. An empty message with `amend` keeps the last message.
 pub fn commit(repo: &Path, message: &str, amend: bool) -> Outcome {
     let message = message.trim();
-    let file = (!message.is_empty()).then(|| message_file(message)).transpose()?;
+    let file = (!message.is_empty())
+        .then(|| message_file(message))
+        .transpose()?;
     let file_arg = file.as_ref().map(|f| f.to_string_lossy().into_owned());
     let mut args = vec!["commit"];
     match &file_arg {
@@ -507,7 +534,13 @@ pub fn stash_clear(repo: &Path) -> Outcome {
 // ---- Remotes ------------------------------------------------------------------
 
 pub fn fetch(repo: &Path, interactive: bool) -> Outcome {
-    git(repo, &["fetch", "--all", "--prune"], Access::Network(interactive), None, 0)
+    git(
+        repo,
+        &["fetch", "--all", "--prune"],
+        Access::Network(interactive),
+        None,
+        0,
+    )
 }
 
 pub fn pull(repo: &Path, rebase: bool) -> Outcome {
@@ -532,11 +565,23 @@ pub fn push(repo: &Path, publish: Option<(&str, &str)>, force: bool) -> Outcome 
 }
 
 pub fn push_tags(repo: &Path, remote: &str) -> Outcome {
-    git(repo, &["push", remote, "--tags"], Access::Network(true), None, 0)
+    git(
+        repo,
+        &["push", remote, "--tags"],
+        Access::Network(true),
+        None,
+        0,
+    )
 }
 
 pub fn delete_remote_branch(repo: &Path, remote: &str, branch: &str) -> Outcome {
-    git(repo, &["push", remote, "--delete", branch], Access::Network(true), None, 0)
+    git(
+        repo,
+        &["push", remote, "--delete", branch],
+        Access::Network(true),
+        None,
+        0,
+    )
 }
 
 pub fn add_remote(repo: &Path, name: &str, url: &str) -> Outcome {
@@ -550,7 +595,13 @@ pub fn remove_remote(repo: &Path, name: &str) -> Outcome {
 // ---- Worktrees and repositories --------------------------------------------------
 
 /// Adds a worktree at `path` on a new branch (from `base`) or an existing one.
-pub fn add_worktree(repo: &Path, path: &Path, branch: &str, new: bool, base: Option<&str>) -> Outcome {
+pub fn add_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    new: bool,
+    base: Option<&str>,
+) -> Outcome {
     let path = path.to_string_lossy().into_owned();
     let mut args = vec!["worktree", "add"];
     if new {
@@ -587,9 +638,19 @@ pub fn init(path: &Path) -> Outcome {
 pub fn worktree_location(repo: &Path, branch: &str) -> PathBuf {
     let slug: String = branch
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    let name = format!("{}-{}", crate::project::folder_name(repo), slug.trim_matches('-'));
+    let name = format!(
+        "{}-{}",
+        crate::project::folder_name(repo),
+        slug.trim_matches('-')
+    );
     let base = crate::project::for_path(repo)
         .and_then(|p| p.primary().map(Path::to_path_buf))
         .unwrap_or_else(|| repo.to_path_buf());
@@ -598,7 +659,10 @@ pub fn worktree_location(repo: &Path, branch: &str) -> PathBuf {
     if ignored {
         base.join(".worktree").join(name)
     } else {
-        let parent = base.parent().map(Path::to_path_buf).unwrap_or_else(|| base.clone());
+        let parent = base
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base.clone());
         parent
             .join(format!("{}.worktrees", crate::project::folder_name(&base)))
             .join(name)
@@ -808,7 +872,11 @@ mod tests {
         assert!(switch(dir.path(), "does-not-exist", false, false).is_err());
         let entries = log();
         assert!(entries.len() > before);
-        let last = entries.iter().rev().find(|e| e.command.contains("does-not-exist")).unwrap();
+        let last = entries
+            .iter()
+            .rev()
+            .find(|e| e.command.contains("does-not-exist"))
+            .unwrap();
         assert!(!last.ok);
         assert!(!last.output.is_empty());
         Ok(())
