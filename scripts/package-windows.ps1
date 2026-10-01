@@ -23,7 +23,8 @@ try {
     & python scripts/release.py stage --target $Target --directory $stage
     if ($LASTEXITCODE -ne 0) { throw 'License and SBOM staging failed.' }
     Copy-Item -LiteralPath $binary -Destination (Join-Path $stage 'Vyber.exe')
-    Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $releaseDir $asset) -Force
+    & python scripts/release.py zip --target $Target --directory $stage
+    if ($LASTEXITCODE -ne 0) { throw 'ZIP creation failed.' }
     & python scripts/release.py record --target $Target
     if ($LASTEXITCODE -ne 0) { throw 'Package metadata failed.' }
     Write-Host "Packaged: dist/release/$asset"

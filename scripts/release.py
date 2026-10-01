@@ -186,6 +186,15 @@ def installation(platform):
         return common + "Drag Vyber.app to Applications. This preview is ad-hoc-signed and has not been Apple-notarized. Gatekeeper may block first launch. See Apple's supported Open Anyway flow in Privacy & Security after checking the release source. macOS 12 is a deployment target, not a verified minimum.\n"
     return common + "Run ./bin/vyber, or install bin/vyber to ~/.local/bin, share/applications/dev.vyber.terminal.desktop to ~/.local/share/applications, and the icon under ~/.local/share/icons/hicolor/256x256/apps. Requires a desktop session, a compatible GPU/driver, XDG utilities, fontconfig, DejaVu Sans Mono and Noto fonts. Desktop notifications require a session D-Bus notification service. Start from a terminal to diagnose missing runtime libraries.\n"
 
+def zip_package(target, directory):
+    directory = Path(directory).resolve()
+    if TARGETS[target][0] != "windows" or not directory.is_relative_to((ROOT / "dist").resolve()):
+        raise ValueError("Windows ZIP staging must stay inside this checkout's dist directory")
+    with zipfile.ZipFile(release_directory() / asset_name(target), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, strict_timestamps=False) as archive:
+        for path in sorted(directory.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(directory).as_posix())
+
 def record(target):
     verify_binary_arch(binary_path(target), target)
     path = release_directory() / asset_name(target)
@@ -350,10 +359,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
-    for command in ("asset-name", "binary-path", "record", "verify-package", "stage"):
+    for command in ("asset-name", "binary-path", "record", "verify-package", "stage", "zip"):
         command_parser = sub.add_parser(command)
         command_parser.add_argument("--target", choices=TARGETS, required=True)
-        if command == "stage":
+        if command in ("stage", "zip"):
             command_parser.add_argument("--directory", required=True)
     for command in ("preflight", "assemble", "draft"):
         command_parser = sub.add_parser(command)
@@ -369,6 +378,8 @@ def main():
         print(binary_path(args.target))
     elif args.command == "stage":
         stage(args.target, args.directory)
+    elif args.command == "zip":
+        zip_package(args.target, args.directory)
     elif args.command == "record":
         record(args.target)
     elif args.command == "verify-package":
