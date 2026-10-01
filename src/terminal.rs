@@ -1963,43 +1963,46 @@ mod tests {
         );
         let mut cwd = None;
         let mut exited = false;
-        let mut read_until =
-            |needle: &str, expected_cwd: Option<&std::path::Path>, want_exit: bool| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                let mut output = String::new();
-                while std::time::Instant::now() < deadline {
-                    for event in backend.events.try_iter() {
-                        match event {
-                            Event::Title(title) => {
-                                if let Some(path) = title.strip_prefix("__VYBER_CWD__") {
-                                    cwd = Some(std::path::PathBuf::from(path));
-                                }
+        let mut read_until = |needle: &str,
+                              expected_cwd: Option<&std::path::Path>,
+                              want_exit: bool,
+                              want_prompt: bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut output = String::new();
+            while std::time::Instant::now() < deadline {
+                for event in backend.events.try_iter() {
+                    match event {
+                        Event::Title(title) => {
+                            if let Some(path) = title.strip_prefix("__VYBER_CWD__") {
+                                cwd = Some(std::path::PathBuf::from(path));
                             }
-                            Event::ChildExit(_) | Event::Exit => exited = true,
-                            Event::PtyWrite(text) => {
-                                let _ = backend.sender.send(Msg::Input(text.into_bytes().into()));
-                            }
-                            _ => {}
                         }
+                        Event::ChildExit(_) | Event::Exit => exited = true,
+                        Event::PtyWrite(text) => {
+                            let _ = backend.sender.send(Msg::Input(text.into_bytes().into()));
+                        }
+                        _ => {}
                     }
-                    output = backend
-                        .term
-                        .lock()
-                        .renderable_content()
-                        .display_iter
-                        .map(|c| c.c)
-                        .collect();
-                    if output.contains(needle)
-                        && expected_cwd.is_none_or(|path| cwd.as_deref() == Some(path))
-                        && (!want_exit || exited)
-                    {
-                        return (true, output);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                (false, output)
-            };
-        let ready = read_until("$", Some(dir.path()), false);
+                output = backend
+                    .term
+                    .lock()
+                    .renderable_content()
+                    .display_iter
+                    .map(|c| c.c)
+                    .collect();
+                if output.contains(needle)
+                    && expected_cwd.is_none_or(|path| cwd.as_deref() == Some(path))
+                    && (!want_exit || exited)
+                    && (!want_prompt || output.trim_end().ends_with('$'))
+                {
+                    return (true, output);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            (false, output)
+        };
+        let ready = read_until("$", Some(dir.path()), false, true);
         if !ready.0 {
             let _ = backend.sender.send(Msg::Shutdown);
             anyhow::bail!(
@@ -2016,18 +2019,22 @@ mod tests {
                 .unwrap()
                 .into(),
         ))?;
-        let completed = read_until("vyber_bash_probe.txt", None, false).0;
+        let completed = read_until("vyber_bash_probe.txt", None, false, false).0;
         backend.sender.send(Msg::Input(vec![13].into()))?;
-        let success = read_until("VYBER_BASH_COMPLETE", None, false).0;
+        let success = read_until("VYBER_BASH_COMPLETE", Some(dir.path()), false, true).0;
         backend
             .sender
             .send(Msg::Input(b"cd child\r".to_vec().into()))?;
-        let moved = read_until("", Some(&dir.path().join("child")), false).0;
+        let moved = read_until("", Some(&dir.path().join("child")), false, true);
         backend.sender.send(Msg::Input(b"exit\r".to_vec().into()))?;
-        let exited = read_until("", None, true).0;
+        let exited = read_until("", None, true, false).0;
         let _ = backend.sender.send(Msg::Shutdown);
         assert!(completed && success, "Git Bash Tab completion failed");
-        assert!(moved, "Git Bash did not report the changed directory");
+        assert!(
+            moved.0,
+            "Git Bash did not report the changed directory: cwd={cwd:?}, output={}",
+            moved.1
+        );
         assert!(exited, "Git Bash did not emit a child-exit event");
         Ok(())
     }
