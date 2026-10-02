@@ -1,8 +1,8 @@
 # Releasing Vyber
 
 The five supported build targets are Windows x64, macOS ARM64/Intel and Linux x64/ARM64.
-Native build/test success is separate from real desktop acceptance. The first release is a
-preview: Windows binaries are unsigned and macOS bundles are ad-hoc-signed, not notarized.
+Native build/test success is separate from real desktop acceptance. Windows binaries are
+unsigned and macOS bundles are ad-hoc-signed, not notarized.
 Windows x64 uses a static CRT. Packaging checks the PE import table and rejects a separate
 Visual C++ runtime DLL dependency. System DLLs remain listed in `runtime-libraries.txt`.
 
@@ -26,20 +26,21 @@ Keep the included cache capacity at its default; eviction or a cache miss only c
 
 ## Cut a version
 
-1. Update `Cargo.toml` and the root package in `Cargo.lock` through Cargo. Use an alpha/beta/rc
-   version until the corresponding desktop acceptance is complete. The tag must exactly match.
+1. Update `Cargo.toml` and the root package in `Cargo.lock` through Cargo. Use the intended
+   release version, including any prerelease suffix. The tag must exactly match.
 2. Merge the version change through a PR after `CI / ready` passes.
 3. Create and push the version tag on the merged commit, for example:
 
    ```sh
-   git tag -a v0.1.0-alpha.1 -m "Vyber 0.1.0-alpha.1"
-   git push origin v0.1.0-alpha.1
+   git tag -a v0.1.0 -m "Vyber 0.1.0"
+   git push origin v0.1.0
    ```
 
 4. Wait for Release. The build must contain five archives, a manifest, SHA256SUMS and build
    provenance. Each archive includes licenses, a dependency inventory and an SPDX SBOM
    describing Cargo's resolved normal/build graph for that target.
-5. Download each relevant package and complete the draft's desktop acceptance list. Record
+5. Download each relevant package and check desktop launch, shell, keyboard, clipboard,
+   fonts, file opening and notifications. Record
    tested OS versions; do not infer macOS 12 compatibility from the deployment target or
    all-Linux compatibility from an Ubuntu build. Keep Linux ARM64 experimental until tested.
 6. Check release notes, tag, commit and all artifacts, then publish the draft in GitHub.
@@ -84,7 +85,7 @@ with GPUI and a session notification service. ripgrep is optional for content se
 
 `deny.toml` blocks reported vulnerabilities, unknown sources and licenses outside its
 explicit allowlist. Four maintenance-only advisories inherited through pinned GPUI/Kit
-are individually accepted for this preview, with reasons next to each ID:
+are individually accepted for this release, with reasons next to each ID:
 
 | Advisory | Package | Follow-up |
 | --- | --- | --- |
