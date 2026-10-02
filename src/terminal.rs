@@ -1927,17 +1927,27 @@ mod tests {
         backend.sender.send(Msg::Input(
             b"Get-Content .\\vyber_completion_pro".to_vec().into(),
         ))?;
+        // Wait for the line editor to consume the text before sending Tab.
+        // A displayed prompt can precede PSReadLine's input readiness on CI.
+        let (typed, typed_output) = read_until("vyber_completion_pro", 10);
+        if !typed {
+            let _ = backend.sender.send(Msg::Shutdown);
+            anyhow::bail!("PowerShell did not echo completion input: {typed_output}");
+        }
         let mode = *backend.term.lock().mode();
         backend.sender.send(Msg::Input(
             key_bytes("tab", None, false, false, false, mode)
                 .unwrap()
                 .into(),
         ))?;
-        let (completed, _) = read_until("vyber_completion_probe.txt", 5);
+        let (completed, completion_output) = read_until("vyber_completion_probe.txt", 10);
         backend.sender.send(Msg::Input(vec![13].into()))?;
         let (success, output) = read_until("VYBER_COMPLETION_SUCCESS", 5);
         let _ = backend.sender.send(Msg::Shutdown);
-        assert!(completed, "Tab did not expand the filename");
+        assert!(
+            completed,
+            "Tab did not expand the filename: {completion_output}"
+        );
         assert!(
             success,
             "Completed filename did not execute correctly: {output}"
