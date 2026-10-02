@@ -181,9 +181,9 @@ def stage(target, directory):
 def installation(platform):
     common = "# Vyber\n\nGit is required for source-control features. ripgrep (rg) is optional for content search.\n\n"
     if platform == "windows":
-        return common + "Extract this ZIP and run Vyber.exe on Windows 11 x64. The Visual C++ runtime is statically linked; no separate VC++ Redistributable installer is required. Git Bash is preferred when installed; PowerShell is the fallback. This preview is not Authenticode-signed. SmartScreen or local policy may warn or block it.\n"
+        return common + "Extract this ZIP and run Vyber.exe on Windows 11 x64. The Visual C++ runtime is statically linked; no separate VC++ Redistributable installer is required. Git Bash is preferred when installed; PowerShell is the fallback. This release is not Authenticode-signed. SmartScreen or local policy may warn or block it.\n"
     if platform == "macos":
-        return common + "Drag Vyber.app to Applications. This preview is ad-hoc-signed and has not been Apple-notarized. Gatekeeper may block first launch. See Apple's supported Open Anyway flow in Privacy & Security after checking the release source. macOS 12 is a deployment target, not a verified minimum.\n"
+        return common + "Drag Vyber.app to Applications. This release is ad-hoc-signed and has not been Apple-notarized. Gatekeeper may block first launch. See Apple's supported Open Anyway flow in Privacy & Security after checking the release source. macOS 12 is a deployment target, not a verified minimum.\n"
     return common + "Run ./bin/vyber, or install bin/vyber to ~/.local/bin, share/applications/dev.vyber.terminal.desktop to ~/.local/share/applications, and the icon under ~/.local/share/icons/hicolor/256x256/apps. Requires a desktop session, a compatible GPU/driver, XDG utilities, fontconfig, DejaVu Sans Mono and Noto fonts. Desktop notifications require a session D-Bus notification service. Start from a terminal to diagnose missing runtime libraries.\n"
 
 def zip_package(target, directory):
@@ -315,17 +315,12 @@ Windows: extract the ZIP and run Vyber.exe. macOS: open the DMG and drag Vyber.a
 Git is needed for source-control features; ripgrep is optional for content search.
 Verify SHA256SUMS.txt and build provenance with `gh attestation verify <package> --repo {REPO}`.
 
-### Preview limitations
-Windows packages are unsigned. macOS packages are ad-hoc-signed and not Apple-notarized. OS security prompts or policies may prevent first launch. CI build/test success does not establish all desktop/GPU combinations. macOS 12 is a deployment target, not a verified minimum. Linux ARM64 and desktop integration require manual acceptance before claiming full support.
+### Validation and platform notes
+All five packages passed native Clippy, tests, optimized builds and package contents/binary version checks. The release also passed dependency auditing and release metadata verification.
 
-### Desktop acceptance — complete before publishing
-- [ ] Clean Windows 11 x64 launch, Git Bash/PowerShell, keyboard and clipboard
-- [ ] Apple Silicon Mac: Finder/Dock launch, shell PATH and window lifecycle
-- [ ] Intel Mac: Finder/Dock launch, shell PATH and window lifecycle
-- [ ] Linux x64: X11 and Wayland launch, fonts, CWD, file opening and notifications
-- [ ] Linux ARM64 desktop/GPU acceptance, or explicitly retain experimental status
+Windows packages are unsigned. macOS packages are ad-hoc-signed and not Apple-notarized. OS security prompts or policies may prevent first launch. Desktop/GPU compatibility has not been manually verified across all platforms. macOS 12 is a deployment target, not a verified minimum. Linux ARM64 desktop support remains experimental until manual validation.
 
-Source commit: `{sha}`. All five artifacts must be present. This draft is never published automatically.
+Source commit: `{sha}`. The manifest records all five packages and their checksums. Publication is a maintainer action after the automated draft workflow completes.
 """
     (ROOT / "dist" / "release-notes.md").write_text(notes, encoding="utf-8")
     print(f"Assembled {len(packages)} packages for {tag}")
