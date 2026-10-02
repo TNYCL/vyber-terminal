@@ -23,7 +23,7 @@ notify = "8"
 ignore = "0.4"
 similar = "2"
 smol = "2"
-dirs = "6"
+dirs = "7"
 chrono = { version = "0.4", features = ["serde"] }
 blake3 = "1"
 log = "0.4"
