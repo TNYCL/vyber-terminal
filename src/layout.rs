@@ -6,10 +6,17 @@ pub enum Layout {
     Split {
         key: usize,
         vertical: bool,
+        #[serde(default = "default_split_ratio")]
+        ratio: f32,
         first: Box<Layout>,
         second: Box<Layout>,
     },
 }
+
+fn default_split_ratio() -> f32 {
+    0.5
+}
+
 impl Layout {
     pub fn leaves(&self) -> Vec<usize> {
         match self {
@@ -52,6 +59,7 @@ impl Layout {
                 *self = Self::Split {
                     key,
                     vertical: matches!(edge, DropEdge::Top | DropEdge::Bottom),
+                    ratio: default_split_ratio(),
                     first: Box::new(first),
                     second: Box::new(second),
                 };
@@ -89,6 +97,29 @@ impl Layout {
             Self::Split { first, second, .. } => first.contains(id) || second.contains(id),
         }
     }
+    /// The first leaf of a split's second branch uniquely identifies its
+    /// divider, including when numeric split keys collide after merging tabs.
+    pub fn resize_split(&mut self, anchor: usize, ratio: f32) -> bool {
+        if !ratio.is_finite() || ratio <= 0. || ratio >= 1. {
+            return false;
+        }
+        match self {
+            Self::Split {
+                ratio: current,
+                first,
+                second,
+                ..
+            } => {
+                if second.first() == anchor {
+                    *current = ratio;
+                    true
+                } else {
+                    first.resize_split(anchor, ratio) || second.resize_split(anchor, ratio)
+                }
+            }
+            Self::Leaf(_) => false,
+        }
+    }
     pub fn remove(&self, target: usize) -> Option<Self> {
         match self {
             Self::Leaf(id) => {
@@ -101,12 +132,14 @@ impl Layout {
             Self::Split {
                 key,
                 vertical,
+                ratio,
                 first,
                 second,
             } => match (first.remove(target), second.remove(target)) {
                 (Some(a), Some(b)) => Some(Self::Split {
                     key: *key,
                     vertical: *vertical,
+                    ratio: *ratio,
                     first: Box::new(a),
                     second: Box::new(b),
                 }),
@@ -249,6 +282,52 @@ mod tests {
         t.split(2, 3, true);
         vec![t]
     }
+
+    #[test]
+    fn old_split_layouts_restore_with_equal_sizes() {
+        let layout: Layout = serde_json::from_str(
+            r#"{"Split":{"key":3,"vertical":false,"first":{"Leaf":1},"second":{"Leaf":2}}}"#,
+        )
+        .unwrap();
+        let Layout::Split { ratio, .. } = layout else {
+            panic!("missing split")
+        };
+        assert_eq!(ratio, 0.5);
+    }
+
+    #[test]
+    fn resized_splits_keep_ratios_through_save_move_and_sibling_removal() {
+        let mut tabs = three();
+        // Old layouts can have overlapping numeric keys. Each divider must
+        // still update independently, without changing its parent or sibling.
+        if let Layout::Split { key, second, .. } = &mut tabs[0]
+            && let Layout::Split { key: nested, .. } = second.as_mut()
+        {
+            *nested = *key;
+        }
+        assert!(tabs[0].resize_split(2, 0.7));
+        assert!(tabs[0].resize_split(3, 0.85));
+        for ratio in [f32::NAN, f32::INFINITY, -1., 0., 1., 2.] {
+            let before = tabs.clone();
+            assert!(!tabs[0].resize_split(3, ratio));
+            assert_eq!(tabs, before);
+        }
+        let saved = serde_json::to_string(&tabs).unwrap();
+        let mut restored: Vec<Layout> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, tabs);
+        restored.push(Layout::Leaf(4));
+        assert!(move_group_to_edge(&mut restored, 1, 4, DropEdge::Right));
+        let Layout::Split { second, .. } = &restored[0] else {
+            panic!("missing merged split")
+        };
+        assert_eq!(second.as_ref(), &tabs[0]);
+        let remaining = tabs[0].remove(1).unwrap();
+        let Layout::Split { ratio, .. } = remaining else {
+            panic!("missing surviving split")
+        };
+        assert_eq!(ratio, 0.85);
+    }
+
     #[test]
     fn reorder_preserves_terminals_and_nested_geometry() {
         let mut tabs = three();

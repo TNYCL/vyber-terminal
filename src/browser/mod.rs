@@ -11,6 +11,7 @@ use crate::{
     config::{Config, PanelMode},
     git::{self as vcs, ops},
     tasks::TaskReview,
+    terminal::FileLink,
     theme::{self, BORDER, PANEL, rpx},
     workspace::{self, Change, Checkpoint, FileEntry},
 };
@@ -285,7 +286,7 @@ pub struct Browser {
     scale: f32,
     restore_docs: Vec<SavedDocument>,
     restore_active: Option<PathBuf>,
-    pending_line: Option<(PathBuf, usize)>,
+    pending_links: HashMap<PathBuf, Option<(usize, usize)>>,
     focus: FocusHandle,
     quick_look: bool,
     tree_root: Option<String>,
@@ -389,7 +390,7 @@ impl Browser {
             scale: 1.,
             restore_docs: vec![],
             restore_active: None,
-            pending_line: None,
+            pending_links: HashMap::new(),
             focus: cx.focus_handle(),
             quick_look: false,
             tree_root: None,
@@ -698,19 +699,46 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_link(
+            FileLink {
+                path,
+                location: Some((line, 1)),
+            },
+            window,
+            cx,
+        );
+    }
+    pub fn open_link(&mut self, target: FileLink, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
-        self.open(path.clone(), true, cx);
-        if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
-            doc.preview = false;
+        self.pending_links
+            .insert(target.path.clone(), target.location);
+        self.open(target.path.clone(), true, cx);
+        if let Some(doc) = self.docs.iter_mut().find(|d| d.path == target.path) {
+            Self::apply_link(doc, target.location, window, cx);
+            self.pending_links.remove(&target.path);
+        }
+        cx.notify();
+    }
+    fn apply_link(
+        doc: &mut Document,
+        location: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        doc.preview = doc.kind == Kind::Image || (location.is_none() && doc.markdown());
+        if let Some((line, column)) = location {
             doc.editor.update(cx, |ed, cx| {
                 ed.set_cursor_position(
-                    gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0),
+                    gpui_kit::component::input::Position::new(
+                        line.saturating_sub(1) as u32,
+                        column.saturating_sub(1) as u32,
+                    ),
                     window,
                     cx,
                 )
             });
         } else {
-            self.pending_line = Some((path, line));
+            doc.scroll.set_offset(point(px(0.), px(0.)));
         }
     }
     pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -728,6 +756,7 @@ impl Browser {
         let (sender, receiver) = mpsc::channel();
         self.sender = sender;
         self.receiver = receiver;
+        self.pending_links.clear();
         self.root = root.clone();
         self.files.clear();
         self.changes.clear();
@@ -902,9 +931,17 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_links.contains_key(&path)
+            && let Err(message) = &result
+        {
+            self.say(message.clone());
+        }
         if let Some(index) = self.docs.iter().position(|d| d.path == path) {
             self.active_doc = index;
             self.docs[index].pinned |= pinned;
+            if let Some(location) = self.pending_links.remove(&path) {
+                Self::apply_link(&mut self.docs[index], location, window, cx);
+            }
             return;
         }
         let extension = path
@@ -989,6 +1026,9 @@ impl Browser {
                 doc.pinned = true;
             }
         }
+        if let Some(location) = self.pending_links.remove(&doc.path) {
+            Self::apply_link(&mut doc, location, window, cx);
+        }
         if let Some(index) = self.docs.iter().position(|d| !d.pinned && !d.dirty) {
             self.docs[index] = doc;
             self.active_doc = index;
@@ -1001,16 +1041,6 @@ impl Browser {
         {
             self.active_doc = i;
         }
-        if let Some((path, line)) = &self.pending_line
-            && let Some(doc) = self.docs.iter_mut().find(|d| &d.path == path)
-        {
-            doc.preview = false;
-            let position =
-                gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0);
-            doc.editor
-                .update(cx, |ed, cx| ed.set_cursor_position(position, window, cx));
-            self.pending_line = None;
-        }
         self.tab_scroll.scroll_to_item(self.active_doc);
     }
     pub fn open(&mut self, path: PathBuf, pinned: bool, cx: &mut Context<Self>) {
@@ -1022,16 +1052,31 @@ impl Browser {
         self.tree_selected = Some(relative);
         self.reveal = true;
         if let Some(i) = self.docs.iter().position(|d| d.path == path) {
-            self.active_doc = i;
-            self.docs[i].pinned |= pinned;
-            self.tab_scroll.scroll_to_item(i);
-            cx.notify();
-            return;
+            if !matches!(self.docs[i].kind, Kind::Unsupported(_)) {
+                self.active_doc = i;
+                self.docs[i].pinned |= pinned;
+                self.tab_scroll.scroll_to_item(i);
+                cx.notify();
+                return;
+            }
+            // A missing/unreadable file may have been created or repaired since
+            // its error card was opened. Retry instead of keeping that error.
+            self.docs.remove(i);
+            self.active_doc = self
+                .active_doc
+                .saturating_sub(usize::from(self.active_doc >= i));
         }
         let sender = self.sender.clone();
         std::thread::spawn(move || {
             let (result, size) = match fs::metadata(&path) {
-                Err(e) => (Err(e.to_string()), 0),
+                Err(e) => (
+                    Err(if e.kind() == std::io::ErrorKind::NotFound {
+                        format!("File not found: {}", path.display())
+                    } else {
+                        format!("Cannot open {}: {e}", path.display())
+                    }),
+                    0,
+                ),
                 Ok(m) if m.len() > READ_LIMIT => (
                     Err("Larger than the 32 MB preview limit".to_string()),
                     m.len(),
@@ -1525,5 +1570,180 @@ mod state_tests {
         assert!(restored.visible && restored.docked && restored.follow);
         assert!(!restored.pinned);
         assert_eq!(restored.panel_width, state.panel_width);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::{Browser, Config, FileLink, Kind};
+    use gpui::{TestAppContext, WindowHandle};
+    use std::path::PathBuf;
+
+    fn window(root: PathBuf, cx: &mut TestAppContext) -> WindowHandle<Browser> {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Config::default());
+            crate::theme::apply(cx);
+        });
+        cx.add_window(move |window, cx| Browser::new(root, window, cx))
+    }
+
+    #[gpui_kit::test]
+    fn markdown_preview_and_source_locations_preserve_unsaved_content(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("report.md");
+        let handle = window(root.path().to_owned(), cx);
+        handle
+            .update(cx, |browser, window, cx| {
+                browser.loaded(
+                    path.clone(),
+                    Ok(b"# Saved\nline\nline\n".to_vec()),
+                    20,
+                    true,
+                    window,
+                    cx,
+                );
+                browser.docs[0].editor.update(cx, |editor, cx| {
+                    editor.set_value("# Unsaved\nsecond line\nthird line\n", window, cx)
+                });
+                // Programmatic set_value is silent; model an existing
+                // unsaved draft before exercising the link-opening flow.
+                browser.docs[0].dirty = true;
+                browser.docs[0].pinned = true;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |browser, window, cx| {
+                assert!(browser.docs[0].dirty);
+                browser.open_link(
+                    FileLink {
+                        path: path.clone(),
+                        location: None,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(browser.visible && browser.docs[0].preview);
+                assert_eq!(
+                    browser.docs[0].editor.read(cx).value().as_ref(),
+                    "# Unsaved\nsecond line\nthird line\n"
+                );
+                browser.open_link(
+                    FileLink {
+                        path: path.clone(),
+                        location: Some((2, 4)),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(!browser.docs[0].preview);
+                assert!(browser.docs[0].dirty);
+                assert_eq!(
+                    browser.docs[0].editor.read(cx).cursor_position(),
+                    gpui_kit::component::input::Position::new(1, 3)
+                );
+                browser.open_link(
+                    FileLink {
+                        path: path.clone(),
+                        location: None,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(browser.docs[0].preview && browser.docs[0].dirty);
+                assert_eq!(
+                    browser.docs[0].editor.read(cx).value().as_ref(),
+                    "# Unsaved\nsecond line\nthird line\n"
+                );
+                assert_eq!(browser.docs.len(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pending_links_apply_to_each_loaded_document(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let preview = root.path().join("preview.md");
+        let source = root.path().join("source.md");
+        let text = b"# Heading\nsecond line\nthird line\n";
+        let handle = window(root.path().to_owned(), cx);
+        handle
+            .update(cx, |browser, window, cx| {
+                browser.open_link(
+                    FileLink {
+                        path: preview.clone(),
+                        location: None,
+                    },
+                    window,
+                    cx,
+                );
+                browser.open_link(
+                    FileLink {
+                        path: source.clone(),
+                        location: Some((3, 2)),
+                    },
+                    window,
+                    cx,
+                );
+                // Deliver asynchronous results in reverse request order.
+                browser.loaded(
+                    source.clone(),
+                    Ok(text.to_vec()),
+                    text.len() as u64,
+                    true,
+                    window,
+                    cx,
+                );
+                browser.loaded(
+                    preview.clone(),
+                    Ok(text.to_vec()),
+                    text.len() as u64,
+                    true,
+                    window,
+                    cx,
+                );
+                let doc = browser.docs.iter().find(|doc| doc.path == preview).unwrap();
+                assert!(doc.preview);
+                let doc = browser.docs.iter().find(|doc| doc.path == source).unwrap();
+                assert!(!doc.preview);
+                assert_eq!(
+                    doc.editor.read(cx).cursor_position(),
+                    gpui_kit::component::input::Position::new(2, 1)
+                );
+                assert!(browser.pending_links.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn missing_file_is_visible_and_can_be_retried_after_creation(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("created-later.md");
+        let handle = window(root.path().to_owned(), cx);
+        handle
+            .update(cx, |browser, window, cx| {
+                let target = FileLink {
+                    path: path.clone(),
+                    location: None,
+                };
+                browser.open_link(target.clone(), window, cx);
+                let error = format!("File not found: {}", path.display());
+                browser.loaded(path.clone(), Err(error.clone()), 0, true, window, cx);
+                assert!(browser.visible);
+                assert_eq!(browser.notice, error);
+                assert!(matches!(browser.docs[0].kind, Kind::Unsupported(_)));
+                std::fs::write(&path, "# Created").unwrap();
+                browser.open_link(target, window, cx);
+                assert!(browser.docs.is_empty());
+                browser.loaded(path.clone(), Ok(b"# Created".to_vec()), 9, true, window, cx);
+                assert_eq!(browser.docs.len(), 1);
+                assert!(browser.docs[0].kind == Kind::Text && browser.docs[0].preview);
+                assert_eq!(
+                    browser.docs[0].editor.read(cx).value().as_ref(),
+                    "# Created"
+                );
+            })
+            .unwrap();
     }
 }

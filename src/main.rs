@@ -19,6 +19,7 @@ mod project_dialog;
 mod pty;
 #[cfg(unix)]
 mod shell;
+mod split;
 mod tab_state;
 mod tasks;
 mod terminal;
