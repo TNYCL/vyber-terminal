@@ -7895,7 +7895,7 @@ dependencies = [
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "url",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
