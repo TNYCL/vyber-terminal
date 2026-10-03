@@ -56,7 +56,7 @@ fn asynchronous_reads_preserve_latest_selection_and_each_source_location(cx: &mu
                         pinned: true,
                     },
                 );
-                browser.pending_lines.insert(path.clone(), line);
+                browser.pending_links.insert(path.clone(), Some((line, 1)));
             }
             browser.intended_document = Some(second.clone());
             // Finish the newest request first, then the slower older read.
@@ -103,7 +103,7 @@ fn asynchronous_reads_preserve_latest_selection_and_each_source_location(cx: &mu
                 .unwrap();
             browser.poll(window, cx);
             assert_eq!(browser.active_document().unwrap().path, first);
-            assert!(browser.pending_lines.is_empty());
+            assert!(browser.pending_links.is_empty());
             let stale_preview = harness.root.join("stale.txt");
             browser.pending_loads.insert(
                 stale_preview.clone(),
@@ -112,14 +112,16 @@ fn asynchronous_reads_preserve_latest_selection_and_each_source_location(cx: &mu
                     pinned: false,
                 },
             );
-            browser.pending_lines.insert(stale_preview.clone(), 7);
+            browser
+                .pending_links
+                .insert(stale_preview.clone(), Some((7, 1)));
             browser
                 .document_sender
                 .send(Message::Loaded(4, stale_preview, Ok(b"stale".to_vec()), 5))
                 .unwrap();
             browser.poll(window, cx);
             assert_eq!(browser.docs.len(), 3);
-            assert!(browser.pending_lines.is_empty());
+            assert!(browser.pending_links.is_empty());
         })
         .unwrap();
 }
@@ -188,6 +190,7 @@ fn root_change_clears_search_and_keeps_document_completions(cx: &mut TestAppCont
                 },
             );
             browser.intended_document = Some(path.clone());
+            browser.pending_links.insert(path.clone(), Some((1, 3)));
             let document_sender = browser.document_sender.clone();
             browser.change_root(other.clone(), window, cx);
             assert!(browser.filter_query(cx).is_empty());
@@ -199,6 +202,16 @@ fn root_change_clears_search_and_keeps_document_completions(cx: &mut TestAppCont
             browser.poll(window, cx);
             assert_eq!(browser.root, other);
             assert_eq!(browser.active_document().unwrap().path, path);
+            assert_eq!(
+                browser
+                    .active_document()
+                    .unwrap()
+                    .editor
+                    .read(cx)
+                    .cursor_position(),
+                gpui_kit::component::input::Position::new(0, 2)
+            );
+            assert!(browser.pending_links.is_empty());
         })
         .unwrap();
 }

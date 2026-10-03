@@ -5,6 +5,7 @@ use crate::{
     layout::{self, DropEdge, Layout},
     panel::{DEFAULT_FRACTION, WorkspaceBody},
     project_dialog::{ProjectDialog, ProjectDialogEvent},
+    split::SplitPane,
     tab_state::TabState,
     tasks::{Monitor, TaskReview},
     terminal::{Terminal, TerminalEvent, TurnBadge},
@@ -12,10 +13,7 @@ use crate::{
     workspace,
 };
 use gpui::{prelude::*, *};
-use gpui_kit::component::{
-    TitleBar,
-    resizable::{h_resizable, resizable_panel, v_resizable},
-};
+use gpui_kit::component::TitleBar;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -217,6 +215,8 @@ pub struct Vyber {
     show_shortcuts: bool,
     close_pending: bool,
     state_path: PathBuf,
+    /// The workspace as last written, so an unchanged one costs no disk access.
+    saved_state: std::cell::RefCell<Option<Vec<u8>>>,
     restoring: bool,
     #[cfg(test)]
     process_snapshot: Option<crate::processes::ProcessSnapshot>,
@@ -312,6 +312,7 @@ impl Vyber {
             show_shortcuts: false,
             close_pending: false,
             state_path: workspace::data_dir().join("workspace.json"),
+            saved_state: Default::default(),
             restoring: true,
             #[cfg(test)]
             process_snapshot: None,
@@ -651,9 +652,9 @@ impl Vyber {
                     .update(cx, |b, cx| b.change_root(root, window, cx));
                 changed = true;
             }
-            if let Some((path, line)) = path {
+            if let Some(target) = path {
                 slot.browser
-                    .update(cx, |b, cx| b.open_at(path, line, window, cx));
+                    .update(cx, |b, cx| b.open_link(target, window, cx));
             }
             let title = &slot.terminal.read(cx).title;
             if &slot.title != title {
@@ -758,13 +759,17 @@ impl Vyber {
             font_size: None,
         };
         if let Ok(bytes) = serde_json::to_vec(&state) {
-            if let Some(dir) = self.state_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if std::fs::read(&self.state_path).ok().as_ref() != Some(&bytes)
-                && let Err(e) = std::fs::write(&self.state_path, bytes)
-            {
-                log::warn!("Save workspace: {e}");
+            let mut saved = self.saved_state.borrow_mut();
+            let saved =
+                saved.get_or_insert_with(|| std::fs::read(&self.state_path).unwrap_or_default());
+            if *saved != bytes {
+                if let Some(dir) = self.state_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                match std::fs::write(&self.state_path, &bytes) {
+                    Ok(()) => *saved = bytes,
+                    Err(e) => log::warn!("Save workspace: {e}"),
+                }
             }
         }
     }
@@ -1523,21 +1528,24 @@ impl Vyber {
         match layout {
             Layout::Leaf(id) => self.pane(*id, cx),
             Layout::Split {
-                key,
                 vertical,
+                ratio,
                 first,
                 second,
+                ..
             } => {
                 let a = self.layout(first, cx);
                 let b = self.layout(second, cx);
-                let group = if *vertical {
-                    v_resizable(("terminal-split", *key))
-                } else {
-                    h_resizable(("terminal-split", *key))
-                };
-                group
-                    .child(resizable_panel().size_range(px(100.)..px(6000.)).child(a))
-                    .child(resizable_panel().size_range(px(100.)..px(6000.)).child(b))
+                let anchor = second.first();
+                SplitPane::new(anchor, *vertical, *ratio, a, b)
+                    .on_resize(cx.listener(move |this, ratio: &f32, _, cx| {
+                        if let Some(layout) = this.tabs.iter_mut().find(|l| l.contains(anchor))
+                            && layout.resize_split(anchor, *ratio)
+                        {
+                            this.persist(cx);
+                            cx.notify();
+                        }
+                    }))
                     .into_any_element()
             }
         }
@@ -1813,6 +1821,21 @@ impl Render for Vyber {
             .font_family(crate::theme::ui_font())
             .text_size(px(12.))
             .track_focus(&self.focus)
+            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, window, cx| {
+                // Modifier events follow keyboard focus. Also refresh the
+                // hovered terminal while the file panel owns that focus.
+                for (id, slot) in &this.slots {
+                    if this
+                        .tabs
+                        .get(this.tab)
+                        .is_some_and(|layout| layout.contains(*id))
+                        && (!this.zoomed || *id == this.active)
+                    {
+                        slot.terminal
+                            .update(cx, |terminal, cx| terminal.update_link_hover(window, cx));
+                    }
+                }
+            }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if this.rename_tab.is_some() {
@@ -2128,11 +2151,7 @@ pub fn bind_keys(cx: &mut App) {
         ),
     ]);
     if cfg!(windows) {
-        cx.bind_keys([
-            KeyBinding::new("ctrl-shift-d", SplitDown, None),
-            // Ctrl+T opens a tab like a browser; the shell no longer sees Ctrl+T.
-            KeyBinding::new("ctrl-t", NewTerminal, None),
-        ]);
+        cx.bind_keys([KeyBinding::new("ctrl-shift-d", SplitDown, None)]);
     }
     // Font zoom. GPUI turns a shifted digit or punctuation key into the
     // character it types, so Turkish Q Ctrl+Shift+0 arrives as ctrl-= and
@@ -2188,6 +2207,7 @@ mod tests {
     fn workspace_round_trip_preserves_names_and_focused_splits() {
         let mut layout = Layout::Leaf(1);
         layout.split(1, 2, false);
+        layout.resize_split(2, 0.85);
         let mut state = SavedState {
             tabs: vec![layout],
             active: 2,
@@ -2206,6 +2226,7 @@ mod tests {
             Some("Derleme · Türkçe")
         );
         assert_eq!(saved.tabs[0].leaves(), vec![1, 2]);
+        assert_eq!(saved.tabs, state.tabs);
     }
 }
 

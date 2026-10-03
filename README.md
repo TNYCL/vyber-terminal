@@ -28,6 +28,9 @@ download verification and the manual publication gate. Releases are prepared as 
 
 - Real PTY sessions (ConPTY on Windows) rendered with `alacritty_terminal`: true color, 256 colors,
   alternate screen, bracketed paste, OSC 8 hyperlinks and TUI programs.
+- Shift+Enter preserves its modifier for multiline input in Codex and Claude Code, with Kitty
+  keyboard protocol negotiation and native Windows console input. Ctrl+T reaches the terminal
+  application; use Ctrl+Shift+T to open a Vyber tab on Windows.
 - Tabs are stable terminal groups: selecting a group never expands or shifts the tab strip.
   Double-click to name a group, right-click to rename/split/close it, or use the arrow beside `+`
   to pick from all open groups. Group names and the last focused terminal are remembered.
@@ -154,7 +157,7 @@ Run the test suite with `cargo test --locked`.
 
 | Action | Windows | macOS | Linux |
 | --- | --- | --- | --- |
-| New tab | Ctrl+T / Ctrl+Shift+T | Cmd+T / Cmd+N | Ctrl+Shift+T |
+| New tab | Ctrl+Shift+T | Cmd+T / Cmd+N | Ctrl+Shift+T |
 | Split right (terminal focused) | Ctrl+D | Cmd+D | Ctrl+Shift+D |
 | Split down | Ctrl+Shift+D / Ctrl+Shift+E | Cmd+Shift+D | Ctrl+Shift+E |
 | Close active preview file, then panel, then focused terminal | Ctrl+Shift+W | Cmd+W | Ctrl+Shift+W |

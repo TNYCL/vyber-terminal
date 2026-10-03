@@ -27,21 +27,26 @@ use std::{
 };
 
 mod badge;
+mod links;
 pub use badge::badge_spot;
 use badge::{BadgeAnchorMemory, badge_visible, fit_badge};
+pub use links::FileLink;
 
 #[derive(Clone)]
 pub struct Proxy {
     dirty: Arc<AtomicBool>,
     sender: mpsc::Sender<Event>,
 }
-impl EventListener for Proxy {
-    fn send_event(&self, event: Event) {
-        if matches!(event, Event::Wakeup | Event::MouseCursorDirty) {
-            self.dirty.store(true, Ordering::Relaxed);
-        } else {
-            let _ = self.sender.send(event);
-        }
+
+#[cfg(test)]
+impl Proxy {
+    pub fn channel() -> (Self, mpsc::Receiver<Event>) {
+        let (sender, events) = mpsc::channel();
+        let proxy = Self {
+            dirty: Arc::new(AtomicBool::new(false)),
+            sender,
+        };
+        (proxy, events)
     }
 }
 #[derive(Clone, Copy)]
@@ -62,6 +67,8 @@ impl Dimensions for Size {
 }
 
 const TERMINAL_INSET: f32 = 3.;
+/// Bytes of typed text kept to match an agent's prompt to its terminal.
+const TYPED_LIMIT: usize = 4096;
 
 /// Summary of an agent turn that ran in this terminal, drawn as a badge
 /// above the agent's input box. Vyber only draws it: the program in the
@@ -74,6 +81,19 @@ pub struct TurnBadge {
     pub deletions: usize,
     pub active: bool,
     pub warning: Option<String>,
+}
+
+/// A cell to paint, copied from the terminal under its lock.
+struct PaintCell {
+    column: usize,
+    row: usize,
+    /// The character, unless the cell only has a background.
+    c: Option<char>,
+    extra: Option<Vec<char>>,
+    fg: u32,
+    bg: u32,
+    bold: bool,
+    italic: bool,
 }
 
 pub enum TerminalEvent {
@@ -99,7 +119,7 @@ pub struct Terminal {
     pub process: crate::processes::TerminalProcess,
     pub bell: bool,
     pub notification: Option<String>,
-    pub open_path: Option<(PathBuf, usize)>,
+    pub open_path: Option<FileLink>,
     pub badge: Option<TurnBadge>,
     badge_dismissed: Option<String>,
     badge_anchor: BadgeAnchorMemory,
@@ -115,6 +135,10 @@ pub struct Terminal {
     sender: EventLoopSender,
     events: mpsc::Receiver<Event>,
     dirty: Arc<AtomicBool>,
+    /// Set while ConPTY takes keys as win32-input-mode events.
+    win32_input: Arc<AtomicBool>,
+    /// Cells copied for the next paint, kept to reuse the allocation.
+    cells: Vec<PaintCell>,
     bounds: Bounds<Pixels>,
     cols: usize,
     rows: usize,
@@ -126,6 +150,12 @@ pub struct Terminal {
     resize_interval: Option<Duration>,
     resized_at: Instant,
     selecting: bool,
+    pointer_inside: bool,
+    link_candidates: Vec<links::Link>,
+    hovered_link: Option<links::Link>,
+    link_generation: u64,
+    link_click_consumed: bool,
+    link_notice: Option<(String, Instant)>,
     last_mouse: Option<(usize, usize)>,
     last_focus: bool,
     selection_start: Option<TermPoint>,
@@ -144,6 +174,7 @@ pub struct Backend {
     sender: EventLoopSender,
     events: mpsc::Receiver<Event>,
     dirty: Arc<AtomicBool>,
+    win32_input: Arc<AtomicBool>,
     program: String,
     shell: Option<u32>,
     process: crate::processes::TerminalProcess,
@@ -175,6 +206,7 @@ impl Terminal {
         };
         let config = Config {
             scrolling_history: crate::config::Config::load().scrollback,
+            kitty_keyboard: true,
             ..Default::default()
         };
         let term = Arc::new(FairMutex::new(Term::new(
@@ -192,7 +224,9 @@ impl Terminal {
         let args = if program.to_lowercase().contains("powershell")
             || program.to_lowercase().contains("pwsh")
         {
-            vec!["-NoLogo".into(),"-NoExit".into(),"-Command".into(),"if (-not (Get-Module PSReadLine)) { Import-Module PSReadLine -ErrorAction SilentlyContinue }; $global:VyberOriginalPrompt = $function:prompt; function global:prompt { $Host.UI.RawUI.WindowTitle = '__VYBER_CWD__' + (Get-Location).Path; & $global:VyberOriginalPrompt }".into()]
+            // The console reports only a changed title, so the prefix
+            // alternates and every prompt reaches Vyber (see `pty::prompt_cwd`).
+            vec!["-NoLogo".into(),"-NoExit".into(),"-Command".into(),"if (-not (Get-Module PSReadLine)) { Import-Module PSReadLine -ErrorAction SilentlyContinue }; $global:VyberOriginalPrompt = $function:prompt; function global:prompt { $global:VyberPromptMark = -not $global:VyberPromptMark; $Host.UI.RawUI.WindowTitle = $(if ($global:VyberPromptMark) { '__VYBER_CWD__' } else { '__VYBER_CWD2__' }) + (Get-Location).Path; & $global:VyberOriginalPrompt }".into()]
         } else if is_windows_bash {
             vec!["--login".into(), "-i".into()]
         } else if ["zsh", "bash", "fish", "sh"].iter().any(|name| {
@@ -249,6 +283,13 @@ impl Terminal {
         } else {
             None
         };
+        // Windows passes "ignore Ctrl+C" from a process to its children. Vyber
+        // inherits it when a parent that ignores Ctrl+C starts it, and then
+        // Ctrl+C would not stop a command in PowerShell or cmd.
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(None, false);
+        }
         #[allow(
             clippy::needless_update,
             reason = "Unix PTY options have additional fields."
@@ -280,7 +321,11 @@ impl Terminal {
             pid: shell,
             shell: program.clone(),
         };
-        let pty = crate::pty::ObservedPty::new(pty, proxy.clone());
+        let win32_input = Arc::new(AtomicBool::new(false));
+        let pty = crate::pty::ObservedPty::new(
+            pty,
+            crate::pty::Observer::new(proxy.clone(), win32_input.clone()),
+        );
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
@@ -289,6 +334,7 @@ impl Terminal {
             sender,
             events,
             dirty,
+            win32_input,
             program,
             shell,
             process,
@@ -302,6 +348,7 @@ impl Terminal {
             sender,
             events,
             dirty,
+            win32_input,
             program,
             shell,
             process,
@@ -347,6 +394,8 @@ impl Terminal {
             sender,
             events,
             dirty,
+            win32_input,
+            cells: Vec::new(),
             bounds: Bounds::default(),
             cols: 100,
             rows: 30,
@@ -356,6 +405,12 @@ impl Terminal {
             resize_interval: None,
             resized_at: Instant::now(),
             selecting: false,
+            pointer_inside: false,
+            link_candidates: Vec::new(),
+            hovered_link: None,
+            link_generation: 0,
+            link_click_consumed: false,
+            link_notice: None,
             last_mouse: None,
             last_focus: false,
             selection_start: None,
@@ -428,63 +483,88 @@ impl Terminal {
         }
         cx.notify();
     }
-    fn link_at(&mut self, point: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+    fn links_at(&self, point: Point<Pixels>) -> Vec<links::Link> {
         let p = self.position(point);
         let term = self.term.lock();
-        if let Some(link) = term.grid()[p].hyperlink() {
-            let uri = link.uri();
-            if uri.starts_with("https://") || uri.starts_with("http://") {
-                cx.open_url(uri);
-                return true;
-            }
-            if let Ok(url) = url::Url::parse(uri)
-                && let Ok(path) = url.to_file_path()
-            {
-                drop(term);
-                self.open_path = Some((path, 1));
-                return true;
-            }
-        }
-        let mut start = p.column.0;
-        let mut end = start;
-        while start > 0
-            && !term.grid()[TermPoint::new(p.line, Column(start - 1))]
-                .c
-                .is_whitespace()
+        links::detect(&term, p, &self.root)
+    }
+    pub(crate) fn update_link_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let candidates = if self.pointer_inside
+            && window.is_window_active()
+            && (window.modifiers().control || window.modifiers().platform)
+            && !self.selecting
+            && !cx.has_active_drag()
+            && self.bounds.contains(&window.mouse_position())
         {
-            start -= 1;
+            self.links_at(window.mouse_position())
+        } else {
+            Vec::new()
+        };
+        if candidates == self.link_candidates {
+            return;
         }
-        while end < self.cols
-            && !term.grid()[TermPoint::new(p.line, Column(end))]
-                .c
-                .is_whitespace()
-        {
-            end += 1;
+        self.link_generation = self.link_generation.wrapping_add(1);
+        let generation = self.link_generation;
+        self.hovered_link = candidates.first().cloned();
+        self.link_candidates = candidates.clone();
+        cx.notify();
+        if candidates.len() < 2 {
+            return;
         }
-        let text = (start..end)
-            .map(|c| term.grid()[TermPoint::new(p.line, Column(c))].c)
-            .collect::<String>();
-        drop(term);
-        let text = text
-            .trim_matches(|c: char| matches!(c, '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';'));
-        if text.starts_with("https://") || text.starts_with("http://") {
-            cx.open_url(text);
-            return true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { links::resolve(&candidates) });
+        cx.spawn(async move |entity, cx| {
+            let resolved = task.await.ok().flatten();
+            let _ = entity.update(cx, |this, cx| {
+                if this.link_generation == generation && this.hovered_link != resolved {
+                    this.hovered_link = resolved;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+    fn link_at(&mut self, point: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let candidates = self.links_at(point);
+        if candidates.is_empty() {
+            return false;
         }
-        if let Some((path, line)) = local_link(text, &self.root) {
-            self.open_path = Some((path, line));
-            cx.notify();
-            return true;
-        }
-        false
+        let task = cx
+            .background_executor()
+            .spawn(async move { links::resolve(&candidates) });
+        cx.spawn(async move |entity, cx| {
+            let resolved = task.await;
+            let _ = entity.update(cx, |this, cx| {
+                match resolved {
+                    Ok(Some(link)) => match link.target {
+                        links::Target::Url(url) => cx.open_url(&url),
+                        links::Target::File(file) => this.open_path = Some(file),
+                    },
+                    Err(message) => this.link_notice = Some((message.into(), Instant::now())),
+                    Ok(None) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.dirty.swap(false, Ordering::Relaxed);
+        if self
+            .link_notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(4))
+        {
+            self.link_notice = None;
+            changed = true;
+        }
         for event in self.events.try_iter().take(1024) {
             changed = true;
             match event {
                 Event::Title(t) => {
-                    if let Some(path) = t.strip_prefix("__VYBER_CWD__") {
+                    if let Some(path) = crate::pty::prompt_cwd(&t) {
                         self.root = PathBuf::from(path);
                     } else if let Some(message) = t.strip_prefix("__VYBER_NOTIFY__") {
                         self.notification = Some(message.into());
@@ -581,20 +661,24 @@ impl Terminal {
     pub fn paste(&mut self, text: &str) {
         self.track_typing(text);
         let bracket = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        let text = text.replace('\x1b', "");
-        self.send(
-            if bracket {
-                format!("\x1b[200~{text}\x1b[201~")
-            } else {
-                text.replace("\r\n", "\r").replace('\n', "\r")
-            }
-            .into_bytes(),
-        );
+        self.send(paste_bytes(text, bracket));
     }
     fn track_typing(&mut self, text: &str) {
-        if self.typed.len() < 4096 {
-            self.typed.push_str(text);
-        }
+        let part = typed_part(text, self.typed.len());
+        self.typed.push_str(part);
+    }
+    /// Bytes for a key press in the program's current keyboard mode.
+    fn key_input(
+        &self,
+        key: &str,
+        text: Option<&str>,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Option<Vec<u8>> {
+        let mode = *self.term.lock().mode();
+        let win32 = self.win32_input.load(Ordering::Relaxed);
+        encode_key(key, text, ctrl, alt, shift, mode, win32)
     }
     fn resize(&mut self, bounds: Bounds<Pixels>) {
         self.bounds = bounds;
@@ -640,8 +724,7 @@ impl Terminal {
             cx.propagate();
             return;
         }
-        let mode = *self.term.lock().mode();
-        if let Some(bytes) = key_bytes("tab", None, false, false, backwards, mode) {
+        if let Some(bytes) = self.key_input("tab", None, false, false, backwards) {
             self.term.lock().scroll_display(Scroll::Bottom);
             self.send(bytes);
             cx.notify();
@@ -669,14 +752,26 @@ impl Terminal {
             cx.stop_propagation();
             return;
         }
-        let mode = *self.term.lock().mode();
-        if let Some(bytes) = key_bytes(
+        // Ctrl+V pastes text, as in Windows Terminal. Without text on the
+        // clipboard (an image, files) the program gets the key and reads the
+        // clipboard itself, as Codex does for images.
+        if cfg!(windows)
+            && key.key == "v"
+            && key.modifiers.control
+            && !key.modifiers.shift
+            && !key.modifiers.alt
+            && let Some(text) = cx.read_from_clipboard().and_then(|i| i.text())
+        {
+            self.paste(&text);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(bytes) = self.key_input(
             &key.key,
             key.key_char.as_deref(),
             key.modifiers.control,
             key.modifiers.alt,
             key.modifiers.shift,
-            mode,
         ) {
             {
                 let mut term = self.term.lock();
@@ -735,7 +830,7 @@ impl Terminal {
                 as usize,
         )
     }
-    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.focus.is_focused(window) && window.is_window_active();
         if focused != self.last_focus {
             self.last_focus = focused;
@@ -765,21 +860,67 @@ impl Terminal {
         self.cell_height = (self.font_size * 1.25).ceil();
         self.resize(bounds);
         let scale = window.scale_factor();
-        let term = self.term.lock();
-        let content = term.renderable_content();
-        let offset = content.display_offset as i32;
-        for cell in content.display_iter {
-            let row = cell.point.line.0 + offset;
-            if row < 0 || row >= self.rows as i32 {
-                continue;
+        // Copy the visible cells and let go of the terminal before shaping
+        // text: the PTY thread waits for this lock to parse output, and keys
+        // queue behind it meanwhile.
+        let mut cells = std::mem::take(&mut self.cells);
+        cells.clear();
+        let (cursor, offset) = {
+            let term = self.term.lock();
+            let content = term.renderable_content();
+            let offset = content.display_offset as i32;
+            for cell in content.display_iter {
+                let row = cell.point.line.0 + offset;
+                if row < 0 || row >= self.rows as i32 {
+                    continue;
+                }
+                let mut fg = foreground(cell.fg, cell.flags, content.colors);
+                let mut bg = color(cell.bg, content.colors);
+                if cell.flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                if content.selection.is_some_and(|s| s.contains(cell.point)) {
+                    bg = 0x363145;
+                }
+                let text = cell.c != ' '
+                    && !cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN);
+                if bg == 0x000000 && !text {
+                    continue;
+                }
+                cells.push(PaintCell {
+                    column: cell.point.column.0,
+                    row: row as usize,
+                    c: text.then_some(cell.c),
+                    extra: cell.zerowidth().map(<[char]>::to_vec),
+                    fg,
+                    bg,
+                    bold: cell.flags.contains(Flags::BOLD),
+                    italic: cell.flags.contains(Flags::ITALIC),
+                });
             }
+            let cursor = content.cursor.point;
+            let row = cursor.line.0 + offset;
+            (
+                (row >= 0
+                    && row < self.rows as i32
+                    && content.mode.contains(TermMode::SHOW_CURSOR))
+                .then_some((row, cursor.column.0)),
+                offset,
+            )
+        };
+        // Re-hit-test after output, scrollback or a resize, including when the
+        // mouse is stationary. All filesystem resolution stays off this thread.
+        self.update_link_hover(window, cx);
+        for cell in &cells {
             let corner = |column: f32, row: f32| {
                 point(
                     bounds.origin.x + px(TERMINAL_INSET + column * self.cell_width),
                     bounds.origin.y + px(TERMINAL_INSET + row * self.cell_height),
                 )
             };
-            let (column, line) = (cell.point.column.0 as f32, row as f32);
+            let (column, line) = (cell.column as f32, cell.row as f32);
             let origin = corner(column, line);
             // Both corners come from cell numbers and snap to device pixels, so
             // neighbouring cells share their edges and fills leave no seams.
@@ -787,44 +928,31 @@ impl Terminal {
                 Bounds::from_corners(origin, corner(column + 1., line + 1.)),
                 scale,
             );
-            let mut fg = foreground(cell.fg, cell.flags, content.colors);
-            let mut bg = color(cell.bg, content.colors);
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
+            if cell.bg != 0x000000 {
+                window.paint_quad(fill(area, rgb(cell.bg)));
             }
-            let selected = content.selection.is_some_and(|s| s.contains(cell.point));
-            if selected {
-                bg = 0x363145;
-            }
-            if bg != 0x000000 {
-                window.paint_quad(fill(area, rgb(bg)));
-            }
-            if cell.c == ' '
-                || cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN)
-            {
+            let Some(c) = cell.c else {
+                continue;
+            };
+            if crate::glyphs::paint(c, area, rgb(cell.fg).into(), self.font_size, window) {
                 continue;
             }
-            if crate::glyphs::paint(cell.c, area, rgb(fg).into(), self.font_size, window) {
-                continue;
-            }
-            let mut text = cell.c.to_string();
-            if let Some(extra) = cell.zerowidth() {
+            let mut text = c.to_string();
+            if let Some(extra) = &cell.extra {
                 text.extend(extra);
             }
             let mut run = TextRun {
                 len: text.len(),
                 font: font.clone(),
-                color: rgb(fg).into(),
+                color: rgb(cell.fg).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            if cell.flags.contains(Flags::BOLD) {
+            if cell.bold {
                 run.font.weight = FontWeight::BOLD;
             }
-            if cell.flags.contains(Flags::ITALIC) {
+            if cell.italic {
                 run.font.style = FontStyle::Italic;
             }
             let shaped =
@@ -840,18 +968,44 @@ impl Terminal {
                 cx,
             );
         }
-        let cursor = content.cursor.point;
-        let row = cursor.line.0 + offset;
-        if row >= 0
-            && row < self.rows as i32
-            && content.mode.contains(TermMode::SHOW_CURSOR)
+        if let Some(link) = &self.hovered_link {
+            for (line, columns) in link.spans() {
+                let row = line.0 + offset;
+                if row < 0 || row >= self.rows as i32 {
+                    continue;
+                }
+                let fg = cells
+                    .iter()
+                    .find(|cell| cell.row == row as usize && cell.column == columns.start)
+                    .map_or(0xb4a5ff, |cell| cell.fg);
+                window.paint_quad(fill(
+                    crate::glyphs::snap(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x
+                                    + px(TERMINAL_INSET + columns.start as f32 * self.cell_width),
+                                bounds.origin.y
+                                    + px(TERMINAL_INSET + (row + 1) as f32 * self.cell_height - 2.),
+                            ),
+                            size(
+                                px((columns.end - columns.start) as f32 * self.cell_width),
+                                px(1.),
+                            ),
+                        ),
+                        scale,
+                    ),
+                    rgb(fg),
+                ));
+            }
+        }
+        self.cells = cells;
+        if let Some((row, column)) = cursor
             && self.focus.is_focused(window)
         {
             window.paint_quad(fill(
                 Bounds::new(
                     point(
-                        bounds.origin.x
-                            + px(TERMINAL_INSET + cursor.column.0 as f32 * self.cell_width),
+                        bounds.origin.x + px(TERMINAL_INSET + column as f32 * self.cell_width),
                         bounds.origin.y + px(TERMINAL_INSET + row as f32 * self.cell_height),
                     ),
                     size(px(2.), px(self.cell_height)),
@@ -1028,7 +1182,7 @@ impl Terminal {
 }
 
 impl Render for Terminal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let badge = self.badge_element(cx);
         div()
@@ -1040,6 +1194,26 @@ impl Render for Terminal {
             .overflow_hidden()
             .bg(rgb(0x000000))
             .cursor_text()
+            .when(
+                self.hovered_link.is_some()
+                    && window.is_window_active()
+                    && (window.modifiers().control || window.modifiers().platform),
+                |el| el.cursor_pointer(),
+            )
+            .when_some(self.hovered_link.clone(), |el, link| {
+                let label = link.target.label();
+                el.tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+                })
+            })
+            .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                this.pointer_inside = *hovered;
+                this.update_link_hover(window, cx);
+            }))
+            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, window, cx| {
+                this.update_link_hover(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &TerminalTab, window, cx| this.tab(false, window, cx)))
             .on_action(
                 cx.listener(|this, _: &TerminalBackTab, window, cx| this.tab(true, window, cx)),
@@ -1054,6 +1228,8 @@ impl Render for Terminal {
                     window.focus(&this.focus, cx);
                     if (e.modifiers.control || e.modifiers.platform) && this.link_at(e.position, cx)
                     {
+                        this.link_click_consumed = true;
+                        this.selecting = false;
                         cx.stop_propagation();
                         return;
                     }
@@ -1079,7 +1255,15 @@ impl Render for Terminal {
                     cx.notify();
                 }),
             )
-            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                this.update_link_hover(window, cx);
+                if this.link_click_consumed
+                    || ((e.modifiers.control || e.modifiers.platform)
+                        && this.hovered_link.is_some())
+                {
+                    cx.stop_propagation();
+                    return;
+                }
                 if cx.has_active_drag() {
                     return;
                 }
@@ -1111,6 +1295,10 @@ impl Render for Terminal {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.link_click_consumed) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if cx.has_active_drag() {
                         return;
                     }
@@ -1122,6 +1310,14 @@ impl Render for Terminal {
                         this.mouse(e.position, 0, true);
                     }
                     cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.link_click_consumed) {
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .on_mouse_down(
@@ -1197,6 +1393,22 @@ impl Render for Terminal {
                 )
                 .size_full(),
             )
+            .when_some(self.link_notice.clone(), |el, (message, _)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_3()
+                        .left_3()
+                        .max_w(px(460.))
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .bg(rgb(0x24212c))
+                        .text_size(px(12.))
+                        .text_color(rgb(0xd6d6d6))
+                        .child(message),
+                )
+            })
             .when(self.search_visible, |el| {
                 el.child(
                     div()
@@ -1314,7 +1526,188 @@ impl EntityInputHandler for Terminal {
     }
 }
 
+/// Bytes for a key press. A program that negotiated Kitty's keyboard
+/// protocol gets CSI u for the keys it covers. On Windows, once ConPTY has
+/// asked for win32-input-mode (`win32`), every other key goes as a complete
+/// win32 key event: after one such event ConPTY takes a raw ESC for the start
+/// of a sequence and holds it until more input arrives, so a raw Escape would
+/// wait for the next key and merge into it (ESC + x arrives as Alt+X, ESC + a
+/// mouse report vanishes). Other terminals get the legacy sequences.
+pub fn encode_key(
+    key: &str,
+    text: Option<&str>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    mode: TermMode,
+    win32: bool,
+) -> Option<Vec<u8>> {
+    kitty_key(key, ctrl, alt, shift, mode).or_else(|| {
+        if win32 {
+            win32_key(key, text, ctrl, alt, shift)
+        } else {
+            legacy_key(key, text, ctrl, alt, shift, mode)
+        }
+    })
+}
+
+/// Bytes for a key press outside win32-input-mode.
+#[cfg(test)]
 pub fn key_bytes(
+    key: &str,
+    text: Option<&str>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    encode_key(key, text, ctrl, alt, shift, mode, false)
+}
+
+fn kitty_key(key: &str, ctrl: bool, alt: bool, shift: bool, mode: TermMode) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC)
+        || (ctrl && alt)
+    {
+        return None;
+    }
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    let code = match key {
+        "enter" => 13,
+        "escape" => 27,
+        "tab" => 9,
+        "backspace" => 127,
+        "space" => 32,
+        _ => {
+            let mut chars = key.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            c as u32
+        }
+    };
+    (modifier > 1 || key == "escape" || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+        .then(|| format!("\x1b[{code};{modifier}u").into_bytes())
+}
+
+/// A key as win32-input-mode's `CSI Vk;Sc;Uc;Kd;Cs;Rc _`, pressed and then
+/// released. ConPTY turns it into a console key event for programs that read
+/// those (Codex, PowerShell) and into VT input for the others. It covers the
+/// same keys as the legacy sequences; plain characters arrive as text.
+pub fn win32_key(
+    key: &str,
+    text: Option<&str>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<Vec<u8>> {
+    const SHIFT: u32 = 0x10;
+    const CTRL: u32 = 0x08;
+    const ALT: u32 = 0x02;
+    const ENHANCED: u32 = 0x100;
+    // Virtual key, the character the key types, and whether it is one of the
+    // keys Windows marks as enhanced (not on the numeric keypad).
+    let (vk, ch, enhanced): (u16, u32, bool) = match key {
+        "escape" => (0x1b, 27, false),
+        // Ctrl+Enter types LF in Windows. Shift+Enter does too here: programs
+        // that read VT input lose Shift on Enter, and LF still breaks the line.
+        "enter" => (0x0d, if shift || ctrl { 10 } else { 13 }, false),
+        "tab" => (0x09, 9, false),
+        "backspace" => (0x08, if ctrl { 0x7f } else { 8 }, false),
+        "up" => (0x26, 0, true),
+        "down" => (0x28, 0, true),
+        "left" => (0x25, 0, true),
+        "right" => (0x27, 0, true),
+        "home" => (0x24, 0, true),
+        "end" => (0x23, 0, true),
+        "insert" => (0x2d, 0, true),
+        "delete" => (0x2e, 0, true),
+        "pageup" => (0x21, 0, true),
+        "pagedown" => (0x22, 0, true),
+        "space" if ctrl || alt => (0x20, 32, false),
+        _ => {
+            if let Some(n) = key
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<u16>().ok())
+                .filter(|n| (1..=12).contains(n))
+            {
+                (0x6f + n, 0, false)
+            } else {
+                // A character is a key only with Ctrl or Alt; with both it is
+                // AltGr typing, which arrives as text.
+                if ctrl == alt {
+                    return None;
+                }
+                let mut chars = key.chars();
+                let c = chars.next()?;
+                if chars.next().is_some() {
+                    return None;
+                }
+                let ch = if ctrl {
+                    if !c.is_ascii() {
+                        return None;
+                    }
+                    match c.to_ascii_uppercase() {
+                        letter @ 'A'..='Z' => letter as u32 & 31,
+                        '@' | '[' | '\\' | ']' | '^' | '_' => c as u32 & 31,
+                        _ => 0,
+                    }
+                } else {
+                    let mut typed = text?.chars();
+                    let typed_char = typed.next()?;
+                    if typed.next().is_some() || typed_char as u32 > 0xffff {
+                        return None;
+                    }
+                    typed_char as u32
+                };
+                (virtual_key(c), ch, false)
+            }
+        }
+    };
+    let state = SHIFT * u32::from(shift)
+        + CTRL * u32::from(ctrl)
+        + ALT * u32::from(alt)
+        + if enhanced { ENHANCED } else { 0 };
+    let sc = scan_code(vk);
+    Some(format!("\x1b[{vk};{sc};{ch};1;{state};1_\x1b[{vk};{sc};{ch};0;{state};1_").into_bytes())
+}
+
+/// The virtual key for a character key. GPUI names letter keys by their
+/// virtual key, so letters map back directly.
+fn virtual_key(c: char) -> u16 {
+    match c.to_ascii_uppercase() {
+        key @ ('A'..='Z' | '0'..='9') => key as u16,
+        _ => {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
+                let mut units = [0u16; 2];
+                if c.encode_utf16(&mut units).len() == 1 {
+                    let scan = unsafe { VkKeyScanW(units[0]) };
+                    if scan != -1 {
+                        return (scan as u16) & 0xff;
+                    }
+                }
+            }
+            0
+        }
+    }
+}
+
+fn scan_code(vk: u16) -> u16 {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+        unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vk;
+        0
+    }
+}
+
+fn legacy_key(
     key: &str,
     text: Option<&str>,
     ctrl: bool,
@@ -1324,34 +1717,10 @@ pub fn key_bytes(
 ) -> Option<Vec<u8>> {
     let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
     let modified = modifier > 1;
-    if mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC)
-        && !(ctrl && alt)
-    {
-        let code = match key {
-            "enter" => Some(13),
-            "escape" => Some(27),
-            "tab" => Some(9),
-            "backspace" => Some(127),
-            "space" => Some(32),
-            _ => {
-                if key.chars().count() == 1 {
-                    key.chars().next().map(|c| c as u32)
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(code) = code
-            && (modified || key == "escape" || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
-        {
-            return Some(format!("\x1b[{code};{modifier}u").into_bytes());
-        }
-    }
-
     let value = match key {
         "enter" => {
             if shift {
-                "\x1b[13;2u".into()
+                format!("\x1b[13;{modifier}u")
             } else {
                 "\r".into()
             }
@@ -1436,32 +1805,40 @@ pub fn key_bytes(
     };
     Some(value.into_bytes())
 }
-pub fn local_link(text: &str, root: &Path) -> Option<(PathBuf, usize)> {
-    let mut path = text;
-    let mut line = 1;
-    if let Some((p, n)) = path.rsplit_once(':')
-        && let Ok(value) = n.parse::<usize>()
-    {
-        path = p;
-        line = value;
-        if let Some((p, n)) = path.rsplit_once(':')
-            && let Ok(value) = n.parse::<usize>()
-        {
-            path = p;
-            line = value;
+
+/// The start of `text` that still fits in the typed text after `used`
+/// bytes, so a large paste keeps at most 4 KB of it.
+fn typed_part(text: &str, used: usize) -> &str {
+    let mut end = TYPED_LIMIT.saturating_sub(used).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// What a paste writes: bracketed when the program asked for it, with ESC
+/// removed so the text cannot end the paste early; otherwise line breaks go
+/// as Enter.
+fn paste_bytes(text: &str, bracket: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 12);
+    let mut bytes = text.bytes().filter(|b| *b != 0x1b).peekable();
+    if bracket {
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend(bytes);
+        out.extend_from_slice(b"\x1b[201~");
+    } else {
+        while let Some(b) = bytes.next() {
+            match b {
+                b'\r' => {
+                    bytes.next_if_eq(&b'\n');
+                    out.push(b'\r');
+                }
+                b'\n' => out.push(b'\r'),
+                _ => out.push(b),
+            }
         }
     }
-    let path = PathBuf::from(path);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    if path.is_file() {
-        Some((path, line))
-    } else {
-        None
-    }
+    out
 }
 
 fn color(c: Color, overrides: &alacritty_terminal::term::color::Colors) -> u32 {
@@ -1744,8 +2121,16 @@ mod tests {
             .display_iter
             .map(|c| c.c)
             .collect::<String>();
+        let win32 = backend
+            .win32_input
+            .load(std::sync::atomic::Ordering::Relaxed);
         if initial.contains("Update available") && initial.contains("esc skip") {
-            backend.sender.send(Msg::Input(vec![27].into()))?;
+            let mode = *backend.term.lock().mode();
+            backend.sender.send(Msg::Input(
+                super::encode_key("escape", None, false, false, false, mode, win32)
+                    .unwrap()
+                    .into(),
+            ))?;
             read_for(3.);
         }
         let screen = backend
@@ -1762,12 +2147,14 @@ mod tests {
             );
         }
         let mode = *backend.term.lock().mode();
+        // If a broken Shift+Enter submits, /status remains a local command
+        // instead of starting an agent request.
         backend
             .sender
-            .send(Msg::Input(b"vyber_input_first".to_vec().into()))?;
+            .send(Msg::Input(b"/status".to_vec().into()))?;
         read_for(0.3);
         backend.sender.send(Msg::Input(
-            key_bytes("enter", None, false, false, true, mode)
+            super::encode_key("enter", None, false, false, true, mode, win32)
                 .unwrap()
                 .into(),
         ))?;
@@ -1781,7 +2168,7 @@ mod tests {
         }
         let first = rows
             .iter()
-            .find(|(_, s)| s.contains("vyber_input_first"))
+            .rfind(|(_, s)| s.contains("/status"))
             .map(|(r, _)| *r);
         let second = rows
             .iter()
@@ -1794,8 +2181,8 @@ mod tests {
             "{program}: keyboard flags={mode:?}, first line={first:?}, second line={second:?}; no Enter submission sent"
         );
         assert!(
-            first.is_some() && second.is_some() && first != second,
-            "CLI did not show two separate input rows; may be at an onboarding/trust screen"
+            first.is_some() && second == first.map(|row| row + 1),
+            "CLI did not show two adjacent input rows; may be at an onboarding/trust screen"
         );
         Ok(())
     }
@@ -1841,6 +2228,246 @@ mod tests {
             output.contains("VYBER_PROBE_OK"),
             "ConPTY output not parsed: {output}"
         );
+        Ok(())
+    }
+    /// A shell in a real ConPTY, driven the way Vyber drives it.
+    #[cfg(windows)]
+    struct Console(super::Backend);
+    #[cfg(windows)]
+    impl Console {
+        fn start(id: usize, program: &str) -> anyhow::Result<Self> {
+            let root = std::env::temp_dir();
+            Ok(Self(super::Terminal::prepare(id, &root, Some(program))?))
+        }
+        fn pump(&self) {
+            for event in self.0.events.try_iter() {
+                if let Event::PtyWrite(text) = event {
+                    self.send(text.as_bytes());
+                }
+            }
+        }
+        fn send(&self, bytes: &[u8]) {
+            let _ = self.0.sender.send(Msg::Input(bytes.to_vec().into()));
+        }
+        fn key(
+            &self,
+            key: &str,
+            text: Option<&str>,
+            ctrl: bool,
+            alt: bool,
+            shift: bool,
+        ) -> Vec<u8> {
+            let mode = *self.0.term.lock().mode();
+            let win32 = self
+                .0
+                .win32_input
+                .load(std::sync::atomic::Ordering::Relaxed);
+            super::encode_key(key, text, ctrl, alt, shift, mode, win32).unwrap()
+        }
+        /// Every line, scrollback included.
+        fn text(&self) -> String {
+            let term = self.0.term.lock();
+            let grid = term.grid();
+            let top = -(grid.history_size() as i32);
+            (top..grid.screen_lines() as i32)
+                .map(|line| {
+                    (0..grid.columns())
+                        .map(|column| grid[TermPoint::new(Line(line), Column(column))].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        fn wait_for(&self, done: impl Fn(&str) -> bool, seconds: u64) -> (bool, String) {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            loop {
+                self.pump();
+                let text = self.text();
+                if done(&text) {
+                    return (true, text);
+                }
+                if Instant::now() > deadline {
+                    return (false, text);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    #[cfg(windows)]
+    impl Drop for Console {
+        fn drop(&mut self) {
+            let _ = self.0.sender.send(Msg::Shutdown);
+        }
+    }
+    #[cfg(windows)]
+    use super::{Column, Dimensions, Event, Line, Msg, TermPoint};
+    #[cfg(windows)]
+    use std::time::{Duration, Instant};
+
+    /// Keys a console program reads with ReadConsoleInput, as Codex does,
+    /// after the cases that used to lose Escape: a win32 key before it (Vyber's
+    /// Shift+Enter), a mouse or focus report in the same write, a double press.
+    #[test]
+    #[cfg(windows)]
+    fn real_conpty_console_programs_get_every_key() -> anyhow::Result<()> {
+        let console = Console::start(9004, "powershell.exe")?;
+        console.send(b"Write-Output ('VYBER_' + 'READY'); while ($true) { $k = [Console]::ReadKey($true); Write-Output ('K=' + $k.Key + '/' + $k.Modifiers + ';'); if ($k.Key -eq 'Q') { break } }\r");
+        let (ready, text) = console.wait_for(|t| t.contains("VYBER_READY"), 20);
+        assert!(ready, "PowerShell did not start: {text}");
+        let mode = *console.0.term.lock().mode();
+        // Check the legacy path before sending any Win32 event. Some ConPTY
+        // hosts, including the Windows 2022 CI host, never request mode 9001.
+        let mut presses = vec![
+            super::encode_key("escape", None, false, false, false, mode, false).unwrap(),
+            super::encode_key("up", None, false, false, false, mode, false).unwrap(),
+            b"\r".to_vec(),
+            b"a".to_vec(),
+        ];
+        let mut expected = vec!["Escape/0", "UpArrow/0", "Enter/0", "A/0"];
+        if console
+            .0
+            .win32_input
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let esc = console.key("escape", None, false, false, false);
+            let mut glued = esc.clone();
+            glued.extend_from_slice(b"\x1b[<35;10;5M\x1b[I");
+            let mut double = esc.clone();
+            double.extend_from_slice(&esc);
+            presses.extend([
+                console.key("enter", None, false, false, true),
+                esc.clone(),
+                glued,
+                double,
+                console.key("x", Some("x"), false, true, false),
+                console.key("enter", None, true, false, false),
+                console.key("up", None, false, false, false),
+                console.key("space", None, true, false, false),
+            ]);
+            expected.extend([
+                "Enter/Shift",
+                "Escape/0",
+                "Escape/0",
+                "Escape/0",
+                "Escape/0",
+                "X/Alt",
+                "Enter/Control",
+                "UpArrow/0",
+                "Spacebar/Control",
+            ]);
+        }
+        presses.push(b"q".to_vec());
+        expected.push("Q/0");
+        for press in presses {
+            console.send(&press);
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let keys = |text: &str| {
+            text.lines()
+                .filter_map(|line| line.trim().strip_prefix("K="))
+                .filter_map(|rest| rest.split_once(';').map(|(key, _)| key.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let (done, text) = console.wait_for(|t| keys(t).len() >= expected.len(), 10);
+        assert!(done, "keys went missing: {:?}\n{text}", keys(&text));
+        assert_eq!(keys(&text), expected);
+        Ok(())
+    }
+
+    /// Ctrl+C still stops the running command in each shell Vyber starts.
+    #[test]
+    #[cfg(windows)]
+    fn real_conpty_ctrl_c_interrupts_commands() -> anyhow::Result<()> {
+        let bash = "C:/Program Files/Git/bin/bash.exe";
+        let mut shells = vec![(
+            "powershell.exe",
+            "Start-Sleep -Seconds 20; Write-Output ('VYBER_' + 'SLEPT')\r",
+            "Write-Output ('VYBER_' + 'AFTER')\r",
+        )];
+        if std::path::Path::new(bash).exists() {
+            shells.push((
+                bash,
+                "sleep 20 && echo VYBER_$((1))SLEPT\r",
+                "echo VYBER_$((0))AFTER\r",
+            ));
+        }
+        for (id, (program, slow, after)) in shells.into_iter().enumerate() {
+            let console = Console::start(9010 + id, program)?;
+            let (ready, text) = console.wait_for(|t| t.contains('>') || t.contains('$'), 20);
+            assert!(ready, "{program} did not start: {text}");
+            std::thread::sleep(Duration::from_millis(500));
+            console.send(slow.as_bytes());
+            std::thread::sleep(Duration::from_millis(1500));
+            console.send(&console.key("c", None, true, false, false));
+            std::thread::sleep(Duration::from_millis(500));
+            console.send(after.as_bytes());
+            let (stopped, text) = console.wait_for(
+                |t| t.contains("VYBER_0AFTER") || t.contains("VYBER_AFTER"),
+                10,
+            );
+            assert!(
+                stopped && !text.contains("VYBER_SLEPT") && !text.contains("VYBER_1SLEPT"),
+                "{program}: Ctrl+C did not interrupt:\n{text}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Programs that read VT input (Node, so Claude Code) get the bytes
+    /// ConPTY derives from win32 key events.
+    #[test]
+    #[ignore = "needs Node.js"]
+    #[cfg(windows)]
+    fn real_conpty_vt_programs_get_vt_keys() -> anyhow::Result<()> {
+        let script = std::env::temp_dir().join("vyber-vt-keys.js");
+        std::fs::write(
+            &script,
+            "process.stdin.setRawMode(true);process.stdin.resume();console.log('VYBER_READY');\
+             process.stdin.on('data',d=>{process.stdout.write('K='+d.toString('hex')+';\\r\\n');if(d.includes(113))process.exit()});",
+        )?;
+        let console = Console::start(9020, "powershell.exe")?;
+        console.send(format!("node '{}'\r", script.display()).as_bytes());
+        let (ready, text) = console.wait_for(|t| t.contains("VYBER_READY"), 20);
+        assert!(ready, "node did not start: {text}");
+        // ConPTY gives these programs nothing for Ctrl+Space, as a win32
+        // event or as the raw NUL Vyber sent before, so it is not listed.
+        type VtKeyCase<'a> = (&'a str, Option<&'a str>, bool, bool, bool, &'a str);
+        let cases: [VtKeyCase<'_>; 11] = [
+            ("escape", None, false, false, false, "1b"),
+            ("enter", None, false, false, true, "0a"),
+            ("x", Some("x"), false, true, false, "1b78"),
+            ("a", None, true, false, false, "01"),
+            ("backspace", None, false, false, false, "7f"),
+            ("backspace", None, true, false, false, "08"),
+            ("tab", None, false, false, true, "1b5b5a"),
+            ("up", None, false, false, false, "1b5b41"),
+            ("left", None, true, false, false, "1b5b313b3544"),
+            ("delete", None, false, false, false, "1b5b337e"),
+            ("f5", None, false, false, false, "1b5b31357e"),
+        ];
+        for (key, text, ctrl, alt, shift, _) in cases {
+            console.send(&console.key(key, text, ctrl, alt, shift));
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        console.send(b"q");
+        let count = |t: &str| t.lines().filter(|l| l.trim().starts_with("K=")).count();
+        let (done, text) = console.wait_for(|t| count(t) > cases.len(), 10);
+        let got = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("K="))
+            .filter_map(|rest| rest.split_once(';').map(|(key, _)| key.to_owned()))
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_file(&script);
+        assert!(done, "keys went missing: {got:?}");
+        for (i, case) in cases.iter().enumerate() {
+            assert_eq!(
+                got[i], case.5,
+                "{} ctrl={} alt={} shift={}",
+                case.0, case.2, case.3, case.4
+            );
+        }
         Ok(())
     }
 
@@ -2080,6 +2707,50 @@ mod tests {
         assert!(!term.mode().contains(TermMode::ALT_SCREEN));
     }
     #[test]
+    fn keyboard_protocol_negotiates_and_restores_legacy_input() {
+        use super::{Event, Proxy, Size};
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+        let (tx, rx) = mpsc::channel();
+        let proxy = Proxy {
+            dirty: Arc::new(AtomicBool::new(false)),
+            sender: tx,
+        };
+        let config = alacritty_terminal::term::Config {
+            kitty_keyboard: true,
+            ..Default::default()
+        };
+        let mut term = alacritty_terminal::Term::new(config, &Size { cols: 80, rows: 24 }, proxy);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, b"\x1b[?u");
+        assert!(
+            rx.try_iter()
+                .any(|event| matches!(event, Event::PtyWrite(text) if text == "\x1b[?0u"))
+        );
+
+        parser.advance(&mut term, b"\x1b[>1u");
+        assert!(term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(
+            key_bytes("enter", None, false, false, true, *term.mode()),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            key_bytes("t", None, true, false, false, *term.mode()),
+            Some(b"\x1b[116;5u".to_vec())
+        );
+
+        parser.advance(&mut term, b"\x1b[<u");
+        assert!(!term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(
+            key_bytes("enter", None, false, false, false, *term.mode()),
+            Some(vec![13])
+        );
+        assert_eq!(
+            key_bytes("t", None, true, false, false, *term.mode()),
+            Some(vec![20])
+        );
+    }
+    #[test]
     fn key_sequences() {
         assert_eq!(
             key_bytes("tab", None, false, false, false, TermMode::empty()),
@@ -2105,8 +2776,26 @@ mod tests {
             Some(vec![3])
         );
         assert_eq!(
-            key_bytes("enter", None, false, false, true, TermMode::empty()),
+            key_bytes(
+                "enter",
+                None,
+                false,
+                false,
+                true,
+                TermMode::DISAMBIGUATE_ESC_CODES
+            ),
             Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            key_bytes(
+                "enter",
+                None,
+                true,
+                false,
+                true,
+                TermMode::DISAMBIGUATE_ESC_CODES
+            ),
+            Some(b"\x1b[13;6u".to_vec())
         );
         assert_eq!(
             key_bytes("up", None, false, false, false, TermMode::APP_CURSOR),
@@ -2116,5 +2805,246 @@ mod tests {
             key_bytes("q", Some("@"), true, true, false, TermMode::empty()),
             None
         );
+    }
+    /// The fields of a win32-input-mode press and release.
+    fn win32_fields(bytes: &[u8]) -> Vec<Vec<u32>> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        text.split('\x1b')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let body = s.strip_prefix('[').unwrap().strip_suffix('_').unwrap();
+                body.split(';').map(|n| n.parse().unwrap()).collect()
+            })
+            .collect()
+    }
+    #[test]
+    fn win32_keys_carry_virtual_key_character_and_modifiers() {
+        use super::{scan_code, win32_key};
+        // (key, text, ctrl, alt, shift) -> (virtual key, character, state)
+        let cases = [
+            (("escape", None, false, false, false), (27, 27, 0)),
+            (("enter", None, false, false, false), (13, 13, 0)),
+            (("enter", None, false, false, true), (13, 10, 0x10)),
+            (("enter", None, true, false, false), (13, 10, 0x08)),
+            (("backspace", None, true, false, false), (8, 0x7f, 0x08)),
+            (("tab", None, false, false, true), (9, 9, 0x10)),
+            (("up", None, false, false, false), (0x26, 0, 0x100)),
+            (("delete", None, false, false, true), (0x2e, 0, 0x110)),
+            (("f5", None, false, false, false), (0x74, 0, 0)),
+            (("f12", None, true, false, false), (0x7b, 0, 0x08)),
+            (("c", None, true, false, false), (0x43, 3, 0x08)),
+            (
+                ("x", Some("X"), false, true, true),
+                (0x58, 'X' as u32, 0x12),
+            ),
+            (("space", Some(" "), false, true, false), (0x20, 32, 0x02)),
+            (("space", None, true, false, false), (0x20, 32, 0x08)),
+        ];
+        for ((key, text, ctrl, alt, shift), (vk, ch, state)) in cases {
+            let bytes = win32_key(key, text, ctrl, alt, shift).unwrap();
+            let sc = u32::from(scan_code(vk as u16));
+            assert_eq!(
+                win32_fields(&bytes),
+                vec![vec![vk, sc, ch, 1, state, 1], vec![vk, sc, ch, 0, state, 1]],
+                "{key} ctrl={ctrl} alt={alt} shift={shift}"
+            );
+        }
+        // Characters are text unless Ctrl or Alt alone is held.
+        for (key, text, ctrl, alt) in [
+            ("a", Some("a"), false, false),
+            ("q", Some("@"), true, true),
+            ("space", Some(" "), false, false),
+            ("ş", Some("ş"), true, false),
+            ("f13", None, false, false),
+        ] {
+            assert_eq!(win32_key(key, text, ctrl, alt, false), None, "{key}");
+        }
+    }
+    #[test]
+    fn keys_follow_kitty_then_win32_then_legacy() {
+        use super::encode_key;
+        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        // A program that negotiated Kitty keeps CSI u, even under ConPTY.
+        assert_eq!(
+            encode_key("escape", None, false, false, false, kitty, true),
+            Some(b"\x1b[27;1u".to_vec())
+        );
+        // Keys Kitty leaves alone go as win32 events, never a bare ESC.
+        let up = encode_key("up", None, false, false, false, kitty, true).unwrap();
+        assert_eq!(win32_fields(&up)[0][0], 0x26);
+        let esc = encode_key("escape", None, true, true, false, kitty, true).unwrap();
+        assert_eq!(win32_fields(&esc)[0][0], 27);
+        // Without ConPTY's request the legacy sequences stay.
+        assert_eq!(
+            encode_key(
+                "escape",
+                None,
+                false,
+                false,
+                false,
+                TermMode::empty(),
+                false
+            ),
+            Some(vec![27])
+        );
+        assert_eq!(
+            encode_key("enter", None, false, false, true, TermMode::empty(), false),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        // Plain characters are text in every mode.
+        for win32 in [false, true] {
+            assert_eq!(
+                encode_key(
+                    "a",
+                    Some("a"),
+                    false,
+                    false,
+                    false,
+                    TermMode::empty(),
+                    win32
+                ),
+                None
+            );
+        }
+    }
+    #[test]
+    fn keyboard_reset_restores_legacy_keys() {
+        use super::Size;
+        let (proxy, _events) = super::Proxy::channel();
+        let config = alacritty_terminal::term::Config {
+            kitty_keyboard: true,
+            ..Default::default()
+        };
+        let mut term = alacritty_terminal::Term::new(config, &Size { cols: 80, rows: 24 }, proxy);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        // A program pushed modes twice and set one more, then crashed.
+        parser.advance(&mut term, b"\x1b[>1u\x1b[>3u\x1b[=8;2u");
+        assert!(term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        parser.advance(&mut term, crate::pty::KEYBOARD_RESET);
+        assert!(!term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(
+            key_bytes("c", None, true, false, false, *term.mode()),
+            Some(vec![3])
+        );
+    }
+    #[test]
+    fn pastes_are_sanitized_without_extra_copies() {
+        use super::paste_bytes;
+        assert_eq!(
+            paste_bytes("a\x1b[201~b\r\nc", true),
+            b"\x1b[200~a[201~b\r\nc\x1b[201~".to_vec()
+        );
+        assert_eq!(
+            paste_bytes("a\r\nb\nc\rd\x1b", false),
+            b"a\rb\rc\rd".to_vec()
+        );
+        let big = "ğ".repeat(3_000_000);
+        assert_eq!(paste_bytes(&big, true).len(), big.len() + 12);
+    }
+    #[test]
+    fn typed_text_stays_within_its_limit() {
+        use super::{TYPED_LIMIT, typed_part};
+        let big = "ğ".repeat(10_000);
+        let first = typed_part(&big, 0);
+        assert!(first.len() <= TYPED_LIMIT && first.len() > TYPED_LIMIT - 2);
+        assert_eq!(typed_part(&big, first.len()), "");
+        assert_eq!(typed_part("abc", TYPED_LIMIT - 2), "ab");
+        assert_eq!(typed_part("abc", TYPED_LIMIT + 10), "");
+    }
+}
+
+#[cfg(test)]
+mod link_interaction_tests {
+    use super::{FileLink, Proxy, Size, Terminal};
+    use alacritty_terminal::{sync::FairMutex, term::Term};
+    use gpui::{Modifiers, MouseButton, TestAppContext, point, px};
+    use std::sync::Arc;
+
+    #[gpui_kit::test]
+    fn ctrl_hover_without_mouse_motion_and_click_release_use_the_same_file(
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("report.md");
+        std::fs::write(&path, "# Report").unwrap();
+        let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let mut backend = Terminal::prepare(9901, root.path(), Some(shell)).unwrap();
+        // Keep the real input backend, but use a separate deterministic output
+        // grid: a shell startup prompt must not overwrite the link fixture.
+        let (proxy, _events) = Proxy::channel();
+        let mut term = Term::new(
+            Default::default(),
+            &Size {
+                cols: 100,
+                rows: 30,
+            },
+            proxy,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, b"Rapor (report.md).");
+        backend.term = Arc::new(FairMutex::new(term));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(crate::config::Config::default());
+            crate::theme::apply(cx);
+        });
+        let terminal_root = root.path().to_owned();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            window.activate_window();
+            let terminal = Terminal::new(9901, &terminal_root, backend, cx);
+            window.focus(&terminal.focus, cx);
+            terminal
+        });
+        let position = view.read_with(cx, |terminal, _| {
+            terminal.bounds.origin
+                + point(
+                    px(super::TERMINAL_INSET + terminal.cell_width * 8.5),
+                    px(super::TERMINAL_INSET + terminal.cell_height * 0.5),
+                )
+        });
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_mouse_move(position, None, Modifiers::none());
+        assert!(view.read_with(cx, |terminal, _| terminal.hovered_link.is_none()));
+        cx.simulate_modifiers_change(ctrl);
+        assert!(view.read_with(cx, |terminal, _| terminal.hovered_link.is_some()));
+        assert_eq!(
+            view.read_with(cx, |terminal, _| terminal
+                .hovered_link
+                .as_ref()
+                .unwrap()
+                .spans()
+                .len()),
+            1
+        );
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert!(view.read_with(cx, |terminal, _| terminal.hovered_link.is_none()));
+        cx.simulate_modifiers_change(ctrl);
+        cx.simulate_mouse_down(position, MouseButton::Left, ctrl);
+        assert!(view.read_with(cx, |terminal, _| terminal.link_click_consumed));
+        assert!(!view.read_with(cx, |terminal, _| terminal.selecting));
+        cx.simulate_mouse_up(position, MouseButton::Left, ctrl);
+        assert!(!view.read_with(cx, |terminal, _| terminal.link_click_consumed));
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |terminal, _| terminal.open_path.clone()),
+            Some(FileLink {
+                path,
+                location: None
+            })
+        );
+        cx.simulate_mouse_move(point(px(-10.), px(-10.)), None, ctrl);
+        assert!(view.read_with(cx, |terminal, _| terminal.hovered_link.is_none()));
+    }
+}
+impl EventListener for Proxy {
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::Wakeup | Event::MouseCursorDirty) {
+            self.dirty.store(true, Ordering::Relaxed);
+        } else {
+            let _ = self.sender.send(event);
+        }
     }
 }

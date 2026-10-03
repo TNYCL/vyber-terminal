@@ -18,12 +18,12 @@ alacritty_terminal = "=0.26.0"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = "1.1"
 notify = "8"
 ignore = "0.4"
-similar = "2"
+similar = "3"
 smol = "2"
-dirs = "6"
+dirs = "7"
 chrono = { version = "0.4", features = ["serde"] }
 blake3 = "1"
 log = "0.4"
@@ -33,7 +33,7 @@ url = "2"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console"] }
 
 [build-dependencies]
 embed-resource = "3"
