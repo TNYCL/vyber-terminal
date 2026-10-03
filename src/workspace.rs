@@ -96,108 +96,177 @@ pub struct FileEntry {
     pub repository: bool,
 }
 
-const SCAN_LIMIT: usize = 30_000;
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileListing {
+    pub entries: Vec<FileEntry>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NameSearchResult {
+    pub entries: Vec<FileEntry>,
+    pub errors: Vec<String>,
+    pub truncated: bool,
+}
+
+pub const NAME_SEARCH_LIMIT: usize = 300;
+
+/// A folder's path within a workspace, accepting equivalent canonical and
+/// ordinary Windows paths while preserving lexical directory-link paths.
+pub fn relative_folder(root: &Path, folder: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = folder.strip_prefix(root)
+        && relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Some(relative.to_path_buf());
+    }
+    let root = fs::canonicalize(root).ok()?;
+    let folder = fs::canonicalize(folder).ok()?;
+    folder.strip_prefix(root).ok().map(Path::to_path_buf)
+}
 
 #[cfg(test)]
 pub fn scan_files(root: &Path) -> Vec<FileEntry> {
-    scan_files_with(root, &[])
+    scan_files_with(root, &[]).entries
 }
 
-/// Like [`scan_files`], and also lists `include` folders inside `root` that
-/// its `.gitignore` hides, such as a playground's own repositories or a
-/// worktree under `.worktree/`. Each is walked with its own ignore rules.
-pub fn scan_files_with(root: &Path, include: &[PathBuf]) -> Vec<FileEntry> {
-    let mut entries = Vec::new();
-    walk_into(root, root, false, &mut entries);
-    let mut known: std::collections::HashSet<String> =
-        entries.iter().map(|e| e.relative.clone()).collect();
+/// Lists every immediate child of the root and requested expanded folders.
+/// Ancestors of requested folders are listed too, so a restored nested root
+/// can be reached without recursively indexing the whole workspace.
+pub fn scan_files_with(root: &Path, include: &[PathBuf]) -> FileListing {
+    let mut result = FileListing::default();
+    let mut folders = BTreeSet::from([root.to_path_buf()]);
     for folder in include {
         let Ok(relative) = folder.strip_prefix(root) else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if relative.is_empty() || known.contains(&relative) || !folder.is_dir() {
-            continue;
-        }
-        // Parent folders the main walk skipped, such as `.worktree`.
-        let mut parent = String::new();
-        let parts: Vec<&str> = relative.split('/').collect();
-        for (depth, part) in parts.iter().enumerate() {
-            if !parent.is_empty() {
-                parent.push('/');
-            }
-            parent.push_str(part);
-            if known.insert(parent.clone()) {
-                entries.push(FileEntry {
-                    path: root.join(&parent),
-                    relative: parent.clone(),
-                    depth,
-                    directory: true,
-                    repository: depth + 1 == parts.len() && folder.join(".git").exists(),
-                });
-            }
-        }
-        let start = entries.len();
-        walk_into(root, folder, true, &mut entries);
-        known.extend(entries[start..].iter().map(|e| e.relative.clone()));
-    }
-    entries.sort_by(tree_order);
-    entries
-}
-
-/// Walks `folder` (inside `root`) and appends its entries with paths relative
-/// to `root`. `own_rules` ignores `.gitignore` files above `folder`.
-fn walk_into(root: &Path, folder: &Path, own_rules: bool, entries: &mut Vec<FileEntry>) {
-    for entry in ignore::WalkBuilder::new(folder)
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(!own_rules)
-        .filter_entry(|e| {
-            !e.path().components().any(|c| {
-                matches!(
-                    c.as_os_str().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                )
-            })
-        })
-        .max_depth(Some(12))
-        .build()
-        .flatten()
-    {
-        if entries.len() >= SCAN_LIMIT {
-            break;
-        }
-        let path = entry.path();
-        if path == folder
-            || path.components().any(|c| {
-                c.as_os_str() == ".git"
-                    || c.as_os_str() == "target"
-                    || c.as_os_str() == "node_modules"
-            })
+        if relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
         {
             continue;
         }
-        let Some(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
-            continue;
+        let mut path = root.to_path_buf();
+        for part in relative.components() {
+            path.push(part);
+            folders.insert(path.clone());
         }
+    }
+    for folder in folders {
+        result.entries.extend(
+            read_children(root, &folder, &mut result.errors, None)
+                .into_iter()
+                .map(|(entry, _)| entry),
+        );
+    }
+    result.entries.sort_by(tree_order);
+    result.entries.dedup_by(|a, b| a.path == b.path);
+    result
+}
+
+/// Returns visible filesystem entries, retaining links even when their target
+/// is unavailable. The link flag keeps background searches from following
+/// directory links into cycles; explicit tree expansion can still open them.
+fn read_children(
+    root: &Path,
+    folder: &Path,
+    errors: &mut Vec<String>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<(FileEntry, bool)> {
+    let mut children = Vec::new();
+    let directory = match fs::read_dir(folder) {
+        Ok(directory) => directory,
+        Err(error) => {
+            errors.push(format!("Cannot read {}: {error}", folder.display()));
+            return children;
+        }
+    };
+    for entry in directory {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("Cannot list {}: {error}", folder.display()));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                errors.push(format!("Cannot inspect {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let linked = kind.is_symlink();
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            // Junctions and other directory reparse points can lead back into
+            // the workspace even when their FileType is reported as a folder.
+            linked
+                || fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
+        };
+        let directory = kind.is_dir() || (linked && path.is_dir());
         let relative = path
             .strip_prefix(root)
-            .unwrap_or(path)
+            .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
         let depth = relative.matches('/').count();
-        entries.push(FileEntry {
-            path: path.to_owned(),
-            repository: kind.is_dir() && depth < 3 && path.join(".git").exists(),
-            depth,
-            relative,
-            directory: kind.is_dir(),
-        });
+        children.push((
+            FileEntry {
+                repository: directory && path.join(".git").exists(),
+                path,
+                depth,
+                relative,
+                directory,
+            },
+            linked,
+        ));
     }
+    children.sort_by(|a, b| tree_order(&a.0, &b.0));
+    children
+}
+
+/// Searches all filesystem names without Git ignore rules or depth limits.
+/// Work is cancelled between entries and directories, and stops after the
+/// first extra match proves that the displayed result limit was reached.
+pub fn search_files(
+    root: &Path,
+    query: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> NameSearchResult {
+    let mut result = NameSearchResult::default();
+    if query.trim().is_empty() {
+        return result;
+    }
+    let mut folders = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(folder) = folders.pop_front() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        for (entry, linked) in read_children(root, &folder, &mut result.errors, Some(cancelled)) {
+            if cancelled.load(Ordering::Relaxed) {
+                return result;
+            }
+            if entry.directory && !linked {
+                folders.push_back(entry.path.clone());
+            }
+            if fuzzy_score(query, &entry.relative).is_some() {
+                if result.entries.len() == NAME_SEARCH_LIMIT {
+                    result.truncated = true;
+                    return result;
+                }
+                result.entries.push(entry);
+            }
+        }
+    }
+    result
 }
 
 /// Depth-first tree order: folders before files at every level, then natural
@@ -1226,15 +1295,19 @@ mod tests {
         Ok(dir)
     }
     #[test]
-    fn scan_includes_ignored_source_folders_with_their_own_rules() -> Result<()> {
+    fn tree_lists_ignored_folders_and_only_expanded_contents() -> Result<()> {
         let dir = playground()?;
         let root = dir.path();
         let plain: Vec<_> = scan_files(root).into_iter().map(|e| e.relative).collect();
-        assert!(!plain.iter().any(|p| p.starts_with("api")));
-        let entries = scan_files_with(root, &[root.join("api")]);
+        assert!(plain.iter().any(|p| p == "api"));
+        assert!(plain.iter().any(|p| p == ".git"));
+        assert!(!plain.iter().any(|p| p == "api/src/main.rs"));
+        let listing = scan_files_with(root, &[root.join("api/src"), root.join("api/target")]);
+        assert!(listing.errors.is_empty());
+        let entries = listing.entries;
         let paths: Vec<_> = entries.iter().map(|e| e.relative.as_str()).collect();
         assert!(paths.contains(&"api/src/main.rs"));
-        assert!(!paths.iter().any(|p| p.starts_with("api/target")));
+        assert!(paths.contains(&"api/target/out.bin"));
         let api = entries.iter().find(|e| e.relative == "api").unwrap();
         assert!(api.repository && api.directory && api.depth == 0);
         let main = entries
@@ -1244,7 +1317,7 @@ mod tests {
         assert_eq!(main.depth, 2);
         // Tree order keeps the folder's children right after it.
         let at = paths.iter().position(|p| *p == "api").unwrap();
-        assert_eq!(paths[at + 1], "api/src");
+        assert!(paths[at + 1].starts_with("api/"));
         fs::write(root.join("api/src/main.rs"), "fn main() { run() }\n")?;
         let changes = status_with(root, &[root.join("api")])?;
         assert!(
@@ -1252,6 +1325,215 @@ mod tests {
                 .iter()
                 .any(|c| c.path == "api/src/main.rs" && c.letter() == 'M')
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_root_siblings_do_not_depend_on_the_size_of_an_unopened_subtree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        fs::create_dir(root.join("a-large"))?;
+        for i in 0..1000 {
+            fs::write(root.join(format!("a-large/file-{i}.txt")), "")?;
+        }
+        for folder in ["target", "node_modules", ".hidden", "z-last"] {
+            fs::create_dir(root.join(folder))?;
+        }
+        fs::write(
+            root.join(".gitignore"),
+            "target/\nnode_modules/\n.hidden/\nz-last/\n",
+        )?;
+        let listing = scan_files_with(root, &[]);
+        assert!(listing.errors.is_empty());
+        let paths: Vec<_> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.relative.as_str())
+            .collect();
+        for folder in ["a-large", "target", "node_modules", ".hidden", "z-last"] {
+            assert!(paths.contains(&folder));
+        }
+        assert_eq!(paths.len(), 6);
+        assert!(!paths.iter().any(|path| path.contains('/')));
+        Ok(())
+    }
+
+    #[test]
+    fn tree_expansion_has_no_depth_limit_and_accepts_a_root_named_target() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("target");
+        let deepest = (0..16).fold(root.clone(), |path, i| path.join(format!("d{i}")));
+        fs::create_dir_all(&deepest)?;
+        fs::write(deepest.join("leaf.txt"), "leaf")?;
+        let listing = scan_files_with(&root, std::slice::from_ref(&deepest));
+        assert!(listing.errors.is_empty());
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.path == deepest.join("leaf.txt"))
+        );
+        assert!(listing.entries.iter().any(|entry| entry.relative == "d0"));
+        Ok(())
+    }
+
+    #[test]
+    fn tree_reports_missing_requested_folders_without_losing_readable_siblings() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("present.txt"), "")?;
+        let listing = scan_files_with(dir.path(), &[dir.path().join("missing")]);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "present.txt")
+        );
+        assert_eq!(listing.errors.len(), 1);
+        assert!(listing.errors[0].contains("missing"));
+        let missing_root = scan_files_with(&dir.path().join("missing-root"), &[]);
+        assert!(missing_root.entries.is_empty());
+        assert_eq!(missing_root.errors.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn name_search_finds_unexpanded_ignored_files_and_reports_its_limit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        fs::create_dir(root.join("node_modules"))?;
+        fs::write(root.join(".gitignore"), "node_modules/\n")?;
+        for i in 0..=NAME_SEARCH_LIMIT {
+            fs::write(root.join(format!("node_modules/needle-{i}.txt")), "")?;
+        }
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let result = search_files(root, "needle", &cancelled);
+        assert_eq!(result.entries.len(), NAME_SEARCH_LIMIT);
+        assert!(result.truncated);
+        assert!(result.errors.is_empty());
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| entry.relative.starts_with("node_modules/"))
+        );
+        cancelled.store(true, Ordering::Relaxed);
+        let result = search_files(root, "needle", &cancelled);
+        assert!(result.entries.is_empty());
+        assert!(!result.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn name_search_reaches_deep_folders_and_reports_read_errors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let deepest = (0..16).fold(dir.path().to_path_buf(), |path, i| {
+            path.join(format!("d{i}"))
+        });
+        fs::create_dir_all(&deepest)?;
+        fs::write(deepest.join("needle.txt"), "")?;
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let result = search_files(dir.path(), "needle", &cancelled);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, deepest.join("needle.txt"));
+        assert!(!result.truncated);
+        let missing = search_files(&dir.path().join("missing"), "needle", &cancelled);
+        assert!(missing.entries.is_empty());
+        assert_eq!(missing.errors.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_keeps_symlinks_and_search_does_not_follow_directory_cycles() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        fs::create_dir(root.join("source"))?;
+        fs::write(root.join("source/needle.txt"), "")?;
+        symlink(root.join("source"), root.join("alias"))?;
+        symlink(root, root.join("source/back"))?;
+        symlink(root.join("missing"), root.join("dangling"))?;
+        let listing = scan_files_with(root, &[root.join("alias")]);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "alias" && entry.directory)
+        );
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "alias/needle.txt")
+        );
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "dangling")
+        );
+        let result = search_files(root, "needle", &std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].relative, "source/needle.txt");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tree_expands_windows_junctions_without_recursing_through_search_cycles() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = fs::canonicalize(dir.path())?;
+        let source = root.join("source");
+        let junction = root.join("alias");
+        let back = source.join("back");
+        fs::create_dir(&source)?;
+        fs::write(source.join("needle.txt"), "")?;
+        for (link, target) in [(&junction, &source), (&back, &root)] {
+            assert!(link.starts_with(&root) && target.starts_with(&root));
+            let output = command("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let listing = scan_files_with(&root, std::slice::from_ref(&junction));
+        assert!(listing.errors.is_empty());
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "alias" && entry.directory)
+        );
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.relative == "alias/needle.txt")
+        );
+        let result = search_files(&root, "needle", &std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].relative, "source/needle.txt");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_scope_accepts_canonical_windows_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let folder = dir.path().join("child");
+        fs::create_dir(&folder)?;
+        let canonical = fs::canonicalize(folder)?;
+        assert_eq!(
+            relative_folder(dir.path(), &canonical),
+            Some(PathBuf::from("child"))
+        );
+        let outside = tempfile::tempdir()?;
+        assert!(relative_folder(dir.path(), outside.path()).is_none());
         Ok(())
     }
     #[test]

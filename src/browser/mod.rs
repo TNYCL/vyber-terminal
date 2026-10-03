@@ -1,6 +1,9 @@
 //! The file panel that opens over a terminal: a workspace tree, editor and
 //! previews on the file side, and a Review tab for Git and task changes.
 mod document;
+mod layout;
+#[cfg(test)]
+mod lifecycle_tests;
 mod review;
 mod scm;
 mod scm_ui;
@@ -123,6 +126,8 @@ struct Document {
     size: u64,
     preview: bool,
     dirty: bool,
+    saving: bool,
+    pending_disk_change: Option<Option<Vec<u8>>>,
     conflict: bool,
     pinned: bool,
     scroll: ScrollHandle,
@@ -141,13 +146,16 @@ impl Document {
     }
 }
 enum Message {
-    Index(Vec<FileEntry>, Vec<Change>, String),
-    Loaded(PathBuf, Result<Vec<u8>, String>, u64, bool),
-    Changed(PathBuf, Option<Vec<u8>>),
+    Index(workspace::FileListing, Vec<Change>, String),
+    NameSearch(u64, String, workspace::NameSearchResult),
+    FolderListed(u64, PathBuf, workspace::FileListing),
+    Loaded(u64, PathBuf, Result<Vec<u8>, String>, u64),
+    Changed(PathBuf),
+    DocumentChanged(PathBuf, Option<Vec<u8>>),
     Checkpoint(Result<Checkpoint, String>),
     Notice(String),
     Saved(PathBuf, Vec<u8>, SharedString, Result<(), String>),
-    Search(String, Vec<(PathBuf, usize, String)>),
+    Search(u64, String, Result<Vec<(PathBuf, usize, String)>, String>),
     Tasks(Vec<TaskReview>),
     /// A review load: its file list (root, base, files), diffs in chunks,
     /// then the end, or an error. The first number is the load generation.
@@ -185,6 +193,7 @@ enum View {
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     Root,
+    Folder(usize),
     Open,
     Source,
     More,
@@ -223,6 +232,11 @@ struct Slide {
     from: f32,
     start: Instant,
 }
+
+struct PendingLoad {
+    generation: u64,
+    pinned: bool,
+}
 impl Slide {
     const DURATION: f32 = 0.24;
     fn settled(view: usize, shown: bool) -> Self {
@@ -259,10 +273,21 @@ pub struct Browser {
     pub branch: String,
     pub tasks: Vec<TaskReview>,
     files: Vec<FileEntry>,
+    tree_errors: Vec<String>,
+    name_results: Vec<FileEntry>,
+    name_query: String,
+    name_errors: Vec<String>,
+    name_truncated: bool,
+    name_loading: bool,
+    name_generation: u64,
+    pending_name_open: Option<u64>,
+    name_cancel: Arc<AtomicBool>,
     statuses: HashMap<String, char>,
     changed_dirs: HashSet<String>,
     search_query: String,
     search_results: Vec<(PathBuf, usize, String)>,
+    search_generation: u64,
+    search_cancel: Arc<AtomicBool>,
     changes: Vec<Change>,
     expanded: BTreeSet<String>,
     docs: Vec<Document>,
@@ -285,7 +310,10 @@ pub struct Browser {
     scale: f32,
     restore_docs: Vec<SavedDocument>,
     restore_active: Option<PathBuf>,
-    pending_line: Option<(PathBuf, usize)>,
+    pending_lines: HashMap<PathBuf, usize>,
+    pending_loads: HashMap<PathBuf, PendingLoad>,
+    load_generation: u64,
+    intended_document: Option<PathBuf>,
     focus: FocusHandle,
     quick_look: bool,
     tree_root: Option<String>,
@@ -293,12 +321,17 @@ pub struct Browser {
     tree_selected: Option<String>,
     reveal: bool,
     menu: Option<Menu>,
+    folder_menu: Option<document::FolderMenu>,
     /// The menu an outside mouse-down just closed, so the click that follows on
     /// its own trigger button does not reopen it.
     menu_dismissed: Option<(Menu, Instant)>,
     tab_scroll: ScrollHandle,
     receiver: mpsc::Receiver<Message>,
     sender: mpsc::Sender<Message>,
+    document_receiver: mpsc::Receiver<Message>,
+    document_sender: mpsc::Sender<Message>,
+    document_paths: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    document_stop: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     scope: Scope,
     _subscriptions: Vec<Subscription>,
@@ -306,12 +339,23 @@ pub struct Browser {
 impl Drop for Browser {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.document_stop.store(true, Ordering::Relaxed);
+        self.name_cancel.store(true, Ordering::Relaxed);
+        self.search_cancel.store(true, Ordering::Relaxed);
     }
 }
 
 impl Browser {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let (document_sender, document_receiver) = mpsc::channel();
+        let document_stop = Arc::new(AtomicBool::new(false));
+        let document_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        start_document_watcher(
+            document_paths.clone(),
+            document_sender.clone(),
+            document_stop.clone(),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let scope = Scope::default();
         start_watcher(root.clone(), sender.clone(), stop.clone(), scope.clone());
@@ -323,12 +367,19 @@ impl Browser {
         let subscription = cx.subscribe_in(&filter, window, |this, _, event, window, cx| {
             match event {
                 InputEvent::PressEnter { shift, .. } => {
-                    if *shift || !this.open_best_match(cx) {
+                    if *shift || !this.open_best_match(window, cx) {
                         this.search_contents(cx);
                     }
                     window.focus(&this.focus, cx);
                 }
-                InputEvent::Change => this.reveal = this.filter_query(cx).is_empty(),
+                InputEvent::Change => {
+                    this.reveal = this.filter_query(cx).is_empty();
+                    this.search_generation += 1;
+                    this.search_cancel.store(true, Ordering::Relaxed);
+                    this.search_query.clear();
+                    this.search_results.clear();
+                    this.search_names(cx);
+                }
                 _ => {}
             }
             cx.notify();
@@ -366,10 +417,21 @@ impl Browser {
             branch: String::new(),
             tasks: vec![],
             files: vec![],
+            tree_errors: vec![],
+            name_results: vec![],
+            name_query: String::new(),
+            name_errors: vec![],
+            name_truncated: false,
+            name_loading: false,
+            name_generation: 0,
+            pending_name_open: None,
+            name_cancel: Arc::new(AtomicBool::new(false)),
             statuses: HashMap::new(),
             changed_dirs: HashSet::new(),
             search_query: String::new(),
             search_results: vec![],
+            search_generation: 0,
+            search_cancel: Arc::new(AtomicBool::new(false)),
             changes: vec![],
             expanded: BTreeSet::new(),
             docs: vec![],
@@ -389,7 +451,10 @@ impl Browser {
             scale: 1.,
             restore_docs: vec![],
             restore_active: None,
-            pending_line: None,
+            pending_lines: HashMap::new(),
+            pending_loads: HashMap::new(),
+            load_generation: 0,
+            intended_document: None,
             focus: cx.focus_handle(),
             quick_look: false,
             tree_root: None,
@@ -397,10 +462,15 @@ impl Browser {
             tree_selected: None,
             reveal: false,
             menu: None,
+            folder_menu: None,
             menu_dismissed: None,
             tab_scroll: ScrollHandle::new(),
             receiver,
             sender,
+            document_receiver,
+            document_sender,
+            document_paths,
+            document_stop,
             stop,
             scope,
             _subscriptions: subscriptions,
@@ -469,13 +539,7 @@ impl Browser {
             0 => self.show_review(cx),
             next => {
                 let index = next as usize - 1;
-                let path = self.docs[index].path.clone();
-                self.active_doc = index;
-                self.view = View::Files;
-                self.menu = None;
-                self.tree_selected = Some(self.relative(&path));
-                self.reveal = true;
-                self.tab_scroll.scroll_to_item(index);
+                self.select_document(index, cx);
             }
         }
         self.focus_shown_tab(window, cx);
@@ -527,17 +591,38 @@ impl Browser {
         self.filter.read(cx).value().trim().to_string()
     }
     fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
+        let relative = path
+            .strip_prefix(&self.root)
+            .map(Path::to_owned)
+            .ok()
+            .or_else(|| {
+                path.canonicalize()
+                    .ok()?
+                    .strip_prefix(self.root.canonicalize().ok()?)
+                    .ok()
+                    .map(Path::to_owned)
+            });
+        relative
+            .as_deref()
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/")
+    }
+    pub fn root_matches(&self, root: &Path) -> bool {
+        self.root == root
+            || self
+                .root
+                .canonicalize()
+                .ok()
+                .zip(root.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
     }
     fn active_document(&self) -> Option<&Document> {
         self.docs.get(self.active_doc)
     }
 
     pub fn has_dirty(&self) -> bool {
-        self.docs.iter().any(|d| d.dirty)
+        self.docs.iter().any(|d| d.dirty) || self.restore_docs.iter().any(|doc| doc.draft.is_some())
     }
     pub fn owns_focus(&self, window: &Window, cx: &App) -> bool {
         self.docs
@@ -590,6 +675,11 @@ impl Browser {
     }
     pub fn close_panel(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
+        self.pending_loads
+            .retain(|path, _| self.restore_docs.iter().any(|doc| &doc.path == path));
+        self.pending_lines
+            .retain(|path, _| self.pending_loads.contains_key(path));
+        self.intended_document = self.active_document().map(|doc| doc.path.clone());
         self.menu = None;
         self.git.menu = None;
         cx.emit(BrowserEvent::Closed);
@@ -615,10 +705,38 @@ impl Browser {
         self.layout_changed(cx);
     }
     pub fn state(&self, cx: &App) -> BrowserState {
+        // The app persists immediately after restoration. Keep saved drafts
+        // that are still awaiting their asynchronous reads in that snapshot.
+        let mut docs = self.restore_docs.clone();
+        for doc in &self.docs {
+            let saved = SavedDocument {
+                path: doc.path.clone(),
+                preview: doc.preview,
+                pinned: doc.pinned,
+                scroll: (
+                    f32::from(doc.scroll.offset().x),
+                    f32::from(doc.scroll.offset().y),
+                ),
+                draft: doc.dirty.then(|| doc.editor.read(cx).value().to_string()),
+                baseline: doc.dirty.then(|| doc.baseline.clone()),
+            };
+            if let Some(index) = docs.iter().position(|saved| saved.path == doc.path) {
+                if !matches!(doc.kind, Kind::Unsupported(_)) || docs[index].draft.is_none() {
+                    docs[index] = saved;
+                }
+            } else {
+                docs.push(saved);
+            }
+        }
+        let active = self
+            .restore_active
+            .clone()
+            .filter(|path| docs.iter().any(|doc| &doc.path == path))
+            .or_else(|| self.active_document().map(|doc| doc.path.clone()));
         BrowserState {
             visible: self.visible,
             expanded: self.expanded.clone(),
-            active: self.active_document().map(|d| d.path.clone()),
+            active,
             follow: self.follow,
             pinned: false,
             docked: cx.global::<Config>().panel_mode == PanelMode::Dock,
@@ -631,21 +749,7 @@ impl Browser {
             git_repo: self.git.selected.clone(),
             git_split: Some(self.git.split),
             git_graph: Some(self.git.graph_open),
-            docs: self
-                .docs
-                .iter()
-                .map(|d| SavedDocument {
-                    path: d.path.clone(),
-                    preview: d.preview,
-                    pinned: d.pinned,
-                    scroll: (
-                        f32::from(d.scroll.offset().x),
-                        f32::from(d.scroll.offset().y),
-                    ),
-                    draft: d.dirty.then(|| d.editor.read(cx).value().to_string()),
-                    baseline: d.dirty.then(|| d.baseline.clone()),
-                })
-                .collect(),
+            docs,
         }
     }
     pub fn restore_state(&mut self, state: BrowserState, cx: &mut Context<Self>) {
@@ -686,10 +790,12 @@ impl Browser {
             .iter()
             .map(|d| d.path.clone())
             .collect::<Vec<_>>();
+        self.restore_active = state.active.or_else(|| paths.first().cloned());
+        self.intended_document = self.restore_active.clone();
         for path in paths {
-            self.open(path, true, cx);
+            self.queue_load(path, true);
         }
-        self.restore_active = state.active;
+        self.sync_tree_scope();
     }
     pub fn open_at(
         &mut self,
@@ -699,6 +805,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.visible = true;
+        self.pending_lines.insert(path.clone(), line);
         self.open(path.clone(), true, cx);
         if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
             doc.preview = false;
@@ -709,18 +816,22 @@ impl Browser {
                     cx,
                 )
             });
-        } else {
-            self.pending_line = Some((path, line));
+            self.pending_lines.remove(&path);
         }
     }
     pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         self.view = View::Files;
+        self.sidebar_hidden[0] = false;
+        self.quick_look = false;
+        self.menu = None;
+        self.restore_active = None;
+        self.intended_document = self.active_document().map(|doc| doc.path.clone());
         self.filter.update(cx, |input, cx| input.focus(window, cx));
-        cx.notify();
+        self.layout_changed(cx);
     }
-    pub fn change_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if root == self.root {
+    pub fn change_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root_matches(&root) {
             return;
         }
         self.stop.store(true, Ordering::Relaxed);
@@ -730,6 +841,24 @@ impl Browser {
         self.receiver = receiver;
         self.root = root.clone();
         self.files.clear();
+        self.tree_errors.clear();
+        self.name_cancel.store(true, Ordering::Relaxed);
+        self.name_generation += 1;
+        self.pending_name_open = None;
+        self.name_loading = false;
+        self.name_results.clear();
+        self.name_query.clear();
+        self.name_errors.clear();
+        self.name_truncated = false;
+        self.search_cancel.store(true, Ordering::Relaxed);
+        self.search_generation += 1;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.filter
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.menu = None;
+        self.folder_menu = None;
+        self.menu_dismissed = None;
         self.changes.clear();
         self.statuses.clear();
         self.changed_dirs.clear();
@@ -739,8 +868,11 @@ impl Browser {
         self.git = scm::GitState::new();
         self.tree_root = None;
         self.tree_selected = None;
+        self.reveal = false;
+        self.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.loading = true;
         self.scope = Scope::default();
+        self.sync_tree_scope();
         start_watcher(
             root,
             self.sender.clone(),
@@ -750,14 +882,19 @@ impl Browser {
         cx.notify();
     }
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let messages: Vec<_> = self.receiver.try_iter().collect();
+        let messages: Vec<_> = self
+            .receiver
+            .try_iter()
+            .chain(self.document_receiver.try_iter())
+            .collect();
         let mut changed = !messages.is_empty();
         let mut follow_path = None;
         for message in messages {
             match message {
-                Message::Index(files, changes, branch) => {
-                    if self.files != files {
-                        self.files = files;
+                Message::Index(listing, changes, branch) => {
+                    self.tree_errors = listing.errors;
+                    if self.files != listing.entries {
+                        self.files = listing.entries;
                     }
                     if self.changes != changes {
                         self.review_worktree_changed(true);
@@ -779,33 +916,33 @@ impl Browser {
                         && !self.root.join(root).is_dir()
                     {
                         self.tree_root = None;
+                        self.tree_selected = None;
+                        self.sync_tree_scope();
+                        self.search_names(cx);
                     }
                 }
-                Message::Loaded(path, result, size, pinned) => {
-                    self.loaded(path, result, size, pinned, window, cx)
+                Message::NameSearch(generation, query, listing) => {
+                    self.name_search_loaded(generation, query, listing, window, cx);
                 }
-                Message::Changed(path, bytes) => {
-                    self.review_worktree_changed(false);
-                    if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path)
-                        && doc.kind == Kind::Text
-                        && bytes.as_ref() != Some(&doc.baseline)
+                Message::FolderListed(generation, path, listing) => {
+                    self.folder_listed(generation, path, listing, cx)
+                }
+                Message::Loaded(generation, path, result, size) => {
+                    if self
+                        .pending_loads
+                        .get(&path)
+                        .is_some_and(|pending| pending.generation == generation)
                     {
-                        if doc.dirty || bytes.is_none() {
-                            doc.conflict = true;
-                        } else if let Some(bytes) = bytes
-                            && let Ok(text) = String::from_utf8(bytes.clone())
-                        {
-                            let text = text.trim_start_matches('\u{feff}').to_owned();
-                            doc.baseline = bytes;
-                            doc.text = text.clone().into();
-                            doc.editor.update(cx, |ed, cx| {
-                                let offset = ed.scroll_offset();
-                                ed.set_value(text, window, cx);
-                                ed.set_scroll_offset(offset, cx);
-                            });
-                        }
+                        let pending = self.pending_loads.remove(&path).unwrap();
+                        self.loaded(path, result, size, pending.pinned, window, cx);
                     }
+                }
+                Message::Changed(path) => {
+                    self.review_worktree_changed(false);
                     follow_path = Some(path);
+                }
+                Message::DocumentChanged(path, bytes) => {
+                    self.document_changed(&path, bytes, window, cx)
                 }
                 Message::Checkpoint(result) => match result {
                     Ok(snapshot) => {
@@ -848,20 +985,49 @@ impl Browser {
                 Message::Notice(message) => self.say(message),
                 Message::Saved(path, bytes, value, result) => match result {
                     Ok(()) => {
+                        let mut pending_disk_change = None;
                         if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
+                            doc.saving = false;
+                            doc.size = bytes.len() as u64;
                             doc.baseline = bytes;
                             doc.text = value;
                             doc.dirty = doc.editor.read(cx).value() != doc.text;
                             doc.conflict = false;
+                            pending_disk_change = doc.pending_disk_change.take();
                         }
+                        if let Some(bytes) = pending_disk_change {
+                            self.document_changed(&path, bytes, window, cx);
+                        }
+                        self.sync_document_watch();
                         self.say("Saved");
                     }
-                    Err(e) => self.say(e),
+                    Err(e) => {
+                        let mut pending_disk_change = None;
+                        if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
+                            doc.saving = false;
+                            pending_disk_change = doc.pending_disk_change.take();
+                        }
+                        if let Some(bytes) = pending_disk_change {
+                            self.document_changed(&path, bytes, window, cx);
+                        }
+                        self.say(e);
+                    }
                 },
-                Message::Search(query, results) => {
-                    self.say(format!("{} matches in file contents", results.len()));
-                    self.search_query = query;
-                    self.search_results = results;
+                Message::Search(generation, query, results) => {
+                    if generation == self.search_generation && query == self.filter_query(cx) {
+                        match results {
+                            Ok(results) => {
+                                self.say(if results.len() == 200 {
+                                    "Showing up to 200 matches in file contents".to_string()
+                                } else {
+                                    format!("{} matches in file contents", results.len())
+                                });
+                                self.search_query = query;
+                                self.search_results = results;
+                            }
+                            Err(error) => self.say(format!("Text search failed: {error}")),
+                        }
+                    }
                 }
                 Message::Tasks(tasks) => {
                     for task in tasks {
@@ -902,8 +1068,16 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let activate = self.intended_document.as_ref() == Some(&path)
+            && (self.view == View::Files || self.restore_active.as_ref() == Some(&path));
+        if !activate && !pinned && !self.restore_docs.iter().any(|doc| doc.path == path) {
+            self.pending_lines.remove(&path);
+            return;
+        }
         if let Some(index) = self.docs.iter().position(|d| d.path == path) {
-            self.active_doc = index;
+            if activate {
+                self.active_doc = index;
+            }
             self.docs[index].pinned |= pinned;
             return;
         }
@@ -948,6 +1122,7 @@ impl Browser {
                 .language(changeset::language(&path))
                 .default_value(text.clone())
         });
+        let text = editor.read(cx).value();
         let watched_path = path.clone();
         let sub = cx.subscribe(&editor, move |view, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -967,13 +1142,21 @@ impl Browser {
             kind,
             size,
             dirty: false,
+            saving: false,
+            pending_disk_change: None,
             conflict: false,
             pinned,
             scroll: ScrollHandle::new(),
             _subscription: sub,
         };
         if let Some(i) = self.restore_docs.iter().position(|d| d.path == doc.path) {
-            let saved = self.restore_docs.remove(i);
+            let retain_draft =
+                matches!(doc.kind, Kind::Unsupported(_)) && self.restore_docs[i].draft.is_some();
+            let saved = if retain_draft {
+                self.restore_docs[i].clone()
+            } else {
+                self.restore_docs.remove(i)
+            };
             doc.preview = saved.preview;
             doc.pinned = saved.pinned;
             doc.scroll
@@ -989,67 +1172,137 @@ impl Browser {
                 doc.pinned = true;
             }
         }
-        if let Some(index) = self.docs.iter().position(|d| !d.pinned && !d.dirty) {
+        if let Some(line) = self.pending_lines.remove(&doc.path) {
+            doc.preview = false;
+            doc.editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(
+                    gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0),
+                    window,
+                    cx,
+                )
+            });
+        }
+        let index = if activate && !pinned {
+            self.docs
+                .iter()
+                .position(|d| !d.pinned && !d.dirty && !d.saving)
+        } else {
+            None
+        };
+        let index = if let Some(index) = index {
             self.docs[index] = doc;
-            self.active_doc = index;
+            index
         } else {
             self.docs.push(doc);
-            self.active_doc = self.docs.len() - 1;
+            self.docs.len() - 1
+        };
+        if activate {
+            self.active_doc = index;
+            self.tab_scroll.scroll_to_item(index);
         }
-        if let Some(active) = &self.restore_active
-            && let Some(i) = self.docs.iter().position(|d| &d.path == active)
-        {
-            self.active_doc = i;
+        self.sync_document_watch();
+    }
+    /// Selects a loaded document and records the user's choice before other
+    /// asynchronous reads complete.
+    pub(super) fn select_document(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(doc) = self.docs.get(index) else {
+            return;
+        };
+        let path = doc.path.clone();
+        self.restore_active = None;
+        self.intended_document = Some(path.clone());
+        self.active_doc = index;
+        self.view = View::Files;
+        self.menu = None;
+        self.reveal_document(&path, cx);
+        self.tab_scroll.scroll_to_item(index);
+        cx.notify();
+    }
+    fn reveal_document(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let relative = self.relative(path);
+        if !Path::new(&relative).is_absolute() {
+            if self
+                .tree_root
+                .as_ref()
+                .is_some_and(|root| !relative.starts_with(&format!("{root}/")))
+            {
+                self.tree_root = None;
+                self.search_cancel.store(true, Ordering::Relaxed);
+                self.search_generation += 1;
+                self.search_query.clear();
+                self.search_results.clear();
+                self.search_names(cx);
+            }
+            self.expanded.extend(workspace::expanded_parents(&relative));
+            self.tree_selected = Some(relative);
+            self.reveal = true;
+            self.sync_tree_scope();
         }
-        if let Some((path, line)) = &self.pending_line
-            && let Some(doc) = self.docs.iter_mut().find(|d| &d.path == path)
-        {
-            doc.preview = false;
-            let position =
-                gpui_kit::component::input::Position::new(line.saturating_sub(1) as u32, 0);
-            doc.editor
-                .update(cx, |ed, cx| ed.set_cursor_position(position, window, cx));
-            self.pending_line = None;
-        }
-        self.tab_scroll.scroll_to_item(self.active_doc);
     }
     pub fn open(&mut self, path: PathBuf, pinned: bool, cx: &mut Context<Self>) {
         self.restore_active = None;
+        self.intended_document = Some(path.clone());
         self.view = View::Files;
         self.menu = None;
-        let relative = self.relative(&path);
-        self.expanded.extend(workspace::expanded_parents(&relative));
-        self.tree_selected = Some(relative);
-        self.reveal = true;
+        self.reveal_document(&path, cx);
         if let Some(i) = self.docs.iter().position(|d| d.path == path) {
-            self.active_doc = i;
-            self.docs[i].pinned |= pinned;
-            self.tab_scroll.scroll_to_item(i);
-            cx.notify();
+            if !matches!(self.docs[i].kind, Kind::Unsupported(_)) {
+                self.docs[i].pinned |= pinned;
+                self.select_document(i, cx);
+                return;
+            }
+            self.docs.remove(i);
+            self.active_doc = self
+                .active_doc
+                .saturating_sub(usize::from(self.active_doc >= i));
+        }
+        self.queue_load(path, pinned);
+        cx.notify();
+    }
+    fn queue_load(&mut self, path: PathBuf, pinned: bool) {
+        if let Some(pending) = self.pending_loads.get_mut(&path) {
+            pending.pinned |= pinned;
             return;
         }
-        let sender = self.sender.clone();
+        self.load_generation += 1;
+        let generation = self.load_generation;
+        self.pending_loads
+            .insert(path.clone(), PendingLoad { generation, pinned });
+        let sender = self.document_sender.clone();
         std::thread::spawn(move || {
             let (result, size) = match fs::metadata(&path) {
-                Err(e) => (Err(e.to_string()), 0),
+                Err(e) => (Err(format!("Cannot open {}: {e}", path.display())), 0),
                 Ok(m) if m.len() > READ_LIMIT => (
                     Err("Larger than the 32 MB preview limit".to_string()),
                     m.len(),
                 ),
                 Ok(m) => (fs::read(&path).map_err(|e| e.to_string()), m.len()),
             };
-            let _ = sender.send(Message::Loaded(path, result, size, pinned));
+            let _ = sender.send(Message::Loaded(generation, path, result, size));
         });
-        cx.notify();
     }
     fn close_doc(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.docs.get(index).is_some_and(|d| d.dirty) {
+        if self.docs.get(index).is_some_and(|doc| {
+            self.restore_docs
+                .iter()
+                .any(|saved| saved.path == doc.path && saved.draft.is_some())
+        }) {
+            self.say(
+                "Restore this file and reopen it to recover your unsaved draft before closing.",
+            );
+        } else if self.docs.get(index).is_some_and(|d| d.dirty) {
             self.say("Save the document before closing it.");
         } else if index < self.docs.len() {
-            self.docs.remove(index);
+            let path = self.docs.remove(index).path;
+            self.pending_loads.remove(&path);
+            self.pending_lines.remove(&path);
             if self.active_doc > index || self.active_doc >= self.docs.len() {
                 self.active_doc = self.active_doc.saturating_sub(1);
             }
+            if self.intended_document.as_ref() == Some(&path) {
+                self.intended_document = self.active_document().map(|doc| doc.path.clone());
+            }
+            self.sync_document_watch();
         }
         cx.notify();
     }
@@ -1057,12 +1310,12 @@ impl Browser {
         let Some(doc) = self.active_document() else {
             return;
         };
-        if !doc.dirty {
+        if !doc.dirty || doc.saving || self.view != View::Files {
             return;
         }
         let value = doc.editor.read(cx).value();
         let mut text = value.to_string();
-        if doc.text.contains("\r\n") {
+        if doc.baseline.windows(2).any(|pair| pair == b"\r\n") {
             text = text.replace("\r\n", "\n").replace('\n', "\r\n");
         }
         let mut bytes = vec![];
@@ -1072,7 +1325,8 @@ impl Browser {
         bytes.extend(text.as_bytes());
         let path = doc.path.clone();
         let baseline = doc.baseline.clone();
-        let sender = self.sender.clone();
+        let sender = self.document_sender.clone();
+        self.docs[self.active_doc].saving = true;
         self.say("Saving…");
         std::thread::spawn(move || {
             let result =
@@ -1087,14 +1341,67 @@ impl Browser {
             && let Ok(text) = String::from_utf8(bytes.clone())
         {
             let text = text.trim_start_matches('\u{feff}').to_owned();
+            doc.size = bytes.len() as u64;
             doc.baseline = bytes;
-            doc.text = text.clone().into();
             doc.dirty = false;
             doc.conflict = false;
             doc.editor
                 .update(cx, |ed, cx| ed.set_value(text, window, cx));
+            doc.text = doc.editor.read(cx).value();
         }
+        self.sync_document_watch();
         cx.notify();
+    }
+    fn sync_document_watch(&self) {
+        *self.document_paths.lock().unwrap() = self
+            .docs
+            .iter()
+            .filter(|doc| doc.kind == Kind::Text)
+            .map(|doc| (doc.path.clone(), doc.baseline.clone()))
+            .collect();
+    }
+    fn document_changed(
+        &mut self,
+        path: &Path,
+        bytes: Option<Vec<u8>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc) = self.docs.iter_mut().find(|doc| doc.path == path) else {
+            return;
+        };
+        if doc.kind != Kind::Text {
+            return;
+        }
+        if doc.saving {
+            if bytes.as_ref() != Some(&doc.baseline) {
+                doc.pending_disk_change = Some(bytes);
+            }
+            return;
+        }
+        if bytes.as_ref() == Some(&doc.baseline) {
+            return;
+        }
+        if doc.dirty || bytes.is_none() {
+            doc.conflict = true;
+        } else if let Some(bytes) = bytes {
+            match std::str::from_utf8(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)) {
+                Ok(text) if !bytes.contains(&0) => {
+                    let text = text.to_owned();
+                    doc.size = bytes.len() as u64;
+                    doc.baseline = bytes;
+                    doc.editor.update(cx, |editor, cx| {
+                        let offset = editor.scroll_offset();
+                        editor.set_value(text, window, cx);
+                        editor.set_scroll_offset(offset, cx);
+                    });
+                    doc.text = doc.editor.read(cx).value();
+                    doc.conflict = false;
+                }
+                _ => doc.conflict = true,
+            }
+        }
+        self.sync_document_watch();
     }
     fn search_contents(&mut self, cx: &mut Context<Self>) {
         let query = self.filter_query(cx);
@@ -1105,71 +1412,23 @@ impl Browser {
         }
         self.view = View::Files;
         self.say("Searching file contents…");
-        let root = self.root.clone();
+        self.search_cancel.store(true, Ordering::Relaxed);
+        self.search_cancel = Arc::new(AtomicBool::new(false));
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        let cancelled = self.search_cancel.clone();
+        let root = self
+            .tree_root
+            .as_ref()
+            .map(|relative| self.root.join(relative))
+            .unwrap_or_else(|| self.root.clone());
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            use std::io::BufRead;
-            let result = (|| -> anyhow::Result<Vec<(PathBuf, usize, String)>> {
-                let mut child = workspace::command("rg")
-                    .args([
-                        "--json",
-                        "--fixed-strings",
-                        "--smart-case",
-                        "--max-count",
-                        "5",
-                        "--glob",
-                        "!target/**",
-                        "--glob",
-                        "!node_modules/**",
-                        "--",
-                        &query,
-                        ".",
-                    ])
-                    .current_dir(&root)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("Search pipe unavailable"))?;
-                let mut results = vec![];
-                for line in std::io::BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok)
-                {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-                        && v["type"] == "match"
-                    {
-                        let data = &v["data"];
-                        if let (Some(path), Some(line)) =
-                            (data["path"]["text"].as_str(), data["line_number"].as_u64())
-                        {
-                            results.push((
-                                root.join(path.trim_start_matches("./")),
-                                line as usize,
-                                data["lines"]["text"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .trim()
-                                    .chars()
-                                    .take(160)
-                                    .collect(),
-                            ));
-                        }
-                    }
-                    if results.len() >= 200 {
-                        let _ = child.kill();
-                        break;
-                    }
-                }
-                let _ = child.wait();
-                Ok(results)
-            })();
-            let _ = sender.send(match result {
-                Ok(results) => Message::Search(query, results),
-                Err(e) => Message::Notice(format!("Text search needs ripgrep (rg): {e}")),
-            });
+            let result =
+                search_contents_in(&root, &query, &cancelled).map_err(|error| error.to_string());
+            if !cancelled.load(Ordering::Relaxed) {
+                let _ = sender.send(Message::Search(generation, query, result));
+            }
         });
         cx.notify();
     }
@@ -1187,7 +1446,7 @@ impl Browser {
     /// Runs a blocking launcher off the UI thread and reports failures.
     fn launch(&mut self, run: fn(&Path) -> std::io::Result<()>, path: PathBuf) {
         self.menu = None;
-        let sender = self.sender.clone();
+        let sender = self.document_sender.clone();
         std::thread::spawn(move || {
             if let Err(e) = run(&path) {
                 let _ = sender.send(Message::Notice(e.to_string()));
@@ -1263,39 +1522,22 @@ impl Render for Browser {
             View::Git => self.git_sidebar(window, cx),
         });
         let main = if !self.quick_look {
+            let browser = cx.entity();
             div()
-                .id("browser-main")
-                .flex()
                 .size_full()
-                .child(div().flex_1().min_w_0().h_full().child(content))
-                .when_some(sidebar, |s, sidebar| {
-                    // The sidebar keeps its width and is revealed from the right
-                    // edge, so it slides instead of squeezing its contents.
-                    s.child(
-                        div()
-                            .relative()
-                            .h_full()
-                            .flex_shrink_0()
-                            .w(rpx(width * shown))
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .bottom_0()
-                                    .left_0()
-                                    .w(rpx(width))
-                                    .child(sidebar),
-                            )
-                            .child(theme::resize_handle("sidebar-resize", SidebarResize).left_0()),
+                .child(
+                    layout::SidebarLayout::new(
+                        content,
+                        sidebar,
+                        width * self.scale,
+                        shown,
+                        self.scale,
                     )
-                })
-                .on_drag_move(
-                    cx.listener(move |this, e: &DragMoveEvent<SidebarResize>, _, cx| {
-                        this.sidebar_width[side] =
-                            (f32::from(e.bounds.right() - e.event.position.x) / this.scale)
-                                .clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
-                        cx.notify();
+                    .on_resize(move |width, _, cx| {
+                        browser.update(cx, |this, cx| {
+                            this.sidebar_width[side] = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX[side]);
+                            cx.notify();
+                        });
                     }),
                 )
                 .with_animation(
@@ -1375,11 +1617,164 @@ fn is_image(path: &Path) -> bool {
     })
 }
 
-/// Folders the tree lists besides what `root`'s `.gitignore` allows: the
-/// project's source folders inside `root` and the worktree picked as tree root.
+/// Open text documents stay observed even when the terminal moves elsewhere.
+/// Metadata checks avoid repeatedly reading unchanged buffers.
+fn start_document_watcher(
+    paths: Arc<std::sync::Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    sender: mpsc::Sender<Message>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut observed = HashMap::new();
+        while !stop.load(Ordering::Relaxed) {
+            let registered: Vec<_> = paths
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, baseline)| {
+                    (
+                        path.clone(),
+                        (!observed.contains_key(path)).then(|| baseline.clone()),
+                    )
+                })
+                .collect();
+            observed.retain(|path, _| registered.iter().any(|(current, _)| current == path));
+            for (path, baseline) in registered {
+                let metadata = fs::metadata(&path).ok();
+                let stamp = metadata
+                    .as_ref()
+                    .map(|metadata| (metadata.len(), metadata.modified().ok()));
+                if observed.get(&path) == Some(&stamp) {
+                    continue;
+                }
+                let bytes = metadata
+                    .filter(|metadata| metadata.len() <= TEXT_LIMIT as u64)
+                    .and_then(|_| fs::read(&path).ok());
+                observed.insert(path.clone(), stamp);
+                if baseline
+                    .as_ref()
+                    .is_none_or(|baseline| bytes.as_ref() != Some(baseline))
+                    && sender.send(Message::DocumentChanged(path, bytes)).is_err()
+                {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+fn search_contents_in(
+    root: &Path,
+    query: &str,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Vec<(PathBuf, usize, String)>> {
+    use std::io::{BufRead, Read};
+    let mut child = workspace::command("rg")
+        .args([
+            "--json",
+            "--hidden",
+            "--no-ignore",
+            "--fixed-strings",
+            "--smart-case",
+            "--max-count",
+            "5",
+            "--",
+            query,
+            ".",
+        ])
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("Cannot start ripgrep (rg): {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Search pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Search error pipe unavailable"))?;
+    let (sender, receiver) = mpsc::sync_channel(32);
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.take(64 * 1024).read_to_string(&mut text);
+        text
+    });
+    let mut results = vec![];
+    let mut truncated = false;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            break;
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(line)) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                    && value["type"] == "match"
+                {
+                    let data = &value["data"];
+                    if let (Some(path), Some(line)) =
+                        (data["path"]["text"].as_str(), data["line_number"].as_u64())
+                    {
+                        results.push((
+                            root.join(path.trim_start_matches("./")),
+                            line as usize,
+                            data["lines"]["text"]
+                                .as_str()
+                                .unwrap_or("")
+                                .trim()
+                                .chars()
+                                .take(160)
+                                .collect(),
+                        ));
+                    }
+                    if results.len() >= 200 {
+                        truncated = true;
+                        let _ = child.kill();
+                        break;
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(receiver);
+                let _ = reader.join();
+                let _ = errors.join();
+                return Err(error.into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait()?;
+    drop(receiver);
+    let _ = reader.join();
+    let errors = errors.join().unwrap_or_default();
+    if !truncated
+        && !cancelled.load(Ordering::Relaxed)
+        && !status.success()
+        && status.code() != Some(1)
+    {
+        anyhow::bail!("ripgrep exited with {status}: {}", errors.trim());
+    }
+    Ok(results)
+}
+
+/// Expanded tree folders and the project's other roots to list explicitly.
 #[derive(Clone, Default)]
 struct Scope {
     extra: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    tree: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     rescan: Arc<AtomicBool>,
 }
 impl Scope {
@@ -1387,9 +1782,11 @@ impl Scope {
     /// their own (whose status is read separately).
     fn folders(&self, root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut all = crate::project::nested_folders(root);
-        for extra in self.extra.lock().unwrap().iter() {
-            if !all.contains(extra) {
-                all.push(extra.clone());
+        let extra = self.extra.lock().unwrap().clone();
+        let tree = self.tree.lock().unwrap().clone();
+        for folder in extra.iter().chain(tree.iter()) {
+            if !all.contains(folder) {
+                all.push(folder.clone());
             }
         }
         let repos = all
@@ -1403,6 +1800,18 @@ impl Scope {
         *self.extra.lock().unwrap() = folders;
         self.rescan.store(true, Ordering::Relaxed);
     }
+    fn set_tree(&self, mut folders: Vec<PathBuf>) -> bool {
+        folders.sort();
+        folders.dedup();
+        let mut current = self.tree.lock().unwrap();
+        if *current != folders {
+            *current = folders;
+            self.rescan.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn start_watcher(
@@ -1412,15 +1821,34 @@ fn start_watcher(
     scope: Scope,
 ) {
     std::thread::spawn(move || {
-        let _ = sender.send(Message::Tasks(crate::tasks::history(&root)));
+        let history_root = root.clone();
+        let history_sender = sender.clone();
+        std::thread::spawn(move || {
+            let _ = history_sender.send(Message::Tasks(crate::tasks::history(&history_root)));
+        });
         let (event_tx, event_rx) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
+        let watcher = notify::recommended_watcher(move |event| {
             let _ = event_tx.send(event);
-        })
-        .ok();
-        let watching = watcher
-            .as_mut()
-            .is_some_and(|w| w.watch(&root, notify::RecursiveMode::Recursive).is_ok());
+        });
+        let mut watch_errors = vec![];
+        let watcher = match watcher {
+            Ok(mut watcher) => match watcher.watch(&root, notify::RecursiveMode::Recursive) {
+                Ok(()) => Some(watcher),
+                Err(error) => {
+                    watch_errors.push(format!(
+                        "Live updates unavailable; refreshing periodically: {error}"
+                    ));
+                    None
+                }
+            },
+            Err(error) => {
+                watch_errors.push(format!(
+                    "Live updates unavailable; refreshing periodically: {error}"
+                ));
+                None
+            }
+        };
+        let watching = watcher.is_some();
         // Staging changes only touch `.git`; when that folder is outside the watched
         // root (a subfolder of a repository) fall back to polling Git more often.
         let fallback = if watching && root.join(".git").exists() {
@@ -1439,7 +1867,20 @@ fn start_watcher(
                 refresh = true;
                 last = Instant::now() - fallback;
             }
-            for event in event_rx.try_iter().flatten() {
+            for event in event_rx.try_iter() {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        refresh = true;
+                        let warning =
+                            format!("Live update failed; refreshing periodically: {error}");
+                        log::warn!("{warning}");
+                        if watch_errors.len() < 3 && !watch_errors.contains(&warning) {
+                            watch_errors.push(warning);
+                        }
+                        continue;
+                    }
+                };
                 for path in event.paths {
                     if path
                         .file_name()
@@ -1447,20 +1888,16 @@ fn start_watcher(
                     {
                         continue;
                     }
-                    let relative = path.strip_prefix(&root).unwrap_or(&path);
-                    let mut parts = relative.components().map(|c| c.as_os_str());
-                    if let Some(position) = parts.clone().position(|c| c == ".git") {
-                        // Index, HEAD and ref updates change Git status but are not user files.
-                        let rest = parts.nth(position + 1).and_then(|c| c.to_str());
-                        if matches!(rest, Some("index" | "HEAD" | "refs" | "MERGE_HEAD")) {
-                            refresh = true;
-                        }
-                        continue;
-                    }
-                    if relative
+                    // Git administration refreshes the tree/status without
+                    // opening metadata through Follow. Explicitly opened
+                    // metadata documents use the independent document watcher.
+                    if path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
                         .components()
-                        .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "node_modules")))
+                        .any(|component| component.as_os_str() == ".git")
                     {
+                        refresh = true;
                         continue;
                     }
                     paths.insert(path);
@@ -1470,15 +1907,12 @@ fn start_watcher(
             if refresh && last.elapsed() > Duration::from_millis(450) {
                 for path in std::mem::take(&mut paths) {
                     if !path.is_dir() {
-                        let bytes = fs::metadata(&path)
-                            .ok()
-                            .filter(|m| m.len() < TEXT_LIMIT as u64)
-                            .and_then(|_| fs::read(&path).ok());
-                        let _ = sender.send(Message::Changed(path, bytes));
+                        let _ = sender.send(Message::Changed(path));
                     }
                 }
                 let (folders, repos) = scope.folders(&root);
-                let files = workspace::scan_files_with(&root, &folders);
+                let mut files = workspace::scan_files_with(&root, &folders);
+                files.errors.extend(watch_errors.iter().cloned());
                 let changes = workspace::status_with(&root, &repos).unwrap_or_default();
                 let branch =
                     workspace::git_text(&root, &["branch", "--show-current"]).unwrap_or_default();
