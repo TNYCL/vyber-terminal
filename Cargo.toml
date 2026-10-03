@@ -1,6 +1,6 @@
 [package]
 name = "vyber-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A native terminal workspace with files, previews, and review."
 license = "MIT OR Apache-2.0"
