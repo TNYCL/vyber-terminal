@@ -2316,29 +2316,50 @@ mod tests {
         console.send(b"Write-Output ('VYBER_' + 'READY'); while ($true) { $k = [Console]::ReadKey($true); Write-Output ('K=' + $k.Key + '/' + $k.Modifiers + ';'); if ($k.Key -eq 'Q') { break } }\r");
         let (ready, text) = console.wait_for(|t| t.contains("VYBER_READY"), 20);
         assert!(ready, "PowerShell did not start: {text}");
-        assert!(
-            console
-                .0
-                .win32_input
-                .load(std::sync::atomic::Ordering::Relaxed),
-            "ConPTY did not ask for win32-input-mode"
-        );
-        let esc = console.key("escape", None, false, false, false);
-        let mut glued = esc.clone();
-        glued.extend_from_slice(b"\x1b[<35;10;5M\x1b[I");
-        let mut double = esc.clone();
-        double.extend_from_slice(&esc);
-        let presses = [
-            console.key("enter", None, false, false, true),
-            esc.clone(),
-            glued,
-            double,
-            console.key("x", Some("x"), false, true, false),
-            console.key("enter", None, true, false, false),
-            console.key("up", None, false, false, false),
-            console.key("space", None, true, false, false),
-            b"q".to_vec(),
+        let mode = *console.0.term.lock().mode();
+        // Check the legacy path before sending any Win32 event. Some ConPTY
+        // hosts, including the Windows 2022 CI host, never request mode 9001.
+        let mut presses = vec![
+            super::encode_key("escape", None, false, false, false, mode, false).unwrap(),
+            super::encode_key("up", None, false, false, false, mode, false).unwrap(),
+            b"\r".to_vec(),
+            b"a".to_vec(),
         ];
+        let mut expected = vec!["Escape/0", "UpArrow/0", "Enter/0", "A/0"];
+        if console
+            .0
+            .win32_input
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let esc = console.key("escape", None, false, false, false);
+            let mut glued = esc.clone();
+            glued.extend_from_slice(b"\x1b[<35;10;5M\x1b[I");
+            let mut double = esc.clone();
+            double.extend_from_slice(&esc);
+            presses.extend([
+                console.key("enter", None, false, false, true),
+                esc.clone(),
+                glued,
+                double,
+                console.key("x", Some("x"), false, true, false),
+                console.key("enter", None, true, false, false),
+                console.key("up", None, false, false, false),
+                console.key("space", None, true, false, false),
+            ]);
+            expected.extend([
+                "Enter/Shift",
+                "Escape/0",
+                "Escape/0",
+                "Escape/0",
+                "Escape/0",
+                "X/Alt",
+                "Enter/Control",
+                "UpArrow/0",
+                "Spacebar/Control",
+            ]);
+        }
+        presses.push(b"q".to_vec());
+        expected.push("Q/0");
         for press in presses {
             console.send(&press);
             std::thread::sleep(Duration::from_millis(60));
@@ -2349,18 +2370,6 @@ mod tests {
                 .filter_map(|rest| rest.split_once(';').map(|(key, _)| key.to_owned()))
                 .collect::<Vec<_>>()
         };
-        let expected = [
-            "Enter/Shift",
-            "Escape/0",
-            "Escape/0",
-            "Escape/0",
-            "Escape/0",
-            "X/Alt",
-            "Enter/Control",
-            "UpArrow/0",
-            "Spacebar/Control",
-            "Q/0",
-        ];
         let (done, text) = console.wait_for(|t| keys(t).len() >= expected.len(), 10);
         assert!(done, "keys went missing: {:?}\n{text}", keys(&text));
         assert_eq!(keys(&text), expected);
