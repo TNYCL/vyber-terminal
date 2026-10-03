@@ -37,6 +37,9 @@ pub const DELETED: u32 = 0xfa423e;
 pub const CONFLICT: u32 = 0xe4676b;
 pub const WARNING_BG: u32 = 0x2a2213;
 pub const WARNING: u32 = 0xe8ca8b;
+// The Update button: a deeper link blue that keeps white text readable.
+pub const UPDATE: u32 = 0x1f6feb;
+pub const UPDATE_HOVER: u32 = 0x2f7cf3;
 
 pub fn mono_font() -> &'static str {
     if cfg!(windows) {

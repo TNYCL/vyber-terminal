@@ -6,6 +6,8 @@ pub enum CloseTarget {
     Tab(Vec<usize>),
     Window,
     Quit,
+    /// Quit to install an update and start the new version.
+    Update,
 }
 
 impl CloseTarget {
@@ -26,7 +28,7 @@ impl CloseTarget {
                 .tab_index(tabs)
                 .filter(|_| ids.iter().all(|id| live.contains(id)))
                 .map(|_| ids.clone()),
-            Self::Window | Self::Quit => Some(live),
+            Self::Window | Self::Quit | Self::Update => Some(live),
         }
     }
 }

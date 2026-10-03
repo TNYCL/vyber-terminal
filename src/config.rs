@@ -34,6 +34,9 @@ pub struct Config {
     pub task_history_limit: usize,
     /// Fetch every few minutes while the Git panel is open.
     pub git_autofetch: bool,
+    /// Look for a new Vyber release now and then and download it in the
+    /// background, ready to install from the title bar.
+    pub check_for_updates: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -51,6 +54,7 @@ impl Default for Config {
             task_history_days: 14,
             task_history_limit: 200,
             git_autofetch: true,
+            check_for_updates: true,
         }
     }
 }

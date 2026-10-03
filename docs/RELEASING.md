@@ -48,6 +48,23 @@ Keep the included cache capacity at its default; eviction or a cache miss only c
 The Release workflow can also be manually dispatched with an existing tag. A published
 release is never overwritten. A draft retry must match its original source commit.
 
+## Updates
+
+Packages built by CI (`VYBER_OFFICIAL_BUILD` set on the optimized build) update themselves.
+They read `releases/latest/download/release-manifest.json`, so a version reaches users only
+when its draft is published; drafts and prereleases are never offered. The manifest's
+`repository`, `tag`, package `target`, `version`, `file`, `bytes` and `sha256` must agree, and
+the package is downloaded from the tag's own release. Keep the asset names and the manifest
+format stable, and never publish a package that wasn't produced by the Release workflow:
+the updater installs whatever the latest release's manifest describes.
+
+To test the update path without publishing, package a higher version and serve its archive
+and a matching `release-manifest.json` from one folder, for example with
+`python -m http.server 8765`, then start any build with
+`VYBER_UPDATE_URL=http://127.0.0.1:8765/release-manifest.json` and a throwaway
+`VYBER_DATA_DIR`. Plain HTTP is accepted only from this machine. The first check then runs
+after three seconds.
+
 ## Verify downloads
 
 ```sh

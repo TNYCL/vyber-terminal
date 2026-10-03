@@ -179,7 +179,7 @@ def stage(target, directory):
         (directory / "runtime-libraries.txt").write_text("\n".join(windows_imports(binary_path(target))) + "\n", encoding="utf-8")
 
 def installation(platform):
-    common = "# Vyber\n\nGit is required for source-control features. ripgrep (rg) is optional for content search.\n\n"
+    common = "# Vyber\n\nGit is required for source-control features. ripgrep (rg) is optional for content search.\n\nVyber checks GitHub for new releases and shows Update in the title bar when one is ready. Keep it in a folder you can write to so it can replace itself; set check_for_updates = false in config.toml to turn the checks off.\n\n"
     if platform == "windows":
         return common + "Extract this ZIP and run Vyber.exe on Windows 11 x64. The Visual C++ runtime is statically linked; no separate VC++ Redistributable installer is required. Git Bash is preferred when installed; PowerShell is the fallback. This release is not Authenticode-signed. SmartScreen or local policy may warn or block it.\n"
     if platform == "macos":

@@ -24,6 +24,7 @@ mod tab_state;
 mod tasks;
 mod terminal;
 mod theme;
+mod update;
 mod workspace;
 use gpui::*;
 fn main() {
@@ -56,6 +57,7 @@ fn main() {
         env_logger::init();
     }
     std::panic::set_hook(Box::new(|info| log::error!("{info}")));
+    update::startup();
     let root = platform::startup_root(directory);
     let application = gpui_kit::application()
         .with_assets(icons::Assets)
@@ -81,5 +83,6 @@ fn main() {
         lifecycle::init(root, cx);
         lifecycle::open_workspace(app::WorkspaceLaunch::Restore, cx).expect("open Vyber");
         cx.activate(true);
+        update::start();
     });
 }

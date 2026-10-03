@@ -50,7 +50,8 @@ actions!(
         DecreaseFontSize,
         ResetFontSize,
         ToggleGit,
-        EditProject
+        EditProject,
+        CheckForUpdates
     ]
 );
 
@@ -231,6 +232,16 @@ pub struct Vyber {
     project_dialog: Option<(Entity<ProjectDialog>, Subscription)>,
     /// The project dialog fading out after it closed.
     project_closing: Option<(Entity<ProjectDialog>, std::time::Instant)>,
+    /// A downloaded update, offered in the title bar, and when it appeared.
+    update: Option<(crate::update::Ready, std::time::Instant)>,
+    /// The update is being installed; Vyber restarts when it's done.
+    updating: bool,
+    /// The notice on screen and when it appeared, so a new one slides in.
+    notice_shown: Option<(String, std::time::Instant)>,
+    /// A dismissed notice fading out.
+    notice_leaving: Option<(String, std::time::Instant)>,
+    /// Passing news clears itself: the notice and when it goes.
+    notice_expires: Option<(String, std::time::Instant)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -324,15 +335,24 @@ impl Vyber {
             config_stamp: Config::modified(),
             project_dialog: None,
             project_closing: None,
+            update: None,
+            updating: false,
+            notice_shown: None,
+            notice_leaving: None,
+            notice_expires: None,
             _subscriptions: vec![],
         };
         #[cfg(not(test))]
         let restore_allowed = std::env::args_os().nth(1).is_none();
         #[cfg(test)]
         let restore_allowed = true;
+        // An update brings back the workspace it closed, whatever the setting.
+        let updated_from = crate::update::take_relaunched();
         let saved = if matches!(launch, WorkspaceLaunch::Empty) {
             Some(SavedState::default())
-        } else if restore_allowed && crate::config::Config::load().restore_workspace {
+        } else if restore_allowed
+            && (updated_from.is_some() || crate::config::Config::load().restore_workspace)
+        {
             std::fs::read(&app.state_path)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<SavedState>(&b).ok())
@@ -390,6 +410,9 @@ impl Vyber {
         app.restoring = false;
         app.update_roots(cx);
         app.persist(cx);
+        if updated_from.is_some_and(|from| from != env!("CARGO_PKG_VERSION")) {
+            app.brief_notice(format!("Updated to Vyber {}", env!("CARGO_PKG_VERSION")));
+        }
         if app.slots.is_empty() {
             window.focus(&app.focus, cx);
         }
@@ -732,9 +755,40 @@ impl Vyber {
             self.persist(cx);
             self.last_persist = std::time::Instant::now();
         }
+        let ready = crate::update::ready();
+        if ready.as_ref() != self.update.as_ref().map(|(ready, _)| ready) {
+            self.update = ready.map(|ready| (ready, std::time::Instant::now()));
+            changed = true;
+        }
+        if let Some(message) = crate::update::take_message() {
+            if message.brief {
+                self.brief_notice(message.text);
+            } else {
+                self.notice = message.text;
+            }
+            changed = true;
+        }
+        if let Some((text, at)) = &self.notice_expires
+            && (*text != self.notice || *at <= std::time::Instant::now())
+        {
+            if *text == self.notice {
+                self.notice.clear();
+            }
+            self.notice_expires = None;
+            changed = true;
+        }
         if changed {
             cx.notify();
         }
+    }
+    /// Shows passing news that clears itself after a few seconds; warnings
+    /// set `notice` directly and stay until dismissed.
+    fn brief_notice(&mut self, text: String) {
+        self.notice_expires = Some((
+            text.clone(),
+            std::time::Instant::now() + Duration::from_secs(6),
+        ));
+        self.notice = text;
     }
     fn persist(&self, cx: &App) {
         if self.restoring {
@@ -1059,6 +1113,7 @@ impl Vyber {
                 } else {
                     let (message, confirm) = match &plan.target {
                         CloseTarget::Quit => ("Quit Vyber and stop running processes?", "Quit Vyber"),
+                        CloseTarget::Update => ("Restart Vyber to update and stop running processes?", "Restart and update"),
                         CloseTarget::Window => ("Close this window and stop running processes?", "Close window"),
                         CloseTarget::Tab(_) => ("Close this group and stop running processes?", "Close group"),
                         CloseTarget::Pane(_) => ("Close this terminal and stop running processes?", "Close terminal"),
@@ -1081,7 +1136,7 @@ impl Vyber {
         }).detach();
     }
     fn close_blocked(&mut self, plan: &ClosePlan, cx: &mut Context<Self>) -> bool {
-        if !matches!(plan.target, CloseTarget::Quit)
+        if !matches!(plan.target, CloseTarget::Quit | CloseTarget::Update)
             && plan.ids.iter().any(|id| {
                 self.slots
                     .get(id)
@@ -1117,7 +1172,80 @@ impl Vyber {
                 self.persist(cx);
                 crate::lifecycle::quit_application(cx);
             }
+            CloseTarget::Update => self.finish_update(cx),
         }
+    }
+    /// Update in the title bar: restarts into the downloaded version, or opens
+    /// the release page when this copy of Vyber can't replace itself.
+    fn install_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((ready, _)) = self.update.as_ref() else {
+            return;
+        };
+        if self.updating {
+            return;
+        }
+        if let Err(error) = crate::update::installable() {
+            log::warn!("Update in place: {error:#}");
+            self.notice = format!(
+                "{error:#}. Download Vyber {} from the release page instead.",
+                ready.version
+            );
+            cx.open_url(&ready.page);
+            cx.notify();
+            return;
+        }
+        self.request_close(CloseTarget::Update, window, cx);
+    }
+    /// Replaces Vyber with the update once the workspace is saved, then
+    /// quits; the new version starts and restores the workspace.
+    fn finish_update(&mut self, cx: &mut Context<Self>) {
+        let Some((ready, _)) = self.update.clone() else {
+            return;
+        };
+        self.persist(cx);
+        self.updating = true;
+        cx.notify();
+        let version = ready.version.clone();
+        let install = cx
+            .background_executor()
+            .spawn(async move { crate::update::install(&ready) });
+        cx.spawn(async move |this, cx| {
+            let installed = install.await;
+            let _ = this.update(cx, |this, cx| {
+                let notice = match installed {
+                    Err(error) => {
+                        log::warn!("Update: {error:#}");
+                        format!("Couldn't update Vyber: {error:#}")
+                    }
+                    Ok(()) => match crate::update::relaunch() {
+                        Ok(()) => return crate::lifecycle::quit_application(cx),
+                        Err(error) => {
+                            log::warn!("Restart after update: {error:#}");
+                            format!(
+                                "Vyber {version} is installed. Quit and open Vyber again to use it."
+                            )
+                        }
+                    },
+                };
+                this.updating = false;
+                this.notice = notice;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    pub(crate) fn check_for_updates(
+        &mut self,
+        _: &CheckForUpdates,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_shortcuts = false;
+        self.notice = match crate::update::check_now() {
+            Ok(()) => "Checking for updates…".into(),
+            Err(message) => message.into(),
+        };
+        cx.notify();
     }
     pub(crate) fn settings(&mut self, _: &Settings, window: &mut Window, cx: &mut Context<Self>) {
         if self.slots.is_empty() {
@@ -1806,10 +1934,100 @@ impl Render for Vyber {
                     },
                 )),
             )
+            .child(
+                chip("menu-updates", "Check for updates").on_click(cx.listener(
+                    |this, _, w, cx| {
+                        this.check_for_updates(&CheckForUpdates, w, cx);
+                    },
+                )),
+            )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.show_shortcuts = false;
                 cx.notify();
             }));
+        let update = self.update.as_ref().map(|(ready, since)| {
+            // Slides in beside the source control button and fades in.
+            let shown = if cx.reduce_motion() {
+                1.
+            } else {
+                theme::ease_out(since.elapsed().as_secs_f32() / 0.24)
+            };
+            if shown < 1. {
+                window.request_animation_frame();
+            }
+            let tooltip: SharedString =
+                format!("Vyber {} is ready — restart to update", ready.version).into();
+            div()
+                .id("update")
+                .occlude()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .h(px(22.))
+                .px(px(11.))
+                .mr(px(6. + 10. * (1. - shown)))
+                .opacity(shown)
+                .rounded(px(11.))
+                .bg(rgb(theme::UPDATE))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(0xffffff))
+                .when(!self.updating, |s| {
+                    s.cursor_pointer().hover(|s| s.bg(rgb(theme::UPDATE_HOVER)))
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(if self.updating {
+                    "Updating…"
+                } else {
+                    "Update"
+                })
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.install_update(window, cx)))
+        });
+        // A new notice slides up into the corner; a cleared one fades out.
+        let now = std::time::Instant::now();
+        if self
+            .notice_shown
+            .as_ref()
+            .map_or("", |(text, _)| text.as_str())
+            != self.notice
+        {
+            if let Some((text, _)) = self.notice_shown.take()
+                && self.notice.is_empty()
+                && !cx.reduce_motion()
+            {
+                self.notice_leaving = Some((text, now));
+            }
+            if !self.notice.is_empty() {
+                self.notice_shown = Some((self.notice.clone(), now));
+                self.notice_leaving = None;
+            }
+        }
+        let notice = if let Some((text, since)) = &self.notice_shown {
+            let shown = if cx.reduce_motion() {
+                1.
+            } else {
+                theme::ease_out(since.elapsed().as_secs_f32() / 0.18)
+            };
+            Some((text.clone(), shown))
+        } else {
+            self.notice_leaving
+                .as_ref()
+                .map(|(text, at)| (text.clone(), 1. - at.elapsed().as_secs_f32() / 0.14))
+        };
+        let notice = notice
+            .filter(|(_, shown)| *shown > 0.)
+            .map(|(text, shown)| {
+                if shown < 1. {
+                    window.request_animation_frame();
+                }
+                notice_card(text, shown, cx)
+            });
+        if notice.is_none() {
+            self.notice_leaving = None;
+        }
         let tab_overlays = self.tab_overlays(cx);
         div()
             .relative()
@@ -1883,6 +2101,7 @@ impl Render for Vyber {
             .on_action(cx.listener(Self::shortcuts))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::settings))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
@@ -1976,6 +2195,7 @@ impl Render for Vyber {
                                         this.drop_on_tab(drag, None, true, window, cx);
                                     })),
                             )
+                            .children(update)
                             .child(
                                 icon_bar_button("git-toggle", "git-branch", git_open)
                                     .when(changes > 0, |s| {
@@ -2048,28 +2268,56 @@ impl Render for Vyber {
                         .child(dialog),
                 )
             })
-            .when(!self.notice.is_empty(), |s| {
-                s.child(
-                    div()
-                        .absolute()
-                        .occlude()
-                        .bottom_2()
-                        .left_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x24201a))
-                        .text_size(px(12.))
-                        .child(self.notice.clone())
-                        .child(chip("dismiss-notice", "×").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.notice.clear();
-                                cx.notify();
-                            },
-                        ))),
-                )
-            })
+            .children(notice)
     }
+}
+/// The notice card in the bottom-left corner. `shown` runs from 0 to 1 as it
+/// slides up and fades in, and back to 0 as it fades out.
+fn notice_card(text: String, shown: f32, cx: &mut Context<Vyber>) -> Stateful<Div> {
+    div()
+        .id("notice")
+        .absolute()
+        .occlude()
+        .left_3()
+        .bottom(px(12. - 6. * (1. - shown)))
+        .max_w(px(460.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .pl(px(12.))
+        .pr(px(4.))
+        .py(px(4.))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .shadow_lg()
+        .opacity(shown)
+        .text_size(px(12.))
+        .line_height(px(18.))
+        .text_color(rgb(theme::TEXT))
+        .child(div().flex_1().min_w_0().py(px(3.)).child(text))
+        .child(
+            div()
+                .id("dismiss-notice")
+                .group("dismiss-notice")
+                .flex_shrink_0()
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::SELECTED)))
+                .child(
+                    theme::icon(theme::ui("x"), theme::MUTED, 13.)
+                        .group_hover("dismiss-notice", |s| s.text_color(rgb(theme::TEXT))),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.notice.clear();
+                    cx.notify();
+                })),
+        )
 }
 pub fn bind_keys(cx: &mut App) {
     let prefix = if cfg!(target_os = "macos") {
@@ -2171,6 +2419,7 @@ pub fn bind_keys(cx: &mut App) {
     if cfg!(target_os = "macos") {
         cx.set_menus([
             Menu::new("Vyber").items([
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::action("Settings…", Settings),
                 MenuItem::action("Quit Vyber", Quit),
             ]),
