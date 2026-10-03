@@ -647,8 +647,9 @@ impl Vyber {
                 self.notifications.show(*id, message);
             }
             let root = slot.terminal.read(cx).root.clone();
-            if root != slot.browser.read(cx).root {
-                slot.browser.update(cx, |b, cx| b.change_root(root, cx));
+            if !slot.browser.read(cx).root_matches(&root) {
+                slot.browser
+                    .update(cx, |b, cx| b.change_root(root, window, cx));
                 changed = true;
             }
             if let Some(target) = path {
@@ -849,12 +850,15 @@ impl Vyber {
         cx.notify();
     }
     fn save(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(slot) = self.slots.get(&self.active) {
-            if !slot.browser.read(cx).owns_focus(window, cx) {
-                cx.propagate();
-                return;
-            }
-            slot.browser.update(cx, |b, cx| b.save(cx));
+        let browser = self
+            .slots
+            .values()
+            .find(|slot| slot.browser.read(cx).has_focus(window, cx))
+            .map(|slot| slot.browser.clone());
+        if let Some(browser) = browser {
+            browser.update(cx, |browser, cx| browser.save(cx));
+        } else {
+            cx.propagate();
         }
     }
     fn checkpoint(&mut self, _: &Checkpoint, _: &mut Window, cx: &mut Context<Self>) {

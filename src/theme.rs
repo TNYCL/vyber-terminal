@@ -209,13 +209,39 @@ pub fn text_button(
         .child(label.into())
 }
 
-/// A menu or popover fading in as it opens.
-pub fn menu_in<E: IntoElement + 'static>(id: &'static str, element: E) -> impl IntoElement {
-    div().child(element).with_animation(
-        id,
-        Animation::new(std::time::Duration::from_millis(130)).with_easing(ease_out_quint()),
-        |el, t| el.opacity(t),
-    )
+/// A popover layer below its toolbar. Its definite bounds let menus use
+/// `max_h(relative(1.))` and scroll within the actual panel, even in a short
+/// window. The layer takes no space in the panel's flex layout.
+pub fn menu_in<E: IntoElement + 'static>(
+    id: &'static str,
+    top: f32,
+    element: E,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(rpx(top))
+        .bottom_2()
+        .left_2()
+        .right_2()
+        .child(element)
+        .with_animation(
+            id,
+            Animation::new(std::time::Duration::from_millis(130)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
+        )
+}
+
+/// Register native bounds and interactions in the headless UI test harness.
+pub(crate) fn observe(element: Stateful<Div>) -> impl IntoElement {
+    #[cfg(test)]
+    {
+        use gpui_kit::test::TestSupportExt;
+        element.test_support()
+    }
+    #[cfg(not(test))]
+    {
+        element
+    }
 }
 
 /// Ease-out curve for panel slides: quick start, soft landing.
