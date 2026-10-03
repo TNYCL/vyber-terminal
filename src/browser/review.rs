@@ -3,6 +3,7 @@
 //! to pick the source (the last agent turn, the working tree, the index, a
 //! commit or the branch).
 use super::{Browser, BrowserEvent, Menu, Message, View, document::empty_state};
+use crate::theme::observe;
 use crate::{
     changeset::{self, Blob, Commit, FileChange, FileDiff, Restore, Source},
     icons,
@@ -1231,6 +1232,7 @@ impl Browser {
         let find = review.find.clone();
         let source_open = self.menu == Some(Menu::Source);
         div()
+            .id("review-toolbar")
             .h(rpx(46.))
             .flex_shrink_0()
             .flex()
@@ -1240,6 +1242,7 @@ impl Browser {
             .pr_2()
             .border_b_1()
             .border_color(rgb(DIVIDER))
+            .overflow_x_scroll()
             .child(
                 div()
                     .id("review-source")
@@ -1279,7 +1282,8 @@ impl Browser {
                         this.toggle_menu(Menu::Source);
                         this.review.submenu = None;
                         cx.notify();
-                    })),
+                    }))
+                    .map(observe),
             )
             .when(has_files, |s| {
                 s.child(
@@ -1359,7 +1363,8 @@ impl Browser {
                             this.toggle_menu(Menu::More);
                             this.review.confirm_revert = None;
                             cx.notify();
-                        })),
+                        }))
+                        .map(observe),
                     )
                     .child(
                         tool(
@@ -1379,7 +1384,8 @@ impl Browser {
                                 this.review.matches.clear();
                             }
                             cx.notify();
-                        })),
+                        }))
+                        .map(observe),
                     )
                     .child(
                         tool("review-refresh", "refresh-cw", "Refresh", false).on_click(
@@ -1446,9 +1452,11 @@ impl Browser {
                             this.review.wrap = !this.review.wrap;
                             this.review.list.remeasure();
                             cx.notify();
-                        })),
+                        }))
+                        .map(observe),
                     ),
             )
+            .map(observe)
     }
 
     fn review_banner(&self) -> Option<AnyElement> {
@@ -1567,12 +1575,14 @@ impl Browser {
             .when(self.menu == Some(Menu::Source), |s| {
                 s.child(menu_in(
                     "review-source-in",
+                    42.,
                     self.source_menu(cx).into_any_element(),
                 ))
             })
             .when(self.menu == Some(Menu::More), |s| {
                 s.child(menu_in(
                     "review-more-in",
+                    42.,
                     self.more_menu(cx).into_any_element(),
                 ))
             })
@@ -1627,7 +1637,7 @@ impl Browser {
                 .is_some_and(|t| is(&Source::Turn(t.id.clone())));
         // Agent turns belong to the terminal, not to a repository of the Git view.
         let turns = !self.review.git;
-        let mut menu = menu_panel("review-source-menu").w(rpx(250.));
+        let mut menu = menu_panel("review-source-menu").w_full().flex_shrink_0();
         if turns {
             menu = menu.child(
                 menu_item(
@@ -1676,9 +1686,14 @@ impl Browser {
             ("source-staged", "Staged", Source::Staged),
         ] {
             let checked = is(&value);
-            menu = menu.child(menu_item(id, label, None, checked, true, false).on_click(
-                cx.listener(move |this, _, _, cx| this.set_source(value.clone(), false, cx)),
-            ));
+            menu =
+                menu.child(
+                    menu_item(id, label, None, checked, true, false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_source(value.clone(), false, cx)
+                        }))
+                        .map(observe),
+                );
         }
         menu = menu
             .child(separator())
@@ -1709,28 +1724,28 @@ impl Browser {
                     true,
                     false,
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.set_source(Source::Branch, false, cx))),
+                .on_click(cx.listener(|this, _, _, cx| this.set_source(Source::Branch, false, cx)))
+                .map(observe),
             );
-        // Open each submenu level with the item that opened it.
-        let turns_row = 44.;
-        let commits_row = if turns {
-            turns_row + if turn_count > 1 { 30. } else { 0. } + 9. + 90. + 9.
-        } else {
-            4. + 90. + 9.
-        };
+        // A second menu level stays inside the same scrollable popup. Stacking
+        // it also keeps commits and earlier turns reachable in narrow panels.
         let submenu = match self.review.submenu {
-            Some(Submenu::Turns) => Some(div().mt(rpx(turns_row)).child(self.turns_menu(cx))),
-            Some(Submenu::Commits) => Some(div().mt(rpx(commits_row)).child(self.commits_menu(cx))),
+            Some(Submenu::Turns) => Some(self.turns_menu(cx).into_any_element()),
+            Some(Submenu::Commits) => Some(self.commits_menu(cx).into_any_element()),
             None => None,
         };
         div()
             .id("review-source-menus")
             .absolute()
             .occlude()
-            .top(rpx(42.))
-            .left(rpx(10.))
+            .top_0()
+            .left_0()
+            .w(rpx(330.))
+            .max_w(relative(1.))
+            .max_h(relative(1.))
+            .overflow_y_scroll()
             .flex()
-            .items_start()
+            .flex_col()
             .gap_1()
             .child(menu)
             .children(submenu)
@@ -1739,6 +1754,7 @@ impl Browser {
                 this.review.submenu = None;
                 cx.notify();
             }))
+            .map(observe)
     }
 
     fn turns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1780,9 +1796,8 @@ impl Browser {
             })
             .collect::<Vec<_>>();
         menu_panel("review-turns-menu")
-            .w(rpx(330.))
-            .max_h(rpx(420.))
-            .overflow_y_scroll()
+            .w_full()
+            .flex_shrink_0()
             .children(items)
     }
 
@@ -1826,9 +1841,8 @@ impl Browser {
                     .collect(),
             };
         menu_panel("review-commits-menu")
-            .w(rpx(330.))
-            .max_h(rpx(420.))
-            .overflow_y_scroll()
+            .w_full()
+            .flex_shrink_0()
             .children(body)
     }
 
@@ -1847,11 +1861,15 @@ impl Browser {
             .id("review-more-menus")
             .absolute()
             .occlude()
-            .top(rpx(42.))
-            .right(rpx(10.))
+            .top_0()
+            .right_0()
+            .w(rpx(250.))
+            .max_w(relative(1.))
+            .max_h(relative(1.))
+            .overflow_y_scroll()
             .child(
                 menu_panel("review-more-menu")
-                    .w(rpx(250.))
+                    .w_full()
                     .child(
                         menu_item("more-copy", "Copy as patch", None, false, count > 0, false)
                             .on_click(cx.listener(|this, _, _, cx| this.copy_patch(cx))),
@@ -1910,6 +1928,7 @@ impl Browser {
                 this.review.confirm_revert = None;
                 cx.notify();
             }))
+            .map(observe)
     }
 
     pub(super) fn review_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2931,6 +2950,47 @@ mod tests {
     use super::{MATCH_BG, Row, overlay, push_lines};
     use crate::workspace::DiffLine;
     use gpui::{FontWeight, HighlightStyle, rgb};
+
+    #[gpui_kit::test]
+    fn review_menus_scroll_within_the_panel_and_toolbar_controls_remain_reachable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::Source;
+        use crate::browser::document::tests::window;
+        use gpui::{AppContext, ScrollDelta, point, px};
+        use gpui_kit::test::TestWindowExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("readme.md");
+        std::fs::write(&path, "# Original\n").unwrap();
+        let (handle, browser) = window(temp.path().to_owned(), path, false, 220., true, cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("review-source", cx);
+            let menu = window.find("review-source-menus").bounds();
+            assert!(menu.left() >= px(0.) && menu.right() <= px(288.));
+            assert!(menu.bottom() <= px(220.));
+            window.scroll(
+                "review-source-menus",
+                ScrollDelta::Pixels(point(px(0.), px(-500.))),
+                cx,
+            );
+            assert!(window.find("source-branch").visible());
+            window.click("source-branch", cx);
+            assert!(browser.read(cx).menu.is_none());
+            assert!(browser.read(cx).review.source == Some(Source::Branch));
+            window.scroll(
+                "review-toolbar",
+                ScrollDelta::Pixels(point(px(-800.), px(0.))),
+                cx,
+            );
+            assert!(window.find("review-wrap").visible());
+            let before = browser.read(cx).review.wrap;
+            window.click("review-wrap", cx);
+            assert!(browser.read(cx).review.wrap != before);
+        })
+        .unwrap();
+    }
 
     fn line(kind: char) -> DiffLine {
         DiffLine {

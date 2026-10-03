@@ -53,7 +53,9 @@ download verification and the manual publication gate. Releases are prepared as 
 - The zoom shortcuts size whatever has focus: the terminals, the file panel or source control, each
   on its own and saved in `config.toml`.
 - Workspace tree with Git status colors, fuzzy file filtering and content search via
-  [ripgrep](https://github.com/BurntSushi/ripgrep). Nested Git repositories can be picked as the tree root.
+  [ripgrep](https://github.com/BurntSushi/ripgrep). The tree and searches include hidden and ignored
+  files, including `.git`, `target` and `node_modules`. Folders load as you expand them; the root
+  picker and the directory menus in the file path let you browse their contents.
 - Built-in editor with syntax highlighting for Rust, Go, TypeScript/TSX, JavaScript, Python, JSON,
   TOML, Markdown, Bash, CSS and HTML; search/replace, undo/redo, line numbers and atomic saves.
 - Rendered Markdown preview, image preview (PNG, JPEG, WebP, GIF, BMP, SVG, ICO) with zoom, and an
@@ -93,8 +95,8 @@ download verification and the manual publication gate. Releases are prepared as 
 - A project is a named set of source folders, the first one primary, like a Codex project
   (≡ ▸ Edit project…). Opening a folder that holds repositories offers them as a project, and a
   project already defined in the Codex app is picked up.
-- Project folders show in the file tree even when the primary folder's `.gitignore` hides them, as
-  in a playground that keeps its repositories side by side. Worktrees can be picked as the tree root.
+- Project folders and worktrees can be picked as the tree root, including folders inside a
+  playground that keeps its repositories side by side.
 - An agent turn in the primary folder snapshots every project repository inside it, so the turn
   badge and Review show changes across repositories.
 - Projects live in Vyber's data directory; nothing is written into the folders.
