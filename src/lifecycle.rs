@@ -1,4 +1,6 @@
-use crate::app::{NewTerminal, OpenFolder, Quit, Settings, Vyber, WorkspaceLaunch};
+use crate::app::{
+    CheckForUpdates, NewTerminal, OpenFolder, Quit, Settings, Vyber, WorkspaceLaunch,
+};
 use gpui::*;
 use gpui_kit::component::TitleBar;
 use std::path::PathBuf;
@@ -49,6 +51,13 @@ pub fn init(root: PathBuf, cx: &mut App) {
     cx.on_action(|action: &Settings, cx| {
         if show_workspace(cx).is_ok() {
             with_workspace(cx, |app, window, cx| app.settings(action, window, cx));
+        }
+    });
+    cx.on_action(|action: &CheckForUpdates, cx| {
+        if show_workspace(cx).is_ok() {
+            with_workspace(cx, |app, window, cx| {
+                app.check_for_updates(action, window, cx)
+            });
         }
     });
     cx.on_action(|action: &Quit, cx| {

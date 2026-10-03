@@ -122,6 +122,20 @@ download verification and the manual publication gate. Releases are prepared as 
   hard resets keep recovery copies; a running agent turn is pointed out before commands that
   change its files.
 
+**Updates**
+
+- Release packages check this repository's latest published release 30 seconds after launch and
+  every six hours. A newer version for your platform downloads in the background, is checked
+  against the release manifest's size and SHA-256, and a blue **Update** button appears at the top
+  right. Clicking it asks first if terminals are running something, replaces Vyber in place and
+  restarts it with your tabs, folders and open files.
+- ≡ ▸ Check for updates (Vyber ▸ Check for Updates… on macOS) checks right away. Set
+  `check_for_updates = false` in `config.toml` to stop the automatic checks.
+- When Vyber can't write to its own folder (Program Files, `/usr/bin`, or a macOS app run from
+  Downloads or a disk image), Update opens the release page instead. Drafts and prereleases are
+  never offered, and builds made from source don't update.
+- Vyber 0.1.0 has no updater: install the release after it by hand once.
+
 Vyber never talks to agents: it doesn't install hooks or use an SDK. It checks local process names
 only when confirming terminal closure. `claude`, `codex`
 and every other CLI simply run in your terminal.
@@ -206,11 +220,12 @@ directory on macOS/Linux (`$XDG_DATA_HOME/Vyber` or `~/.local/share/Vyber` on Li
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | `shell`, `font_family`, `font_size`, `files_font_size`, `git_font_size`, `panel_mode` (`"overlay"` or `"dock"`), `scrollback`, `reduced_motion`, `notifications`, `restore_workspace`, `task_history_days`, `task_history_limit`, `git_autofetch`. Changes apply as soon as the file is saved. |
+| `config.toml` | `shell`, `font_family`, `font_size`, `files_font_size`, `git_font_size`, `panel_mode` (`"overlay"` or `"dock"`), `scrollback`, `reduced_motion`, `notifications`, `restore_workspace`, `task_history_days`, `task_history_limit`, `git_autofetch`, `check_for_updates`. Changes apply as soon as the file is saved. |
 | `workspace.json` | Tabs, split layout, terminal folders, open files and unsaved drafts |
 | `projects.json` | Projects and their source folders |
 | `git-drafts.json` | Unsent commit messages |
 | `checkpoints/`, `tasks/`, `recovery/` | Local review snapshots and recovery copies |
+| `updates/` | A downloaded update waiting to be installed |
 | `vyber.log` | Application errors only — terminal output is never logged |
 
 ## Known limitations

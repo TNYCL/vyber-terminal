@@ -108,6 +108,9 @@ jobs:
           VYBER_DATA_DIR: ${{ runner.temp }}/vyber-test-data
         run: cargo test --locked --bin vyber --target ${{ matrix.target }} -- --test-threads=1
       - name: Build optimized binary
+        env:
+          # Packaged builds check GitHub releases for updates; local builds don't.
+          VYBER_OFFICIAL_BUILD: '1'
         run: cargo build --release --locked --target ${{ matrix.target }}
       - if: runner.os == 'Windows'
         name: Package Windows
