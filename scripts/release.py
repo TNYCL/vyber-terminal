@@ -313,6 +313,7 @@ Native packages for Windows x64, macOS Apple Silicon and Intel, and Linux x64/AR
 Windows: extract the ZIP and run Vyber.exe. macOS: open the DMG and drag Vyber.app to Applications. Linux: extract the tar.gz and run bin/vyber; see INSTALL.md for desktop integration.
 
 Git is needed for source-control features; ripgrep is optional for content search.
+Vyber checks this repository for newer releases and offers them with Update in the title bar; set `check_for_updates = false` in config.toml to turn the checks off.
 Verify SHA256SUMS.txt and build provenance with `gh attestation verify <package> --repo {REPO}`.
 
 ### Validation and platform notes
