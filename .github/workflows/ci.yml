@@ -11,6 +11,11 @@ on:
         description: Validated commit to build
         type: string
         required: false
+      full_ci:
+        description: Always run full checks for reusable workflows, including releases
+        type: boolean
+        default: true
+        required: false
 
 permissions:
   contents: read
@@ -24,8 +29,31 @@ env:
   CARGO_BUILD_JOBS: '2'
 
 jobs:
+  changes:
+    name: Detect CI scope
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          FORCE_FULL: ${{ inputs.full_ci || inputs.ref != '' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+        run: python3 scripts/ci_scope.py classify
+
   quality:
     name: Format and workflow checks
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -51,12 +79,16 @@ jobs:
 
   audit:
     name: Dependency audit
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     uses: ./.github/workflows/security.yml
     with:
       ref: ${{ inputs.ref || github.sha }}
 
   native:
     name: Native (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -146,20 +178,16 @@ jobs:
   ready:
     name: ready
     if: always()
-    needs: [quality, audit, native]
+    needs: [changes, quality, audit, native]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - name: Require all checks
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os, sys
-          results = json.loads(os.environ['RESULTS'])
-          failed = {name: job['result'] for name, job in results.items() if job['result'] != 'success'}
-          if failed:
-              print(f'CI failed: {failed}')
-              sys.exit(1)
-          print('All required checks passed.')
-          PY
+          FULL_CI: ${{ needs.changes.outputs.full }}
+        run: python3 scripts/ci_scope.py check
