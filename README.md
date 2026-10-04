@@ -42,7 +42,7 @@ Choose your operating system and processor from the
 | Linux x64 | tar.gz, x86_64 | Extract, open the package folder, and run `./bin/vyber`. |
 | Linux ARM64 | tar.gz, aarch64 | Same steps; desktop support is experimental. |
 
-**Platform status:** CI checks all five targets; desktop/GPU compatibility is still being verified
+**Platform status:** Code and release checks cover all five targets; desktop/GPU compatibility is still being verified
 on macOS/Linux. Windows 11 is the development platform. Windows packages are unsigned; macOS
 packages are ad-hoc-signed, not notarized, and may encounter OS security prompts. macOS 12 is a
 build target, not a verified minimum.

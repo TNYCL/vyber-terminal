@@ -8,10 +8,14 @@ Visual C++ runtime DLL dependency. System DLLs remain listed in `runtime-librari
 
 ## Workflows
 
-- `ci.yml`: PR/main/manual checks, plus a reusable workflow for releases. All five targets
-  run Clippy, tests, an optimized build and packaging. `ready` requires every job to succeed.
-- `security.yml`: dependency advisories, licenses and sources; called by CI for every PR
-  and release, also weekly and manually.
+- `ci.yml`: PR/main/manual checks, plus a reusable workflow for releases. Code/build changes
+  run Clippy, tests, optimized builds and packaging on all five targets. PRs and main pushes
+  changing only `README.md` or `docs/**/*.md` run scope detection and `ready`, skipping the
+  heavy jobs. Mixed changes or unknown history use full CI; manual and reusable release
+  runs always use full CI. `ready` requires success on the full path, or a successful scope
+  check and intentional skips on the documentation path; failed/cancelled checks never pass.
+- `security.yml`: dependency advisories, licenses and sources; called by full CI and releases,
+  also weekly and manually.
 - `release.yml`: an existing version tag selects a main-branch commit, runs the same CI,
   validates all five artifacts, attests them, then creates a draft. It never publishes.
 - `.github/dependabot.yml`: weekly Cargo and SHA-pinned Action update PRs.
