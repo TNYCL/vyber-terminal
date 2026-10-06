@@ -97,7 +97,7 @@ pub fn open_workspace(launch: WorkspaceLaunch, cx: &mut App) -> anyhow::Result<A
             size(px(1380.), px(850.)),
             cx,
         ))),
-        window_min_size: Some(size(px(900.), px(550.))),
+        window_min_size: Some(size(px(160.), px(200.))),
         app_id: Some("dev.vyber.terminal".into()),
         ..TitleBar::window_options()
     };
