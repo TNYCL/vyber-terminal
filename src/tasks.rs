@@ -40,6 +40,9 @@ pub struct TaskReview {
     pub changes: Vec<Change>,
     pub active: bool,
     pub warning: String,
+    /// The agent's latest message in the turn, shown in the toolbelt.
+    #[serde(default)]
+    pub reply: String,
 }
 impl TaskReview {
     /// Whether the agent may run in a terminal. Codex's desktop app and the
@@ -82,6 +85,11 @@ pub enum Boundary {
         id: String,
         interrupted: bool,
     },
+    /// The agent wrote a message in the turn.
+    Reply {
+        id: String,
+        text: String,
+    },
 }
 #[derive(Default)]
 pub struct Parser {
@@ -98,6 +106,10 @@ fn label(text: &str) -> String {
         .chars()
         .take(100)
         .collect()
+}
+/// The start of an agent message, enough for a preview.
+fn reply(text: &str) -> String {
+    text.trim().chars().take(600).collect()
 }
 fn text_content(value: &Value) -> String {
     if let Some(s) = value.as_str() {
@@ -163,6 +175,19 @@ impl Parser {
                     });
                 }
             }
+            let message = match typ {
+                "agent_message" => p["message"].as_str(),
+                "task_complete" | "turn_complete" => p["last_agent_message"].as_str(),
+                _ => None,
+            };
+            if let Some(text) = message.map(reply).filter(|t| !t.is_empty())
+                && let Some(id) = &self.current
+            {
+                events.push(Boundary::Reply {
+                    id: id.clone(),
+                    text,
+                });
+            }
             if matches!(typ, "task_complete" | "turn_complete" | "turn_aborted")
                 && let Some(id) = self.current.clone()
                 && (turn.is_empty() || id.ends_with(&format!(":{turn}")))
@@ -194,6 +219,33 @@ impl Parser {
                     });
                 }
             }
+        }
+        let p = &v["payload"];
+        let assistant = if kind == "response_item" && p["type"] == "message" {
+            (p["role"] == "assistant").then(|| text_content(&p["content"]))
+        } else if kind == "assistant" {
+            let content = &v["message"]["content"];
+            Some(content.as_array().map_or_else(
+                || text_content(content),
+                |items| {
+                    items
+                        .iter()
+                        .filter(|i| i["type"] == "text")
+                        .filter_map(|i| i["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            ))
+        } else {
+            None
+        };
+        if let Some(text) = assistant.as_deref().map(reply).filter(|t| !t.is_empty())
+            && let Some(id) = &self.current
+        {
+            events.push(Boundary::Reply {
+                id: id.clone(),
+                text,
+            });
         }
         if kind == "user" && v["isMeta"] != true {
             let content = &v["message"]["content"];
@@ -516,6 +568,7 @@ impl Monitor {
                                 changes: vec![],
                                 active: true,
                                 warning,
+                                reply: String::new(),
                             };
                             let _ = sender.send(review.clone());
                             reviews.insert(id, review);
@@ -525,6 +578,14 @@ impl Monitor {
                                 && let Some(r) = reviews.get_mut(&id)
                             {
                                 r.label = format!("{} · {label}", r.agent);
+                                let _ = sender.send(r.clone());
+                            }
+                        }
+                        Boundary::Reply { id, text } => {
+                            if let Some(r) = reviews.get_mut(&id)
+                                && r.reply != text
+                            {
+                                r.reply = text;
                                 let _ = sender.send(r.clone());
                             }
                         }
@@ -673,6 +734,43 @@ mod tests {
         assert!(matches!(&tail.read(f.path())[0],Boundary::Start{label,..}if label=="Türkçe"));
     }
     #[test]
+    fn replies_follow_the_latest_agent_message() {
+        let replies = |events: Vec<Boundary>| {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    Boundary::Reply { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut p = Parser::default();
+        assert!(
+            replies(p.feed(
+                &json!({"type":"assistant","message":{"content":[{"type":"text","text":"early"}]}})
+            ))
+            .is_empty()
+        );
+        p.feed(&json!({"type":"user","uuid":"u","sessionId":"s","cwd":"/r","message":{"content":"hi"}}));
+        assert!(replies(p.feed(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}))).is_empty());
+        assert_eq!(
+            replies(p.feed(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"  Done.\n"}]}}))),
+            ["Done."]
+        );
+        assert!(replies(p.feed(&json!({"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"child"}]}}))).is_empty());
+        let mut p = Parser::default();
+        p.feed(&json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}));
+        assert_eq!(
+            replies(p.feed(&json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Looking."}]}}))),
+            ["Looking."]
+        );
+        assert!(replies(p.feed(&json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]}}))).is_empty());
+        let end = p.feed(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"All set."}}));
+        assert!(
+            matches!(&end[..], [Boundary::Reply { text, .. }, Boundary::End { .. }] if text == "All set.")
+        );
+    }
+    #[test]
     fn unknown_schema_is_ignored() {
         assert!(
             Parser::default()
@@ -706,6 +804,7 @@ mod tests {
             changes: vec![],
             active: true,
             warning: String::new(),
+            reply: String::new(),
         };
         for client in ["codex-tui", "codex_cli_rs", "codex_exec", "cli", ""] {
             assert!(review(client).is_from_terminal(), "{client}");

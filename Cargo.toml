@@ -1,6 +1,6 @@
 [package]
 name = "vyber-terminal"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "A native terminal workspace with files, previews, and review."
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,7 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_System_Threading"] }
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_System_Threading", "Wdk_System_Threading"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [build-dependencies]

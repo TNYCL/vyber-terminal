@@ -87,7 +87,7 @@ impl Vyber {
         window.request_animation_frame();
     }
 
-    fn group_name(&self, index: usize, cx: &App) -> String {
+    pub(super) fn group_name(&self, index: usize, cx: &App) -> String {
         self.tab_state.groups[index]
             .name
             .clone()
@@ -107,13 +107,23 @@ impl Vyber {
             })
     }
 
-    fn group_busy(&self, layout: &Layout) -> bool {
-        layout.leaves().iter().any(|id| {
-            self.slots
-                .get(id)
-                .and_then(|s| s.turn.as_ref())
-                .is_some_and(|t| t.active)
-        })
+    /// The neediest agent state among the group's terminals. A turn in the
+    /// logs counts as work where no agent process was found.
+    fn group_state(&self, layout: &Layout) -> Option<AgentState> {
+        layout
+            .leaves()
+            .iter()
+            .filter_map(|id| {
+                let slot = self.slots.get(id)?;
+                slot.agent.as_ref().map(|a| a.state).or_else(|| {
+                    slot.turn
+                        .as_ref()
+                        .is_some_and(|t| t.active)
+                        .then_some(AgentState::Working)
+                })
+            })
+            .max()
+            .filter(|state| *state != AgentState::Idle)
     }
 
     pub(super) fn group_tab(
@@ -127,7 +137,7 @@ impl Vyber {
         let anchor = layout.first();
         let active = index == self.tab;
         let count = layout.leaves().len();
-        let busy = self.group_busy(layout);
+        let state = self.group_state(layout);
         let name = self.group_name(index, cx);
         let tooltip = format!(
             "{name} · {count} terminal{}\nDouble-click to rename · Right-click for actions",
@@ -176,12 +186,8 @@ impl Vyber {
                     .when(count > 1, |s| s.child(count.to_string())),
             )
             .child(
-                div()
-                    .size(px(5.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(theme::LINK))
-                    .opacity(if busy { 1. } else { 0. }),
+                super::toolbelt::state_dot(state.unwrap_or(AgentState::Idle), 6.)
+                    .opacity(if state.is_some() { 1. } else { 0. }),
             )
             .child(
                 tool_button(

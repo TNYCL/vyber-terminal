@@ -35,6 +35,8 @@ pub const ADDED: u32 = 0x40c977;
 pub const MODIFIED: u32 = 0xff8549;
 pub const DELETED: u32 = 0xfa423e;
 pub const CONFLICT: u32 = 0xe4676b;
+// Agent states: working borrows the modified orange, a reply the added green.
+pub const WAITING: u32 = 0xf5c542;
 pub const WARNING_BG: u32 = 0x2a2213;
 pub const WARNING: u32 = 0xe8ca8b;
 // The Update button: a deeper link blue that keeps white text readable.
@@ -170,6 +172,38 @@ pub fn icon_button(
         .hover(|s| s.bg(rgb(HOVER)))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .child(icon(ui(name), TEXT_2, 15.).group_hover(group, |s| s.text_color(rgb(TEXT))))
+}
+
+/// A chevron that turns from right (0) to down (1).
+pub fn chevron(open: f32, color: u32, size: f32) -> Svg {
+    icon(ui("chevron-right"), color, size).with_transformation(Transformation::rotate(radians(
+        std::f32::consts::FRAC_PI_2 * open,
+    )))
+}
+
+/// The small capitals title of a collapsible section.
+pub fn section_title(text: &'static str) -> Div {
+    div()
+        .text_size(rpx(10.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(MUTED))
+        .child(text)
+}
+
+pub fn count_badge(count: usize) -> Div {
+    div()
+        .flex_shrink_0()
+        .min_w(rpx(18.))
+        .h(rpx(16.))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(rpx(8.))
+        .bg(rgb(SELECTED))
+        .text_size(rpx(10.5))
+        .text_color(rgb(TEXT_2))
+        .child(count.to_string())
 }
 
 /// A borderless text row used in menus.

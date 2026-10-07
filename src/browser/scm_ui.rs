@@ -46,13 +46,6 @@ fn spinner(size: f32, color: u32) -> impl IntoElement {
     )
 }
 
-/// A chevron that turns from right (0) to down (1).
-fn chevron(open: f32, color: u32, size: f32) -> Svg {
-    icon(ui("chevron-right"), color, size).with_transformation(Transformation::rotate(radians(
-        std::f32::consts::FRAC_PI_2 * open,
-    )))
-}
-
 /// Shows `body` at `open` of its height (`full`), fading with it.
 fn folding(body: Div, open: f32, full: f32) -> Div {
     if open >= 0.999 {
@@ -73,30 +66,6 @@ fn appear<E: IntoElement + 'static>(id: impl Into<ElementId>, element: E) -> imp
         Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
         |el, t| el.opacity(t).mt(rpx(-6. * (1. - t))),
     )
-}
-
-fn section_title(text: &'static str) -> Div {
-    div()
-        .text_size(rpx(10.5))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(MUTED))
-        .child(text)
-}
-
-fn count_badge(count: usize) -> Div {
-    div()
-        .flex_shrink_0()
-        .min_w(rpx(18.))
-        .h(rpx(16.))
-        .px_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(rpx(8.))
-        .bg(rgb(SELECTED))
-        .text_size(rpx(10.5))
-        .text_color(rgb(TEXT_2))
-        .child(count.to_string())
 }
 
 /// A small icon button that is always shown.

@@ -14,6 +14,15 @@ pub enum PanelMode {
     Dock,
 }
 
+/// The window edge the toolbelt sits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolbeltSide {
+    Left,
+    #[default]
+    Right,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -37,6 +46,13 @@ pub struct Config {
     /// Look for a new Vyber release now and then and download it in the
     /// background, ready to install from the title bar.
     pub check_for_updates: bool,
+    /// Show the toolbelt: the focused terminal's jobs and every agent's status.
+    pub toolbelt: bool,
+    pub toolbelt_side: ToolbeltSide,
+    /// Toolbelt width in pixels.
+    pub toolbelt_width: f32,
+    /// The share of the toolbelt's height that Jobs takes.
+    pub toolbelt_split: f64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -55,6 +71,10 @@ impl Default for Config {
             task_history_limit: 200,
             git_autofetch: true,
             check_for_updates: true,
+            toolbelt: true,
+            toolbelt_side: ToolbeltSide::Right,
+            toolbelt_width: 300.,
+            toolbelt_split: 0.45,
         }
     }
 }
@@ -148,6 +168,16 @@ impl Config {
         self.files_font_size = self.files_font_size.clamp(8., 24.);
         self.git_font_size = self.git_font_size.clamp(8., 24.);
         self.scrollback = self.scrollback.clamp(1000, 100_000);
+        self.toolbelt_width = if self.toolbelt_width.is_finite() {
+            self.toolbelt_width.clamp(200., 640.).round()
+        } else {
+            300.
+        };
+        self.toolbelt_split = if self.toolbelt_split.is_finite() {
+            (self.toolbelt_split.clamp(0.15, 0.85) * 100.).round() / 100.
+        } else {
+            0.45
+        };
     }
     fn table(&self) -> toml::Table {
         toml::Table::try_from(self).unwrap_or_default()

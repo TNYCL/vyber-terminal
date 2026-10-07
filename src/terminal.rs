@@ -127,6 +127,8 @@ pub struct Terminal {
     typed: String,
     pub last_line: String,
     pub last_submit: Option<Instant>,
+    /// When the program last got input: keys, pastes or comments.
+    input_at: std::cell::Cell<Option<Instant>>,
     /// Process id of the shell, which the programs started in it run under.
     pub shell: Option<u32>,
     font_family: String,
@@ -387,6 +389,7 @@ impl Terminal {
             typed: String::new(),
             last_line: String::new(),
             last_submit: None,
+            input_at: Default::default(),
             shell,
             font_family,
             focus: cx.focus_handle(),
@@ -638,7 +641,29 @@ impl Terminal {
         }
     }
     pub fn send(&self, bytes: impl Into<Vec<u8>>) {
+        self.input_at.set(Some(Instant::now()));
         let _ = self.sender.send(Msg::Input(Cow::Owned(bytes.into())));
+    }
+    pub fn last_input(&self) -> Option<Instant> {
+        self.input_at.get()
+    }
+    /// The text of the bottom `rows` lines of the screen, whatever part of
+    /// the scrollback is on display.
+    pub fn screen_text(&self, rows: usize) -> String {
+        let term = self.term.lock();
+        let lines = term.screen_lines();
+        let columns = term.columns();
+        (lines.saturating_sub(rows)..lines)
+            .map(|row| {
+                let line = &term.grid()[Line(row as i32)];
+                (0..columns)
+                    .map(|column| line[Column(column)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
     pub fn set_badge(&mut self, badge: Option<TurnBadge>, cx: &mut Context<Self>) {
         if self.badge != badge {

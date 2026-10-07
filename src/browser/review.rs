@@ -1157,6 +1157,7 @@ impl Browser {
                         changes,
                         active: false,
                         warning: "Includes all workspace edits since this checkpoint.".into(),
+                        reply: String::new(),
                     };
                     crate::tasks::persist(&task);
                     anyhow::Ok(task)

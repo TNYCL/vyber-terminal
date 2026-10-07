@@ -98,6 +98,18 @@ Run TUI tools in real PTYs, with multiline Shift+Enter support for Codex and Cla
 Search scrollback and Ctrl/Cmd+click file paths or URLs. Font sizes persist, and background bells
 or terminal notifications can trigger desktop notifications.
 
+### Watch agents and jobs in the toolbelt
+
+The toolbelt (Ctrl+Shift+J / Cmd+J) sits beside the terminals, on the right or left, and keeps
+its width. **Jobs** shows the focused terminal's process tree with each command line; select a
+process to end it (choose the signal on macOS and Linux). **Session Status** lists every terminal
+running Claude Code or Codex as working, waiting for you, responded, or idle, with its latest
+message. A reply stays green until you look at its terminal; click a session to go there. Tab
+dots show the same states.
+
+Claude Code reports its own state; for Codex, Vyber reads the session log, an approval question
+on screen, and bells or notifications during a turn.
+
 ### Browse, preview, and edit beside the terminal
 
 Each terminal has its own tree, open files, and preview. Float the file panel over the terminal
@@ -275,6 +287,10 @@ argument list, to choose another shell:
 | `task_history_limit` | `200` | Displayed review limit; not a disk quota. |
 | `git_autofetch` | `true` | Fetch remotes every five minutes while Source Control is open. |
 | `check_for_updates` | `true` | Automatic checks/downloads in official packages; manual checks remain available. |
+| `toolbelt` | `true` | Show the toolbelt with Jobs and Session Status. |
+| `toolbelt_side` | `"right"` | `"right"` or `"left"`. |
+| `toolbelt_width` | `300.0` | Toolbelt width in pixels, 200–640; dragging its edge saves it. |
+| `toolbelt_split` | `0.45` | Share of the toolbelt's height for Jobs, 0.15–0.85. |
 
 | File or directory | Contents |
 | --- | --- |
@@ -296,6 +312,7 @@ Set `VYBER_DATA_DIR` to use a different data directory, for example for an isola
 | --- | --- | --- |
 | New tab | Ctrl+Shift+T | Cmd+T / Cmd+N |
 | File panel | Ctrl+Shift+B | Cmd+B |
+| Toolbelt | Ctrl+Shift+J | Cmd+J |
 | Find file | Ctrl+Shift+P | Cmd+P |
 | Source Control | Ctrl+Shift+G | Cmd+Shift+G |
 | Manual checkpoint | Ctrl+Shift+K | Cmd+Shift+K |
@@ -317,6 +334,7 @@ Set `VYBER_DATA_DIR` to use a different data directory, for example for an isola
 | Go to tab 1–8 / last tab | Ctrl+1…8 / Ctrl+9 | Cmd+1…8 / Cmd+9 | Ctrl+1…8 / Ctrl+9 |
 | Maximize terminal | Ctrl+Shift+Enter | Cmd+Enter | Ctrl+Shift+Enter |
 | File panel | Ctrl+Shift+B | Cmd+B | Ctrl+Shift+B |
+| Toolbelt | Ctrl+Shift+J | Cmd+J | Ctrl+Shift+J |
 | Source control | Ctrl+Shift+G | Cmd+Shift+G | Ctrl+Shift+G |
 | Find file | Ctrl+Shift+P | Cmd+P | Ctrl+Shift+P |
 | Search terminal history | Ctrl+Shift+F | Cmd+F | Ctrl+Shift+F |
