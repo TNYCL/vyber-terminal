@@ -1106,6 +1106,7 @@ mod tests {
             after: Some(after),
             active: false,
             warning: String::new(),
+            reply: String::new(),
         };
         assert_eq!(task.changes[0].additions, 1);
         let files = read(&turn_plan(&task)?)?;
@@ -1152,6 +1153,7 @@ mod tests {
             after: None,
             active: true,
             warning: String::new(),
+            reply: String::new(),
         };
         let expected = vec![
             (

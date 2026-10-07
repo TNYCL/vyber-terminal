@@ -1,4 +1,5 @@
 use crate::{
+    agents::AgentState,
     browser::{Browser, BrowserEvent},
     closing::{self, ClosePlan, CloseTarget},
     config::{Config, PANEL_FONT_SIZE, PanelMode},
@@ -23,7 +24,9 @@ use std::{
 };
 
 mod tabs;
+mod toolbelt;
 use tabs::{RenameTab, TabMenu};
+use toolbelt::{AgentStatus, Toolbelt};
 
 actions!(
     vyber,
@@ -51,7 +54,8 @@ actions!(
         ResetFontSize,
         ToggleGit,
         EditProject,
-        CheckForUpdates
+        CheckForUpdates,
+        ToggleToolbelt
     ]
 );
 
@@ -171,6 +175,11 @@ struct Slot {
     browser: Entity<Browser>,
     /// Latest agent turn that ran in this terminal.
     turn: Option<TaskReview>,
+    /// The Claude Code or Codex session running here, if any.
+    agent: Option<AgentStatus>,
+    tracker: crate::agents::Tracker,
+    /// When the program last rang the bell or sent a notification.
+    attention: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
 }
 #[derive(Serialize, Deserialize, Default)]
@@ -209,6 +218,9 @@ pub struct Vyber {
     monitor: Monitor,
     /// Agent session → the terminal it runs in, learned from its first turn.
     sessions: HashMap<String, usize>,
+    /// The processes and Claude Code sessions, rescanned every second or two.
+    scan: crate::agents::Scan,
+    toolbelt: Toolbelt,
     notice: String,
     notifications: crate::notifications::Notifications,
     last_persist: std::time::Instant,
@@ -316,6 +328,8 @@ impl Vyber {
             roots,
             monitor,
             sessions: HashMap::new(),
+            scan: Default::default(),
+            toolbelt: Toolbelt::new(cx.global::<Config>()),
             notice: String::new(),
             notifications: crate::notifications::Notifications::new(),
             last_persist: std::time::Instant::now(),
@@ -445,6 +459,41 @@ impl Vyber {
             }
         })
         .detach();
+        // Listing processes takes a moment on macOS, so it runs off the UI
+        // thread: more often while the toolbelt shows them.
+        #[cfg(not(test))]
+        cx.spawn_in(window, async move |entity, cx| {
+            loop {
+                let Ok((shells, interval)) = entity.update(cx, |this, cx| {
+                    let shells = this
+                        .slots
+                        .values()
+                        .filter_map(|s| s.terminal.read(cx).shell)
+                        .collect::<Vec<_>>();
+                    let interval = if this.toolbelt.shown() { 1000 } else { 2000 };
+                    (shells, Duration::from_millis(interval))
+                }) else {
+                    break;
+                };
+                let scan = cx
+                    .background_executor()
+                    .spawn(async move { crate::agents::Scan::capture(&shells) })
+                    .await;
+                if entity
+                    .update_in(cx, |this, window, cx| {
+                        this.scan = scan;
+                        if this.refresh_agents(window, cx) || this.toolbelt.shown() {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(interval).await;
+            }
+        })
+        .detach();
         app
     }
     fn add_terminal(
@@ -532,6 +581,9 @@ impl Vyber {
                 terminal,
                 browser,
                 turn: None,
+                agent: None,
+                tracker: Default::default(),
+                attention: None,
                 _subscriptions: vec![focused, badge, comments],
             },
         );
@@ -663,6 +715,9 @@ impl Vyber {
                 });
                 (msg, t.open_path.take())
             });
+            if message.is_some() {
+                slot.attention = Some(std::time::Instant::now());
+            }
             if let Some(message) = message
                 && !window.is_window_active()
                 && cx.global::<Config>().notifications
@@ -736,20 +791,14 @@ impl Vyber {
         }
         let notifications: Vec<_> = self.notifications.receiver.try_iter().collect();
         for id in notifications {
-            if let Some(slot) = self.slots.get(&id) {
-                self.active = id;
-                self.tab = self
-                    .tabs
-                    .iter()
-                    .position(|t| t.contains(id))
-                    .unwrap_or(self.tab);
-                self.tab_state.focus(id);
-                self.tab_scroll.scroll_to_item(self.tab);
+            if self.slots.contains_key(&id) {
                 window.activate_window();
-                let focus = slot.terminal.read(cx).focus.clone();
-                window.focus(&focus, cx);
+                self.focus_pane(id, window, cx);
                 changed = true;
             }
+        }
+        if self.refresh_agents(window, cx) {
+            changed = true;
         }
         if self.last_persist.elapsed() > Duration::from_secs(5) {
             self.persist(cx);
@@ -1732,6 +1781,14 @@ impl Render for Vyber {
         let visible = browser.as_ref().is_some_and(|b| b.read(cx).visible);
         let git_open = browser.as_ref().is_some_and(|b| b.read(cx).git_open());
         let changes = browser.as_ref().map_or(0, |b| b.read(cx).change_count());
+        // With the toolbelt hidden, its button still says an agent waits.
+        let toolbelt_open = cx.global::<Config>().toolbelt;
+        let toolbelt_dot = self
+            .slots
+            .values()
+            .filter_map(|s| s.agent.as_ref().map(|a| a.state))
+            .max()
+            .filter(|state| !toolbelt_open && *state == AgentState::Waiting);
         let config = cx.global::<Config>();
         let docked = config.panel_mode == PanelMode::Dock;
         // A docked panel stays while another terminal of the tab has focus, so
@@ -1790,9 +1847,10 @@ impl Render for Vyber {
         if !cx.has_active_drag() {
             self.resizing_panel = false;
         }
-        let interval = if dockness > 0. && motion.running() {
+        let (belt, belt_moving) = self.toolbelt_progress(full, cx);
+        let interval = if (dockness > 0. && motion.running()) || belt_moving {
             Some(Duration::MAX)
-        } else if docked && self.resizing_panel {
+        } else if (docked && self.resizing_panel) || self.toolbelt.resizing() {
             Some(Duration::from_millis(100))
         } else {
             None
@@ -1920,6 +1978,19 @@ impl Render for Vyber {
                         this.toggle_git(&ToggleGit, w, cx);
                     },
                 )),
+            )
+            .child(
+                chip(
+                    "menu-toolbelt",
+                    if cfg!(target_os = "macos") {
+                        "Toolbelt     ⌘J"
+                    } else {
+                        "Toolbelt     Ctrl+Shift+J"
+                    },
+                )
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.toggle_toolbelt(&ToggleToolbelt, w, cx);
+                })),
             )
             .child(
                 chip("menu-project", "Edit project…").on_click(cx.listener(|this, _, w, cx| {
@@ -2102,6 +2173,7 @@ impl Render for Vyber {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::settings))
             .on_action(cx.listener(Self::check_for_updates))
+            .on_action(cx.listener(Self::toggle_toolbelt))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
@@ -2248,10 +2320,40 @@ impl Render for Vyber {
                                 .on_click(cx.listener(
                                     |this, _, w, cx| this.toggle_files(&ToggleFiles, w, cx),
                                 )),
+                            )
+                            .child(
+                                icon_bar_button("toolbelt-toggle", "activity", toolbelt_open)
+                                    .when(toolbelt_open, |s| s.bg(rgb(0x1d1d1d)))
+                                    .when_some(toolbelt_dot, |s, state| {
+                                        s.relative().child(
+                                            toolbelt::state_dot(state, 6.)
+                                                .absolute()
+                                                .top(px(9.))
+                                                .right(px(6.)),
+                                        )
+                                    })
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            if cfg!(target_os = "macos") {
+                                                "Toolbelt  (⌘J)"
+                                            } else {
+                                                "Toolbelt  (Ctrl+Shift+J)"
+                                            },
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.toggle_toolbelt(&ToggleToolbelt, w, cx)
+                                    })),
                             ),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.with_toolbelt(body, belt, full, cx)),
+            )
             .when(self.show_shortcuts, |s| s.child(menu))
             .children(tab_overlays)
             .when_some(self.project_dialog.as_ref(), |s, (dialog, _)| {
@@ -2341,6 +2443,7 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new(&format!("{prefix}-e"), SplitDown, None),
         KeyBinding::new(&format!("{prefix}-b"), ToggleFiles, None),
+        KeyBinding::new(&format!("{prefix}-j"), ToggleToolbelt, None),
         KeyBinding::new(
             if cfg!(target_os = "macos") {
                 "cmd-shift-g"

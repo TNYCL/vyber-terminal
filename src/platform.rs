@@ -256,65 +256,12 @@ pub struct Processes(std::collections::HashMap<u32, (u32, String)>);
 
 impl Processes {
     pub fn list() -> Self {
-        #[cfg(windows)]
-        {
-            use windows::Win32::{
-                Foundation::CloseHandle,
-                System::Diagnostics::ToolHelp::{
-                    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                    TH32CS_SNAPPROCESS,
-                },
-            };
-            let mut list = std::collections::HashMap::new();
-            // Safety: the snapshot handle is closed below, and each entry
-            // carries its size as Process32FirstW/NextW require.
-            unsafe {
-                let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-                    return Self::default();
-                };
-                let mut entry = PROCESSENTRY32W {
-                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-                    ..Default::default()
-                };
-                let mut next = Process32FirstW(snapshot, &mut entry);
-                while next.is_ok() {
-                    let name = &entry.szExeFile;
-                    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-                    list.insert(
-                        entry.th32ProcessID,
-                        (
-                            entry.th32ParentProcessID,
-                            String::from_utf16_lossy(&name[..len]),
-                        ),
-                    );
-                    next = Process32NextW(snapshot, &mut entry);
-                }
-                let _ = CloseHandle(snapshot);
-            }
-            Self(list)
-        }
-        #[cfg(not(windows))]
-        {
-            let Ok(out) = std::process::Command::new("ps")
-                .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "comm="])
-                .output()
-            else {
-                return Self::default();
-            };
-            Self(
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        let mut fields = line.split_whitespace();
-                        let id = fields.next()?.parse().ok()?;
-                        let parent = fields.next()?.parse().ok()?;
-                        let command = fields.collect::<Vec<_>>().join(" ");
-                        let name = std::path::Path::new(&command).file_name()?;
-                        Some((id, (parent, name.to_string_lossy().into_owned())))
-                    })
-                    .collect(),
-            )
-        }
+        Self(
+            process_rows()
+                .into_iter()
+                .map(|(id, parent, name)| (id, (parent, name)))
+                .collect(),
+        )
     }
 
     /// Whether process `id` runs under `ancestor`, through its parents.
@@ -342,6 +289,200 @@ impl Processes {
     }
 }
 
+/// Every running process as its id, its parent's id and its executable name.
+pub fn process_rows() -> Vec<(u32, u32, String)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::{
+            Foundation::CloseHandle,
+            System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+        };
+        let mut rows = Vec::new();
+        // Safety: the snapshot handle is closed below, and each entry
+        // carries its size as Process32FirstW/NextW require.
+        unsafe {
+            let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                return rows;
+            };
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut next = Process32FirstW(snapshot, &mut entry);
+            while next.is_ok() {
+                let name = &entry.szExeFile;
+                let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+                rows.push((
+                    entry.th32ProcessID,
+                    entry.th32ParentProcessID,
+                    String::from_utf16_lossy(&name[..len]),
+                ));
+                next = Process32NextW(snapshot, &mut entry);
+            }
+            let _ = CloseHandle(snapshot);
+        }
+        rows
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "comm="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let id = fields.next()?.parse().ok()?;
+                let parent = fields.next()?.parse().ok()?;
+                let command = fields.collect::<Vec<_>>().join(" ");
+                let name = std::path::Path::new(&command).file_name()?;
+                Some((id, parent, name.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+}
+
+/// The command lines of the processes `ids`, arguments included. Processes
+/// that are gone or that Vyber may not read are left out.
+pub fn command_lines(ids: &[u32]) -> std::collections::HashMap<u32, String> {
+    let mut lines = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return lines;
+    }
+    #[cfg(windows)]
+    {
+        use windows::{
+            Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation},
+            Win32::{
+                Foundation::{CloseHandle, UNICODE_STRING},
+                System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            },
+        };
+        for &id in ids {
+            // Safety: the handle is closed below. The buffer is u64s so the
+            // UNICODE_STRING at its start is aligned, and its text points
+            // into the same buffer, within the length the call returned.
+            unsafe {
+                let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id) else {
+                    continue;
+                };
+                let mut buffer = vec![0u64; 512];
+                let mut needed = 0u32;
+                let mut status = NtQueryInformationProcess(
+                    process,
+                    ProcessCommandLineInformation,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    &mut needed,
+                );
+                if status.is_err() && needed as usize > buffer.len() * 8 {
+                    buffer = vec![0u64; (needed as usize).div_ceil(8)];
+                    status = NtQueryInformationProcess(
+                        process,
+                        ProcessCommandLineInformation,
+                        buffer.as_mut_ptr().cast(),
+                        (buffer.len() * 8) as u32,
+                        &mut needed,
+                    );
+                }
+                let _ = CloseHandle(process);
+                if status.is_err() {
+                    continue;
+                }
+                let text = &*buffer.as_ptr().cast::<UNICODE_STRING>();
+                if text.Buffer.is_null() {
+                    continue;
+                }
+                let units = std::slice::from_raw_parts(text.Buffer.0, text.Length as usize / 2);
+                lines.insert(id, String::from_utf16_lossy(units));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let list = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-ww", "-o", "pid=", "-o", "args=", "-p", &list])
+            .output()
+        else {
+            return lines;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim_start();
+            let Some((id, args)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if let Ok(id) = id.parse() {
+                lines.insert(id, args.trim().to_owned());
+            }
+        }
+    }
+    lines
+}
+
+/// What ending a process asks of it. Windows can only terminate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Terminate,
+    Interrupt,
+    Hangup,
+    Kill,
+}
+impl Signal {
+    pub const ALL: [Signal; 4] = [
+        Signal::Terminate,
+        Signal::Interrupt,
+        Signal::Hangup,
+        Signal::Kill,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Terminate => "TERM",
+            Signal::Interrupt => "INT",
+            Signal::Hangup => "HUP",
+            Signal::Kill => "KILL",
+        }
+    }
+}
+
+/// Ends process `id`: sends `signal` on Unix, terminates it on Windows.
+pub fn end_process(id: u32, signal: Signal) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+        };
+        let _ = signal;
+        // Safety: the handle is closed after use.
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, false, id)?;
+            let result = TerminateProcess(process, 1);
+            let _ = CloseHandle(process);
+            result?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("kill")
+            .args(["-s", signal.name(), &id.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("Could not end process {id}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -359,7 +500,10 @@ mod tests {
         assert!(!processes.descends(me, child.id()));
         assert!(processes.runs(me, "git"));
         assert!(!processes.runs(child.id(), "git"));
-        child.kill().unwrap();
+        let lines = super::command_lines(&[child.id()]);
+        assert!(lines[&child.id()].contains("cat-file --batch"), "{lines:?}");
+        super::end_process(child.id(), super::Signal::Kill).unwrap();
         let _ = child.wait();
+        assert!(super::command_lines(&[child.id()]).is_empty());
     }
 }

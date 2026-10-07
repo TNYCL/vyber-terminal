@@ -1,4 +1,5 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+mod agents;
 mod app;
 mod browser;
 mod changeset;
