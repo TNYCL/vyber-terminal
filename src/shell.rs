@@ -1,5 +1,34 @@
+#[cfg(unix)]
 use std::{collections::HashMap, ffi::OsString};
 
+/// Prefer native OpenSSH in ConPTY-backed Git Bash sessions. The MSYS2 SSH
+/// client can exit with `poll: No error` on a console resize (Git for Windows
+/// #6413). Install the function at the first prompt, after login profiles,
+/// while leaving user aliases/functions and the inherited prompt hook intact.
+pub fn windows_bash_prompt(inherited: &str, native_ssh: Option<&std::path::Path>) -> String {
+    let ssh = native_ssh.map_or_else(String::new, |path| {
+        let path = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+        format!(
+            "if ! declare -F ssh >/dev/null && ! alias ssh >/dev/null 2>&1; then\n\
+             function ssh {{ MSYS2_ARG_CONV_EXCL='*' command '{path}' \"$@\"; }}\n\
+             fi\n"
+        )
+    });
+    format!(
+        "{inherited}\n__vyber_status=$?; {ssh}\
+         if [[ ${{__vyber_prompt_mark:-0}} == 0 ]]; then\n\
+         __vyber_prompt_mark=1; __vyber_prompt_title=__VYBER_CWD__\n\
+         else\n\
+         __vyber_prompt_mark=0; __vyber_prompt_title=__VYBER_CWD2__\n\
+         fi\n\
+         printf '\\033]0;%s%s\\007' \"$__vyber_prompt_title\" \"$(pwd -W)\"; (exit \"$__vyber_status\")"
+    )
+}
+
+#[cfg(unix)]
 pub fn zsh_integration(
     env: &mut HashMap<String, String>,
     original_zdotdir: Option<OsString>,
@@ -37,10 +66,70 @@ pub fn zsh_integration(
     Ok(directory)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::pty::OscParser;
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_bash_ssh_hook_preserves_arguments_overrides_and_exit_status() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let ssh = dir.path().join("native ssh's client");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\ntest \"$MSYS2_ARG_CONV_EXCL\" = '*' || exit 91\nprintf '<%s>\\n' \"$@\"\nexit 23\n",
+        )?;
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))?;
+        let hook = windows_bash_prompt("printf 'INHERITED\\n'; (exit 17)", Some(&ssh));
+        for (setup, invocation, expected) in [
+            (
+                "",
+                "ssh -t 'user@host' '/usr/bin/program' 'argument with spaces'; test $? = 23 && test \"$MSYS2_ARG_CONV_EXCL\" = sentinel",
+                "<-t>\n<user@host>\n</usr/bin/program>\n<argument with spaces>",
+            ),
+            (
+                "ssh() { printf 'USER_FUNCTION\\n'; }",
+                "ssh",
+                "USER_FUNCTION",
+            ),
+            (
+                "alias ssh=\"printf 'USER_ALIAS\\\\n'\"",
+                "eval ssh",
+                "USER_ALIAS",
+            ),
+        ] {
+            let output = std::process::Command::new("bash")
+                .args(["--noprofile", "--norc", "-c",
+                    "MSYS2_ARG_CONV_EXCL=sentinel; shopt -s expand_aliases; pwd() { builtin pwd; }; eval \"$1\"; eval \"$2\"; test $? = 17 || exit 90; eval \"$2\"; eval \"$3\"",
+                    "vyber-test", setup, &hook, invocation])
+                .output()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{setup}: {output:?}");
+            assert!(
+                text.contains("INHERITED") && text.contains(expected),
+                "{text}"
+            );
+            let markers = OscParser::default().feed(&output.stdout);
+            assert_eq!(markers.len(), 2, "{markers:?}");
+            assert!(markers[0].starts_with("0;__VYBER_CWD__"));
+            assert!(markers[1].starts_with("0;__VYBER_CWD2__"));
+        }
+        // An absent Windows client leaves the shell's normal SSH resolution alone.
+        let output = std::process::Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "pwd() { builtin pwd; }; eval \"$1\"; ! declare -F ssh",
+                "vyber-test",
+                &windows_bash_prompt("", None),
+            ])
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        Ok(())
+    }
 
     #[test]
     fn zsh_preserves_profiles_and_reports_directory_changes() -> anyhow::Result<()> {

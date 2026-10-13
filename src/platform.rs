@@ -58,6 +58,14 @@ pub fn git_bash_path() -> Option<std::path::PathBuf> {
     })
 }
 
+#[cfg(windows)]
+pub fn windows_openssh_path() -> Option<PathBuf> {
+    ["SystemRoot", "WINDIR"].into_iter().find_map(|name| {
+        let path = PathBuf::from(std::env::var_os(name)?).join("System32/OpenSSH/ssh.exe");
+        path.is_file().then_some(path)
+    })
+}
+
 /// Dock launches do not inherit the user's login shell PATH.
 #[cfg(target_os = "macos")]
 pub fn login_environment() {

@@ -177,6 +177,13 @@ input. Ctrl+T reaches the terminal application on Windows; Ctrl+Shift+T opens a 
 Box-drawing, block, and Powerline characters join across cells.
 
 Windows prefers Git Bash found through `PATH` or standard install locations, then PowerShell.
+In Git Bash, plain `ssh` prefers Windows' installed OpenSSH client to avoid the MSYS2
+`poll: No error` disconnect on window resize. Existing SSH aliases/functions take precedence;
+`/usr/bin/ssh` still explicitly selects Git's client. If Windows OpenSSH is absent, SSH lookup
+is unchanged. Remote command arguments are passed without MSYS path conversion; local options
+such as `-i` and `-F` use Windows paths (`cygpath -m` converts a Git Bash path when needed).
+Returning to a Vyber-marked shell prompt also clears leftover mouse and focus
+reporting so an interrupted remote application cannot leave mouse coordinates in shell input.
 Unix uses a valid `$SHELL` with platform fallbacks. Shell profiles are never modified; macOS's
 default zsh session reports directory changes. Tab labels use folder names unless renamed.
 Ctrl/Cmd+click opens local paths such as `src/main.rs:42` in the file panel and URLs in the browser.

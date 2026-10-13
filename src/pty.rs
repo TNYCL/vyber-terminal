@@ -1,6 +1,5 @@
 //! Observe a small set of OSC messages and ConPTY's input mode in the
-//! terminal byte stream. The stream changes in one way only: a keyboard mode
-//! reset follows each shell prompt.
+//! terminal byte stream. Shell prompt markers are followed by input mode resets.
 use crate::terminal::Proxy;
 use alacritty_terminal::{
     event::{Event, EventListener, OnResize, WindowSize},
@@ -20,6 +19,11 @@ use std::{
 /// Escape, Ctrl+C and the other keys encoded for itself. Windows' console
 /// drops those encodings for the programs that read console key events.
 pub const KEYBOARD_RESET: &[u8] = b"\x1b[<65535u";
+
+/// A local Vyber prompt also ends mouse/focus reporting left behind by a
+/// crashed program or disconnected SSH session. Do not do this for arbitrary
+/// OSC 7 messages: remote applications can report their cwd while still running.
+pub const PROMPT_RESET: &[u8] = b"\x1b[<65535u\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016l";
 
 /// The folder a shell prompt reports in the window title. PowerShell
 /// alternates the two prefixes, because the console reports a title only
@@ -161,9 +165,9 @@ pub struct Observer {
     /// ConPTY asks for win32-input-mode (private mode 9001) when it starts.
     win32_mode: ModeWatch,
     win32_input: Arc<AtomicBool>,
-    /// A keyboard reset that did not fit after the last read goes first in
+    /// An input mode reset that did not fit after the last read goes first in
     /// the next one.
-    reset_pending: bool,
+    reset_pending: Option<&'static [u8]>,
 }
 impl Observer {
     pub fn new(proxy: Proxy, win32_input: Arc<AtomicBool>) -> Self {
@@ -172,23 +176,20 @@ impl Observer {
             proxy,
             win32_mode: ModeWatch::new(9001),
             win32_input,
-            reset_pending: false,
+            reset_pending: None,
         }
     }
     /// Room to keep free at the start of a read buffer of `len` bytes.
     fn lead(&self, len: usize) -> usize {
-        if self.reset_pending && len > 2 * KEYBOARD_RESET.len() {
-            KEYBOARD_RESET.len()
-        } else {
-            0
-        }
+        self.reset_pending
+            .filter(|reset| len > reset.len())
+            .map_or(0, |reset| reset.len())
     }
     /// Looks at `n` bytes read after `lead` free bytes and returns how many
     /// bytes of `bytes` the terminal should parse.
     fn observe(&mut self, bytes: &mut [u8], lead: usize, n: usize) -> usize {
         if lead > 0 {
-            bytes[..lead].copy_from_slice(KEYBOARD_RESET);
-            self.reset_pending = false;
+            bytes[..lead].copy_from_slice(self.reset_pending.take().unwrap());
         }
         let data = lead..lead + n;
         if cfg!(windows)
@@ -199,7 +200,16 @@ impl Observer {
         let mut prompt_end = None;
         for (osc, end) in self.parser.feed_at(&bytes[data.clone()]) {
             if marks_prompt(&osc) {
-                prompt_end = Some(lead + end);
+                let local_prompt = osc
+                    .strip_prefix("0;")
+                    .or_else(|| osc.strip_prefix("2;"))
+                    .is_some_and(|title| prompt_cwd(title).is_some());
+                let reset = if local_prompt {
+                    PROMPT_RESET
+                } else {
+                    KEYBOARD_RESET
+                };
+                prompt_end = Some((lead + end, reset));
             }
             if let Some(path) = osc.strip_prefix("7;")
                 && let Ok(url) = url::Url::parse(path)
@@ -223,8 +233,8 @@ impl Observer {
         match prompt_end {
             // Right after the prompt's message, in stream order, so a program
             // started at this prompt negotiates on a clean keyboard.
-            Some(at) => insert(bytes, len, at, KEYBOARD_RESET).unwrap_or_else(|| {
-                self.reset_pending = true;
+            Some((at, reset)) => insert(bytes, len, at, reset).unwrap_or_else(|| {
+                self.reset_pending = Some(reset);
                 len
             }),
             None => len,
@@ -286,7 +296,7 @@ impl OnResize for ObservedPty {
 }
 #[cfg(test)]
 mod tests {
-    use super::{KEYBOARD_RESET, ModeWatch, Observer, OscParser};
+    use super::{KEYBOARD_RESET, ModeWatch, Observer, OscParser, PROMPT_RESET};
     use std::sync::{Arc, atomic::AtomicBool};
     #[test]
     fn split_osc_and_limits() {
@@ -326,17 +336,17 @@ mod tests {
         );
         assert_eq!(
             out,
-            [b"out".as_slice(), prompt, KEYBOARD_RESET, b"$ "].concat()
+            [b"out".as_slice(), prompt, PROMPT_RESET, b"$ "].concat()
         );
         // PowerShell's alternate title and zsh's OSC 7 mark prompts too.
-        for osc in [
-            b"\x1b]2;__VYBER_CWD2__C:\\repo\x1b\\".as_slice(),
-            b"\x1b]7;file://host/repo\x07",
+        for (osc, reset) in [
+            (
+                b"\x1b]2;__VYBER_CWD2__C:\\repo\x1b\\".as_slice(),
+                PROMPT_RESET,
+            ),
+            (b"\x1b]7;file://host/repo\x07".as_slice(), KEYBOARD_RESET),
         ] {
-            assert_eq!(
-                observe(&mut observer, osc, 64),
-                [osc, KEYBOARD_RESET].concat()
-            );
+            assert_eq!(observe(&mut observer, osc, 64), [osc, reset].concat());
         }
         // A program's own title is not a prompt.
         let title = b"\x1b]0;codex\x07";
@@ -345,10 +355,62 @@ mod tests {
         assert_eq!(observe(&mut observer, prompt, 0), prompt);
         let mut next = vec![0; 64];
         let lead = observer.lead(next.len());
-        assert_eq!(lead, KEYBOARD_RESET.len());
+        assert_eq!(lead, PROMPT_RESET.len());
         next[lead..lead + 3].copy_from_slice(b"abc");
         let len = observer.observe(&mut next, lead, 3);
-        assert_eq!(&next[..len], [KEYBOARD_RESET, b"abc"].concat());
+        assert_eq!(&next[..len], [PROMPT_RESET, b"abc"].concat());
         assert_eq!(observer.lead(64), 0);
+    }
+
+    #[test]
+    fn local_prompt_clears_mouse_and_focus_modes_after_disconnect() {
+        use alacritty_terminal::{
+            grid::Dimensions,
+            term::{Config, Term, TermMode},
+            vte::ansi,
+        };
+        struct Size;
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                10
+            }
+            fn screen_lines(&self) -> usize {
+                10
+            }
+            fn columns(&self) -> usize {
+                80
+            }
+        }
+        let (proxy, _events) = crate::terminal::Proxy::channel();
+        let mut term = Term::new(Config::default(), &Size, proxy.clone());
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut observer = Observer::new(proxy, Arc::new(AtomicBool::new(false)));
+        parser.advance(&mut term, b"\x1b[?1003;1004;1006h");
+        assert!(
+            term.mode()
+                .contains(TermMode::MOUSE_MOTION | TermMode::FOCUS_IN_OUT)
+        );
+        // A remote cwd update must not stop a running application's mouse input.
+        parser.advance(
+            &mut term,
+            &observe(&mut observer, b"\x1b]7;file://remote/home/user\x07", 64),
+        );
+        assert!(
+            term.mode()
+                .contains(TermMode::MOUSE_MOTION | TermMode::FOCUS_IN_OUT)
+        );
+        let reset = observe(&mut observer, b"\x1b]0;__VYBER_CWD__C:/repo\x07", 64);
+        parser.advance(&mut term, &reset);
+        assert!(
+            !term
+                .mode()
+                .intersects(TermMode::MOUSE_MODE | TermMode::FOCUS_IN_OUT | TermMode::SGR_MOUSE)
+        );
+        // A later program can negotiate mouse input normally again.
+        parser.advance(&mut term, b"\x1b[?1003;1004;1006h");
+        assert!(
+            term.mode()
+                .contains(TermMode::MOUSE_MOTION | TermMode::FOCUS_IN_OUT | TermMode::SGR_MOUSE)
+        );
     }
 }
