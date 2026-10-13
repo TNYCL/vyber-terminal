@@ -258,11 +258,13 @@ impl Terminal {
             // Preserve the requested directory and report cd changes without modifying profiles.
             env.insert("CHERE_INVOKING".into(), "1".into());
             let inherited = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+            #[cfg(windows)]
+            let native_ssh = crate::platform::windows_openssh_path();
+            #[cfg(not(windows))]
+            let native_ssh: Option<PathBuf> = None;
             env.insert(
                 "PROMPT_COMMAND".into(),
-                format!(
-                    "{inherited}\n__vyber_status=$?; printf '\\033]0;__VYBER_CWD__%s\\007' \"$(pwd -W)\"; (exit \"$__vyber_status\")"
-                ),
+                crate::shell::windows_bash_prompt(&inherited, native_ssh.as_deref()),
             );
         }
         #[cfg(unix)]
@@ -2440,6 +2442,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn real_git_bash_prefers_windows_openssh_and_keeps_user_overrides() -> anyhow::Result<()> {
+        let Some(bash) = crate::platform::git_bash_path() else {
+            anyhow::bail!("Git Bash is required for the ConPTY SSH selection test");
+        };
+        // OpenSSH is an optional Windows capability, so exercise the fallback too.
+        let native = crate::platform::windows_openssh_path().is_some();
+        let console = Console::start(9019, &bash.to_string_lossy())?;
+        let (ready, text) = console.wait_for(|t| t.trim_end().ends_with('$'), 20);
+        assert!(ready, "Git Bash did not start: {text}");
+        console.send(b"if declare -F ssh >/dev/null; then printf 'VYBER_%s\\n' NATIVE_SSH; else printf 'VYBER_%s\\n' PATH_SSH; fi\r");
+        let expected = if native {
+            "VYBER_NATIVE_SSH"
+        } else {
+            "VYBER_PATH_SSH"
+        };
+        let (selected, text) = console.wait_for(|t| t.contains(expected), 10);
+        assert!(selected, "Wrong SSH selection: {text}");
+        if native {
+            console.send(b"ssh -V\r");
+            let (version, text) = console.wait_for(|t| t.contains("OpenSSH_for_Windows"), 10);
+            assert!(version, "ssh did not invoke Windows OpenSSH: {text}");
+        }
+        console.send(b"function ssh { printf 'VYBER_%s\\n' USER_SSH; }\r");
+        let (prompt, text) = console.wait_for(
+            |t| t.trim_end().ends_with('$') && t.contains("USER_SSH"),
+            10,
+        );
+        assert!(prompt, "Override prompt did not return: {text}");
+        console.send(b"ssh\r");
+        let (overridden, text) = console.wait_for(|t| t.contains("VYBER_USER_SSH"), 10);
+        assert!(
+            overridden,
+            "Prompt replaced the user's SSH function: {text}"
+        );
+        Ok(())
+    }
+
     /// Programs that read VT input (Node, so Claude Code) get the bytes
     /// ConPTY derives from win32 key events.
     #[test]
@@ -2637,7 +2678,7 @@ mod tests {
                 for event in backend.events.try_iter() {
                     match event {
                         Event::Title(title) => {
-                            if let Some(path) = title.strip_prefix("__VYBER_CWD__") {
+                            if let Some(path) = crate::pty::prompt_cwd(&title) {
                                 cwd = Some(std::path::PathBuf::from(path));
                             }
                         }
