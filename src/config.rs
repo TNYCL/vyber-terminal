@@ -36,6 +36,8 @@ pub struct Config {
     pub git_font_size: f32,
     pub panel_mode: PanelMode,
     pub scrollback: usize,
+    /// Copy selected terminal text to the clipboard when the mouse button is released.
+    pub copy_on_select: bool,
     pub reduced_motion: bool,
     pub notifications: bool,
     pub restore_workspace: bool,
@@ -64,6 +66,7 @@ impl Default for Config {
             git_font_size: PANEL_FONT_SIZE,
             panel_mode: PanelMode::Overlay,
             scrollback: 20_000,
+            copy_on_select: true,
             reduced_motion: false,
             notifications: true,
             restore_workspace: true,
@@ -276,5 +279,13 @@ mod tests {
         let config: Config = toml::from_str("panel_mode = \"dock\"").unwrap();
         assert_eq!(config.panel_mode, PanelMode::Dock);
         assert_eq!(config.table()["panel_mode"].as_str(), Some("dock"));
+    }
+
+    #[test]
+    fn copy_on_select_defaults_to_enabled_and_parses() {
+        assert!(Config::default().copy_on_select);
+        let config: Config = toml::from_str("copy_on_select = false").unwrap();
+        assert!(!config.copy_on_select);
+        assert_eq!(config.table()["copy_on_select"].as_bool(), Some(false));
     }
 }

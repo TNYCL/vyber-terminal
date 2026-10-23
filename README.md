@@ -171,7 +171,9 @@ original path; `content`, when present, contains the saved file bytes. Inspect c
 restoring them manually. Git commands that change files warn when an agent turn is active.
 
 **Terminal protocols and shells.** Vyber uses ConPTY on Windows and supports true color, 256
-colors, alternate screen, bracketed paste, OSC 8 links, and Kitty keyboard protocol negotiation.
+colors, alternate screen, bracketed paste, OSC 8 links, OSC 52 clipboard copy (including `tmux`
+passthrough), and Kitty keyboard protocol negotiation. Hold Shift to select or right-click paste
+locally while a TUI captures mouse input; right-clicking an active selection copies it.
 Shift+Enter preserves its modifier for Codex/Claude Code; Windows also supports native console
 input. Ctrl+T reaches the terminal application on Windows; Ctrl+Shift+T opens a Vyber tab.
 Box-drawing, block, and Powerline characters join across cells.
@@ -287,6 +289,7 @@ argument list, to choose another shell:
 | `git_font_size` | `12.0` | Source Control text, 8–24. |
 | `panel_mode` | `"overlay"` | `"overlay"` or `"dock"`. |
 | `scrollback` | `20000` | History lines, 1,000–100,000; applies to new terminals. |
+| `copy_on_select` | `true` | Copy selected terminal text to the clipboard when releasing the mouse. |
 | `reduced_motion` | `false` | Reduce interface motion. |
 | `notifications` | `true` | Desktop notifications for background terminal events. |
 | `restore_workspace` | `true` | Restore layout, folders, files, and drafts on a later launch. |
@@ -351,7 +354,7 @@ Set `VYBER_DATA_DIR` to use a different data directory, for example for an isola
 | Close the file in the panel (the panel when no file is open) | Ctrl+W | Cmd+W | Ctrl+W |
 | Next / previous panel tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PgDn / Ctrl+PgUp |
 | Find in the Review diff | Ctrl+F | Cmd+F | Ctrl+F |
-| Copy / paste in terminal | Ctrl+Shift+C / V | Cmd+C / V | Ctrl+Shift+C / V |
+| Copy / paste in terminal | Ctrl+C (selection) / Ctrl+V, Ctrl+Shift+C / V, Ctrl+Insert / Shift+Insert | Cmd+C / V, Ctrl+Insert / Shift+Insert | Ctrl+Shift+C / V, Ctrl+Insert / Shift+Insert |
 | Settings file | Ctrl+Shift+, | Cmd+, | Ctrl+Shift+, |
 | Shortcut help | Ctrl+Shift+H | Cmd+Shift+H | Ctrl+Shift+H |
 | Font size of the focused terminal or panel: up / down / reset | Ctrl++ / Ctrl+- / Ctrl+0 | Cmd++ / Cmd+- / Cmd+0 | Ctrl++ / Ctrl+- / Ctrl+0 |
