@@ -3,6 +3,7 @@
 use crate::terminal::Proxy;
 use alacritty_terminal::{
     event::{Event, EventListener, OnResize, WindowSize},
+    term::ClipboardType,
     tty::{self, ChildEvent, EventedPty, EventedReadWrite},
 };
 use polling::{PollMode, Poller};
@@ -44,6 +45,115 @@ fn marks_prompt(osc: &str) -> bool {
             .is_some_and(|title| prompt_cwd(title).is_some())
 }
 
+const OSC52_LIMIT: usize = 1 << 20;
+
+fn vte_osc_ignored(b: u8) -> bool {
+    matches!(b, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f)
+}
+
+fn decode_base64(input: &[u8], strict: bool) -> Option<Vec<u8>> {
+    let mut vals = Vec::with_capacity(input.len());
+    let mut pad = 0usize;
+    for &b in input {
+        if vte_osc_ignored(b) || (!strict && (b.is_ascii_whitespace() || b < 0x20)) {
+            continue;
+        }
+        if b == b'=' {
+            pad += 1;
+            if pad > 2 {
+                return None;
+            }
+            continue;
+        }
+        if pad > 0 {
+            return None;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        vals.push(val);
+    }
+    if (strict || pad > 0) && !(vals.len() + pad).is_multiple_of(4) {
+        return None;
+    }
+    if vals.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    let (chunks, rem) = vals.as_chunks::<4>();
+    for c in chunks {
+        out.push((c[0] << 2) | (c[1] >> 4));
+        out.push((c[1] << 4) | (c[2] >> 2));
+        out.push((c[2] << 6) | c[3]);
+    }
+    match rem.len() {
+        2 => {
+            if strict && (rem[1] & 0x0f) != 0 {
+                return None;
+            }
+            out.push((rem[0] << 2) | (rem[1] >> 4));
+        }
+        3 => {
+            if strict && (rem[2] & 0x03) != 0 {
+                return None;
+            }
+            out.push((rem[0] << 2) | (rem[1] >> 4));
+            out.push((rem[1] << 4) | (rem[2] >> 2));
+        }
+        _ => {}
+    }
+    Some(out)
+}
+
+/// Clipboard stores requested by an OSC 52 message that `alacritty_terminal`
+/// does not emit on its own (extra targets in `pc`/`cp`, cut-buffer `0`,
+/// whitespace-separated or unpadded base64).
+fn osc52_stores(osc: &str) -> Vec<(ClipboardType, String)> {
+    let Some(rest) = osc.strip_prefix("52;") else {
+        return Vec::new();
+    };
+    let Some((targets, after)) = rest.split_once(';') else {
+        return Vec::new();
+    };
+    let payload = after.split(';').next().unwrap_or(after);
+    if payload.trim_ascii() == "?" {
+        return Vec::new();
+    }
+    let Some(bytes) = decode_base64(payload.as_bytes(), false) else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let clean_targets = || targets.bytes().filter(|&b| !vte_osc_ignored(b));
+    let mut want_clipboard = clean_targets().next().is_none()
+        || clean_targets().any(|b| matches!(b, b'c' | b'q' | b'0'..=b'7'));
+    let mut want_selection = clean_targets().any(|b| matches!(b, b'p' | b's'));
+    if decode_base64(payload.as_bytes(), true).is_some() {
+        match clean_targets().next().unwrap_or(b'c') {
+            b'c' => want_clipboard = false,
+            b'p' | b's' => want_selection = false,
+            _ => {}
+        }
+    }
+    let mut stores = Vec::new();
+    if want_clipboard {
+        stores.push((ClipboardType::Clipboard, text.clone()));
+    }
+    if want_selection {
+        stores.push((ClipboardType::Selection, text));
+    }
+    stores
+}
+
 #[derive(Default)]
 pub struct OscParser {
     state: u8,
@@ -68,16 +178,27 @@ impl OscParser {
                     }
                 }
                 1 => {
-                    self.state = if b == b']' { 2 } else { 0 };
+                    self.state = if b == b']' {
+                        2
+                    } else if b == 27 {
+                        1
+                    } else {
+                        0
+                    };
                     self.bytes.clear();
                 }
                 2 => {
+                    let limit = if self.bytes.starts_with(b"52;") {
+                        OSC52_LIMIT
+                    } else {
+                        8192
+                    };
                     if b == 7 {
                         messages.push((String::from_utf8_lossy(&self.bytes).into(), i + 1));
                         self.state = 0;
                     } else if b == 27 {
                         self.state = 3;
-                    } else if self.bytes.len() < 8192 {
+                    } else if self.bytes.len() < limit {
                         self.bytes.push(b);
                     } else {
                         self.state = 0;
@@ -87,8 +208,15 @@ impl OscParser {
                 _ => {
                     if b == b'\\' {
                         messages.push((String::from_utf8_lossy(&self.bytes).into(), i + 1));
+                        self.state = 0;
+                    } else if b == 27 {
+                        self.state = 3;
+                    } else if b == b']' {
+                        self.state = 2;
+                        self.bytes.clear();
+                    } else {
+                        self.state = 0;
                     }
-                    self.state = 0;
                 }
             }
         }
@@ -227,6 +355,9 @@ impl Observer {
                     "__VYBER_NOTIFY__{}",
                     message.replace(';', " · ")
                 )));
+            }
+            for (kind, text) in osc52_stores(&osc) {
+                self.proxy.send_event(Event::ClipboardStore(kind, text));
             }
         }
         let len = data.end;
@@ -412,5 +543,89 @@ mod tests {
             term.mode()
                 .contains(TermMode::MOUSE_MOTION | TermMode::FOCUS_IN_OUT | TermMode::SGR_MOUSE)
         );
+    }
+
+    #[test]
+    fn osc52_copies_across_direct_tmux_passthrough_wrapped_and_combined_targets() {
+        use alacritty_terminal::{
+            event::Event,
+            grid::Dimensions,
+            term::{ClipboardType, Config, Term},
+            vte::ansi,
+        };
+        struct Size;
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                10
+            }
+            fn screen_lines(&self) -> usize {
+                10
+            }
+            fn columns(&self) -> usize {
+                80
+            }
+        }
+        let (proxy, events) = crate::terminal::Proxy::channel();
+        let mut term = Term::new(Config::default(), &Size, proxy.clone());
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        let mut observer = Observer::new(proxy, Arc::new(AtomicBool::new(false)));
+        let mut run = |chunks: &[&[u8]]| -> Vec<(ClipboardType, String)> {
+            for chunk in chunks {
+                let bytes = observe(&mut observer, chunk, 64);
+                parser.advance(&mut term, &bytes);
+            }
+            events
+                .try_iter()
+                .filter_map(|event| match event {
+                    Event::ClipboardStore(kind, text) => Some((kind, text)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Standard direct OSC 52 (BEL, ST, empty selection target) emits once.
+        assert_eq!(
+            run(&[b"\x1b]52;c;SGVsbG8=\x07"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        assert_eq!(
+            run(&[b"\x1b]52;;SGVsbG8=\x1b\\"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        // Combined `pc` target updates both selection and system clipboard.
+        let mut pc = run(&[b"\x1b]52;pc;SGVsbG8=\x07"]);
+        pc.sort_by_key(|(kind, _)| matches!(kind, ClipboardType::Clipboard));
+        assert_eq!(
+            pc,
+            vec![
+                (ClipboardType::Selection, "Hello".into()),
+                (ClipboardType::Clipboard, "Hello".into()),
+            ]
+        );
+        // Cut-buffer `0`, line-wrapped base64, space-separated and unpadded base64.
+        assert_eq!(
+            run(&[b"\x1b]52;0;SGVsbG8=\x07"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        assert_eq!(
+            run(&[b"\x1b]52;c;SGVs\r\nbG8=\x07"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        assert_eq!(
+            run(&[b"\x1b]52;c;SGVs bG8\x07"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        // tmux DCS passthrough (both BEL and doubled-ESC ST, split across reads).
+        assert_eq!(
+            run(&[b"\x1bPtmux;\x1b", b"\x1b]52;c;SGVs", b"bG8=\x07\x1b\\"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        assert_eq!(
+            run(&[b"\x1bPtmux;\x1b\x1b]52;c;SGVsbG8=\x1b", b"\x1b\\\x1b\\"]),
+            vec![(ClipboardType::Clipboard, "Hello".into())]
+        );
+        // Clipboard read queries (`?`) are never answered or stored.
+        assert!(run(&[b"\x1b]52;c;?\x07"]).is_empty());
+        assert!(events.try_iter().next().is_none());
     }
 }

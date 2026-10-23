@@ -105,7 +105,7 @@ with GPUI and a session notification service. ripgrep is optional for content se
 ## Dependency maintenance exceptions
 
 `deny.toml` blocks reported vulnerabilities, unknown sources and licenses outside its
-explicit allowlist. Four maintenance-only advisories inherited through pinned GPUI/Kit
+explicit allowlist. Seven maintenance-only advisories inherited through pinned GPUI/Kit
 are individually accepted for this release, with reasons next to each ID:
 
 | Advisory | Package | Follow-up |
@@ -114,6 +114,9 @@ are individually accepted for this release, with reasons next to each ID:
 | RUSTSEC-2024-0436 | paste | Replace on GPUI upgrade |
 | RUSTSEC-2026-0206 | rustybuzz | Track upstream font stack maintenance |
 | RUSTSEC-2026-0192 | ttf-parser | Track upstream font stack maintenance |
+| RUSTSEC-2026-0370 | zvariant | Replace on GPUI/Kit D-Bus (`zbus`) upgrade |
+| RUSTSEC-2026-0371 | zbus_names | Replace on GPUI/Kit D-Bus (`zbus`) upgrade |
+| RUSTSEC-2026-0372 | zvariant_derive | Replace on GPUI/Kit D-Bus (`zbus`) upgrade |
 
 Review these at each release and on upstream upgrades. They do not suppress unrelated
 future vulnerability advisories. Preserve the shipped original license files and icon

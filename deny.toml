@@ -15,6 +15,9 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is inherited through pinned GPUI 0.3.7; maintenance-only advisory, replace on upstream upgrade." },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is inherited through pinned GPUI; maintenance-only advisory, reviewed for this preview." },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is inherited through pinned GPUI; maintenance-only advisory, reviewed for this preview." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is inherited through pinned GPUI/Kit Linux D-Bus stack (zbus 5.19); maintenance-only advisory after merge into zbus 6.0, replace on upstream upgrade." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is inherited through pinned GPUI/Kit Linux D-Bus stack (zbus 5.19); maintenance-only advisory after merge into zbus 6.0, replace on upstream upgrade." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is inherited through pinned GPUI/Kit Linux D-Bus stack (zbus 5.19); maintenance-only advisory after merge into zbus 6.0, replace on upstream upgrade." },
 ]
 
 [licenses]

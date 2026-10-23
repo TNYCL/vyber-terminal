@@ -5,7 +5,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point as TermPoint, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, Term, TermMode, cell::Flags},
+    term::{ClipboardType, Config, Osc52, Term, TermMode, cell::Flags},
     tty,
     vte::ansi::{Color, NamedColor},
 };
@@ -102,13 +102,51 @@ pub enum TerminalEvent {
 }
 impl EventEmitter<TerminalEvent> for Terminal {}
 
-actions!(vyber_terminal, [TerminalTab, TerminalBackTab]);
+actions!(vyber_terminal, [TerminalTab, TerminalBackTab, TerminalCopy]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", TerminalTab, Some("Terminal && !Input")),
         KeyBinding::new("shift-tab", TerminalBackTab, Some("Terminal && !Input")),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-c"
+            },
+            TerminalCopy,
+            Some("Terminal && !Input"),
+        ),
     ]);
+}
+
+fn store_clipboard(kind: ClipboardType, text: String, cx: &mut App) {
+    if text.is_empty() {
+        return;
+    }
+    match kind {
+        ClipboardType::Clipboard => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+        ClipboardType::Selection => {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(text));
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+}
+
+fn read_selection_or_clipboard(cx: &App) -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(text) = cx
+        .read_from_primary()
+        .and_then(|item| item.text())
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text);
+    }
+    cx.read_from_clipboard()
+        .and_then(|item| item.text())
+        .filter(|text| !text.is_empty())
 }
 
 pub struct Terminal {
@@ -157,6 +195,8 @@ pub struct Terminal {
     hovered_link: Option<links::Link>,
     link_generation: u64,
     link_click_consumed: bool,
+    right_click_consumed: bool,
+    middle_click_consumed: bool,
     link_notice: Option<(String, Instant)>,
     last_mouse: Option<(usize, usize)>,
     last_focus: bool,
@@ -209,6 +249,7 @@ impl Terminal {
         let config = Config {
             scrolling_history: crate::config::Config::load().scrollback,
             kitty_keyboard: true,
+            osc52: Osc52::OnlyCopy,
             ..Default::default()
         };
         let term = Arc::new(FairMutex::new(Term::new(
@@ -415,6 +456,8 @@ impl Terminal {
             hovered_link: None,
             link_generation: 0,
             link_click_consumed: false,
+            right_click_consumed: false,
+            middle_click_consumed: false,
             link_notice: None,
             last_mouse: None,
             last_focus: false,
@@ -607,6 +650,7 @@ impl Terminal {
                         .sender
                         .send(Msg::Input(format(self.window_size()).into_bytes().into()));
                 }
+                Event::ClipboardStore(kind, text) => store_clipboard(kind, text, cx),
                 Event::ChildExit(_) | Event::Exit => self.exited = true,
                 Event::Bell => self.bell = true,
                 _ => {}
@@ -686,9 +730,74 @@ impl Terminal {
         });
     }
     pub fn paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         self.track_typing(text);
-        let bracket = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let bracket = {
+            let mut term = self.term.lock();
+            term.scroll_display(Scroll::Bottom);
+            term.selection = None;
+            term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
         self.send(paste_bytes(text, bracket));
+    }
+    fn selected_text(&self) -> Option<String> {
+        self.term
+            .lock()
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+    fn finish_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if !std::mem::replace(&mut self.selecting, false) {
+            return false;
+        }
+        if !self.selection_dragged && self.selection_clicks == 1 {
+            self.term.lock().selection = None;
+            return true;
+        }
+        if let Some(text) = self.selected_text() {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+            if cx
+                .try_global::<crate::config::Config>()
+                .is_none_or(|config| config.copy_on_select)
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+        true
+    }
+    fn copy_or_interrupt(&mut self, copy_selection: bool, cx: &mut Context<Self>) {
+        if copy_selection && let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.term.lock().selection = None;
+            cx.notify();
+            return;
+        }
+        if let Some(bytes) = self.key_input("c", None, true, false, false) {
+            {
+                let mut term = self.term.lock();
+                term.scroll_display(Scroll::Bottom);
+                term.selection = None;
+            }
+            self.typed.clear();
+            self.send(bytes);
+            cx.notify();
+        }
+    }
+    fn copy_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        if cfg!(target_os = "macos") {
+            if let Some(text) = self.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        } else {
+            self.copy_or_interrupt(cfg!(windows), cx);
+        }
     }
     fn track_typing(&mut self, text: &str) {
         let part = typed_part(text, self.typed.len());
@@ -766,16 +875,48 @@ impl Terminal {
         }
         let application = key.modifiers.platform || (key.modifiers.control && key.modifiers.shift);
         if application && key.key == "c" {
-            if let Some(text) = self.term.lock().selection_to_string() {
+            if let Some(text) = self.selected_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             cx.stop_propagation();
             return;
         }
         if application && key.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            if let Some(text) = cx
+                .read_from_clipboard()
+                .and_then(|i| i.text())
+                .filter(|text| !text.is_empty())
+            {
                 self.paste(&text);
+                cx.notify();
             }
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "insert" && !key.modifiers.alt && !key.modifiers.platform {
+            if key.modifiers.control && !key.modifiers.shift {
+                if let Some(text) = self.selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if key.modifiers.shift && !key.modifiers.control {
+                if let Some(text) = read_selection_or_clipboard(cx) {
+                    self.paste(&text);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if key.key == "c"
+            && key.modifiers.control
+            && !key.modifiers.shift
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            self.copy_or_interrupt(cfg!(windows), cx);
             cx.stop_propagation();
             return;
         }
@@ -787,10 +928,14 @@ impl Terminal {
             && key.modifiers.control
             && !key.modifiers.shift
             && !key.modifiers.alt
-            && let Some(text) = cx.read_from_clipboard().and_then(|i| i.text())
+            && let Some(text) = cx
+                .read_from_clipboard()
+                .and_then(|i| i.text())
+                .filter(|text| !text.is_empty())
         {
             self.paste(&text);
             cx.stop_propagation();
+            cx.notify();
             return;
         }
         if let Some(bytes) = self.key_input(
@@ -1245,6 +1390,9 @@ impl Render for Terminal {
             .on_action(
                 cx.listener(|this, _: &TerminalBackTab, window, cx| this.tab(true, window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &TerminalCopy, window, cx| this.copy_action(window, cx)),
+            )
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1261,6 +1409,9 @@ impl Render for Terminal {
                         return;
                     }
                     if !e.modifiers.shift && this.mouse(e.position, 0, false) {
+                        if this.term.lock().selection.take().is_some() {
+                            cx.notify();
+                        }
                         return;
                     }
                     let p = this.position(e.position);
@@ -1296,7 +1447,8 @@ impl Render for Terminal {
                 }
                 let cell = this.position_without_lock(e.position);
                 let mode = *this.term.lock().mode();
-                if !e.modifiers.shift
+                if !this.selecting
+                    && !e.modifiers.shift
                     && this.last_mouse != Some(cell)
                     && (mode.contains(TermMode::MOUSE_MOTION)
                         || (mode.contains(TermMode::MOUSE_DRAG) && e.pressed_button.is_some()))
@@ -1329,11 +1481,7 @@ impl Render for Terminal {
                     if cx.has_active_drag() {
                         return;
                     }
-                    this.selecting = false;
-                    if !this.selection_dragged && this.selection_clicks == 1 {
-                        this.term.lock().selection = None;
-                    }
-                    if !e.modifiers.shift {
+                    if !this.finish_selection(cx) && !e.modifiers.shift {
                         this.mouse(e.position, 0, true);
                     }
                     cx.notify();
@@ -1344,41 +1492,99 @@ impl Render for Terminal {
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     if std::mem::take(&mut this.link_click_consumed) {
                         cx.stop_propagation();
+                        return;
+                    }
+                    if this.finish_selection(cx) {
+                        cx.notify();
                     }
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    if cx.has_active_drag() {
+                        return;
+                    }
+                    window.focus(&this.focus, cx);
+                    if let Some(text) = this.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        this.term.lock().selection = None;
+                        this.selecting = false;
+                        this.right_click_consumed = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
                     if !e.modifiers.shift && this.mouse(e.position, 2, false) {
                         return;
                     }
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    this.right_click_consumed = true;
+                    if let Some(text) = cx
+                        .read_from_clipboard()
+                        .and_then(|i| i.text())
+                        .filter(|text| !text.is_empty())
+                    {
                         this.paste(&text);
+                        cx.notify();
                     }
+                    cx.stop_propagation();
                 }),
             )
             .on_mouse_up(
                 MouseButton::Right,
-                cx.listener(|this, e: &MouseUpEvent, _, _| {
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.right_click_consumed) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if !e.modifiers.shift {
                         this.mouse(e.position, 2, true);
                     }
                 }),
             )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.right_click_consumed) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(|this, e: &MouseDownEvent, _, _| {
-                    if !e.modifiers.shift {
-                        this.mouse(e.position, 1, false);
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    if cx.has_active_drag() {
+                        return;
                     }
+                    window.focus(&this.focus, cx);
+                    if !e.modifiers.shift && this.mouse(e.position, 1, false) {
+                        return;
+                    }
+                    this.middle_click_consumed = true;
+                    if let Some(text) = read_selection_or_clipboard(cx) {
+                        this.paste(&text);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
                 }),
             )
             .on_mouse_up(
                 MouseButton::Middle,
-                cx.listener(|this, e: &MouseUpEvent, _, _| {
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.middle_click_consumed) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if !e.modifiers.shift {
                         this.mouse(e.position, 1, true);
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.middle_click_consumed) {
+                        cx.stop_propagation();
                     }
                 }),
             )
@@ -3103,6 +3309,315 @@ mod link_interaction_tests {
         );
         cx.simulate_mouse_move(point(px(-10.), px(-10.)), None, ctrl);
         assert!(view.read_with(cx, |terminal, _| terminal.hovered_link.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_interaction_tests {
+    use super::{ClipboardType, Event, Proxy, Size, Terminal};
+    use alacritty_terminal::{sync::FairMutex, term::Term};
+    use gpui::{
+        AppContext as _, ClipboardItem, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
+        Modifiers, MouseButton, ParentElement, Render, Styled, TestAppContext, div, point, px,
+    };
+    use std::sync::{Arc, mpsc};
+
+    fn fixture<'a>(
+        cx: &'a mut TestAppContext,
+        id: usize,
+        initial_bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        gpui::Entity<Terminal>,
+        &'a mut gpui::VisualTestContext,
+        mpsc::Sender<Event>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let mut backend = Terminal::prepare(id, root.path(), Some(shell)).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (proxy, _) = Proxy::channel();
+        let mut term = Term::new(
+            Default::default(),
+            &Size {
+                cols: 100,
+                rows: 30,
+            },
+            proxy,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, initial_bytes);
+        backend.term = Arc::new(FairMutex::new(term));
+        backend.events = event_rx;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::bind_keys(cx);
+            cx.set_global(crate::config::Config::default());
+            crate::theme::apply(cx);
+        });
+        let terminal_root = root.path().to_owned();
+        let (view, vcx) = cx.add_window_view(move |window, cx| {
+            window.activate_window();
+            let terminal = Terminal::new(id, &terminal_root, backend, cx);
+            window.focus(&terminal.focus, cx);
+            terminal
+        });
+        (root, view, vcx, event_tx)
+    }
+
+    fn cell_point(terminal: &Terminal, col: f32, row: f32) -> gpui::Point<gpui::Pixels> {
+        terminal.bounds.origin
+            + point(
+                px(super::TERMINAL_INSET + terminal.cell_width * col),
+                px(super::TERMINAL_INSET + terminal.cell_height * row),
+            )
+    }
+
+    #[gpui_kit::test]
+    fn osc52_clipboard_store_updates_clipboard_and_ignores_empty(cx: &mut TestAppContext) {
+        let (_root, view, cx, event_tx) = fixture(cx, 9910, b"ssh output");
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("before".into())));
+        event_tx
+            .send(Event::ClipboardStore(
+                ClipboardType::Clipboard,
+                "copied over ssh".into(),
+            ))
+            .unwrap();
+        view.update(cx, |terminal, cx| terminal.poll(cx));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("copied over ssh".into())
+        );
+
+        // An empty OSC 52 sequence must not wipe existing clipboard text.
+        event_tx
+            .send(Event::ClipboardStore(
+                ClipboardType::Clipboard,
+                String::new(),
+            ))
+            .unwrap();
+        view.update(cx, |terminal, cx| terminal.poll(cx));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("copied over ssh".into())
+        );
+
+        event_tx
+            .send(Event::ClipboardStore(
+                ClipboardType::Selection,
+                "primary ssh".into(),
+            ))
+            .unwrap();
+        view.update(cx, |terminal, cx| terminal.poll(cx));
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_primary().and_then(|i| i.text())),
+            Some("primary ssh".into())
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("primary ssh".into())
+        );
+    }
+
+    #[gpui_kit::test]
+    fn copy_on_select_and_mouse_up_outside_bounds(cx: &mut TestAppContext) {
+        let (_root, view, cx, _) = fixture(cx, 9911, b"alpha beta");
+        let (start, mid, end) = view.read_with(cx, |t, _| {
+            (
+                cell_point(t, 0.2, 0.5),
+                cell_point(t, 4.8, 0.5),
+                cell_point(t, 9.8, 0.5),
+            )
+        });
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(mid, MouseButton::Left, Modifiers::none());
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("alpha".into())
+        );
+
+        // Releasing outside the terminal ends the drag and still copies.
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(
+            point(px(-20.), px(-20.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert!(!view.read_with(cx, |t, _| t.selecting));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("alpha beta".into())
+        );
+
+        // With `copy_on_select = false`, selecting does not overwrite clipboard.
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("keep me".into()));
+            cx.set_global(crate::config::Config {
+                copy_on_select: false,
+                ..Default::default()
+            });
+        });
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(mid, MouseButton::Left, Modifiers::none());
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("keep me".into())
+        );
+    }
+
+    #[gpui_kit::test]
+    fn right_click_copies_selection_in_mouse_mode_and_pastes_otherwise(cx: &mut TestAppContext) {
+        let (_root, view, cx, _) = fixture(cx, 9912, b"\x1b[?1000;1006halpha beta");
+        cx.update(|_, cx| {
+            cx.set_global(crate::config::Config {
+                copy_on_select: false,
+                ..Default::default()
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("original".into()));
+        });
+        let (start, mid) = view.read_with(cx, |t, _| {
+            (cell_point(t, 0.2, 0.5), cell_point(t, 4.8, 0.5))
+        });
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_mouse_down(start, MouseButton::Left, shift);
+        cx.simulate_mouse_move(mid, Some(MouseButton::Left), shift);
+        cx.simulate_mouse_up(mid, MouseButton::Left, shift);
+        assert_eq!(
+            view.read_with(cx, |t, _| t.selected_text()),
+            Some("alpha".into())
+        );
+
+        // Right-click with an active selection copies and clears it even in mouse mode.
+        cx.simulate_mouse_down(mid, MouseButton::Right, Modifiers::none());
+        cx.simulate_mouse_up(mid, MouseButton::Right, Modifiers::none());
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("alpha".into())
+        );
+        assert_eq!(view.read_with(cx, |t, _| t.selected_text()), None);
+        assert_eq!(view.read_with(cx, |t, _| t.typed.clone()), "");
+
+        // Shift+right-click in mouse mode pastes clipboard text without sending mouse release.
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("pasted".into())));
+        cx.simulate_mouse_down(mid, MouseButton::Right, shift);
+        cx.simulate_mouse_up(mid, MouseButton::Right, Modifiers::none());
+        assert_eq!(view.read_with(cx, |t, _| t.typed.clone()), "pasted");
+    }
+
+    #[gpui_kit::test]
+    fn windows_ctrl_c_and_insert_shortcuts_and_root_copy_override(cx: &mut TestAppContext) {
+        struct RootHarness {
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl Render for RootHarness {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .key_context("Root")
+                    .size_full()
+                    .on_action(|_: &gpui_kit::base::input::Copy, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string("STOLEN_BY_ROOT".into()));
+                    })
+                    .child(self.terminal.clone())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+        let mut backend = Terminal::prepare(9913, root.path(), Some(shell)).unwrap();
+        let (proxy, _) = Proxy::channel();
+        let mut term = Term::new(
+            Default::default(),
+            &Size {
+                cols: 100,
+                rows: 30,
+            },
+            proxy,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut term, b"copiedword");
+        backend.term = Arc::new(FairMutex::new(term));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::bind_keys(cx);
+            cx.set_global(crate::config::Config {
+                copy_on_select: false,
+                ..Default::default()
+            });
+            crate::theme::apply(cx);
+        });
+        let terminal_root = root.path().to_owned();
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            window.activate_window();
+            let terminal = cx.new(|cx| Terminal::new(9913, &terminal_root, backend, cx));
+            let focus = terminal.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            RootHarness { terminal }
+        });
+        let terminal = harness.read_with(cx, |h, _| h.terminal.clone());
+        let (start, end) = terminal.read_with(cx, |t, _| {
+            (cell_point(t, 0.2, 0.5), cell_point(t, 9.8, 0.5))
+        });
+
+        // Windows Ctrl+C mode: first press copies & clears selection without sending SIGINT;
+        // second press sends Ctrl+C interrupt.
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        assert!(terminal.read_with(cx, |t, _| t.last_input().is_none()));
+        terminal.update(cx, |t, cx| t.copy_or_interrupt(true, cx));
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("copiedword".into())
+        );
+        assert_eq!(terminal.read_with(cx, |t, _| t.selected_text()), None);
+        assert!(terminal.read_with(cx, |t, _| t.last_input().is_none()));
+        terminal.update(cx, |t, cx| t.copy_or_interrupt(true, cx));
+        assert!(terminal.read_with(cx, |t, _| t.last_input().is_some()));
+
+        // Ctrl+Insert copies and Shift+Insert pastes.
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("other".into())));
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("ctrl-insert").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("copiedword".into())
+        );
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("shift-insert").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        assert_eq!(terminal.read_with(cx, |t, _| t.typed.clone()), "copiedword");
+
+        // Root's `Copy` action must never steal Ctrl+C / Cmd+C from a focused Terminal.
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("untouched".into())));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        assert_ne!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text())),
+            Some("STOLEN_BY_ROOT".into())
+        );
     }
 }
 impl EventListener for Proxy {
