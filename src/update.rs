@@ -404,7 +404,14 @@ fn download(agent: &ureq::Agent, url: &str, package: &Package, path: &Path) -> R
 fn sha256(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buf = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buf[..count]);
+    }
     Ok(hex(&hasher.finalize()))
 }
 
