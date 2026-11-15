@@ -48,7 +48,26 @@ impl Layout {
     fn insert(&mut self, target: usize, id: usize, edge: DropEdge, key: usize) -> bool {
         self.insert_tree(target, &Self::Leaf(id), edge, key)
     }
+    /// Inserts `tree` beside `target` and shares the row or column it joins
+    /// equally between all of its panes.
     fn insert_tree(&mut self, target: usize, tree: &Self, edge: DropEdge, key: usize) -> bool {
+        match self.insert_inner(target, tree, edge, key) {
+            Some(row) => {
+                self.settle_row(row);
+                true
+            }
+            None => false,
+        }
+    }
+    /// `None` when `target` isn't in this subtree, otherwise the axis of the
+    /// row that grew, while it still has to be equalized further up.
+    fn insert_inner(
+        &mut self,
+        target: usize,
+        tree: &Self,
+        edge: DropEdge,
+        key: usize,
+    ) -> Option<Option<bool>> {
         match self {
             Self::Leaf(current) if *current == target => {
                 let (first, second) = if matches!(edge, DropEdge::Left | DropEdge::Top) {
@@ -56,20 +75,76 @@ impl Layout {
                 } else {
                     (Self::Leaf(target), tree.clone())
                 };
+                let vertical = matches!(edge, DropEdge::Top | DropEdge::Bottom);
                 *self = Self::Split {
                     key,
-                    vertical: matches!(edge, DropEdge::Top | DropEdge::Bottom),
+                    vertical,
                     ratio: default_split_ratio(),
                     first: Box::new(first),
                     second: Box::new(second),
                 };
-                true
+                Some(Some(vertical))
             }
-            Self::Split { first, second, .. } => {
-                first.insert_tree(target, tree, edge, key)
-                    || second.insert_tree(target, tree, edge, key)
+            Self::Split {
+                vertical,
+                first,
+                second,
+                ..
+            } => {
+                let vertical = *vertical;
+                if let Some(row) = first.insert_inner(target, tree, edge, key) {
+                    Some(first.settle_child(row, vertical))
+                } else {
+                    let row = second.insert_inner(target, tree, edge, key)?;
+                    Some(second.settle_child(row, vertical))
+                }
             }
-            _ => false,
+            _ => None,
+        }
+    }
+    /// A changed row continues into a parent split along the same axis;
+    /// otherwise this subtree is the whole row and is equalized now.
+    fn settle_child(&mut self, row: Option<bool>, parent: bool) -> Option<bool> {
+        if row == Some(parent) {
+            row
+        } else {
+            self.settle_row(row);
+            None
+        }
+    }
+    fn settle_row(&mut self, row: Option<bool>) {
+        if let Some(axis) = row {
+            self.equalize(axis);
+        }
+    }
+    /// Panes side by side along `axis`; a pane split the other way counts once.
+    fn span(&self, axis: bool) -> usize {
+        match self {
+            Self::Split {
+                vertical,
+                first,
+                second,
+                ..
+            } if *vertical == axis => first.span(axis) + second.span(axis),
+            _ => 1,
+        }
+    }
+    /// Gives every pane of this row (nested splits along `axis`) an equal
+    /// share. Splits along the other axis keep their own ratios.
+    fn equalize(&mut self, axis: bool) {
+        if let Self::Split {
+            vertical,
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+            && *vertical == axis
+        {
+            let before = first.span(axis);
+            *ratio = before as f32 / (before + second.span(axis)) as f32;
+            first.equalize(axis);
+            second.equalize(axis);
         }
     }
     pub fn split(&mut self, target: usize, new: usize, vertical: bool) -> bool {
@@ -120,13 +195,22 @@ impl Layout {
             Self::Leaf(_) => false,
         }
     }
+    /// Removes `target` and shares the row it leaves equally between the
+    /// panes that remain there.
     pub fn remove(&self, target: usize) -> Option<Self> {
+        let (mut tree, row) = self.remove_inner(target);
+        if let Some(tree) = tree.as_mut() {
+            tree.settle_row(row);
+        }
+        tree
+    }
+    fn remove_inner(&self, target: usize) -> (Option<Self>, Option<bool>) {
         match self {
             Self::Leaf(id) => {
                 if *id == target {
-                    None
+                    (None, None)
                 } else {
-                    Some(self.clone())
+                    (Some(self.clone()), None)
                 }
             }
             Self::Split {
@@ -135,16 +219,25 @@ impl Layout {
                 ratio,
                 first,
                 second,
-            } => match (first.remove(target), second.remove(target)) {
-                (Some(a), Some(b)) => Some(Self::Split {
-                    key: *key,
-                    vertical: *vertical,
-                    ratio: *ratio,
-                    first: Box::new(a),
-                    second: Box::new(b),
-                }),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
+            } => match (first.remove_inner(target), second.remove_inner(target)) {
+                ((Some(mut a), a_row), (Some(mut b), b_row)) => {
+                    let row = a
+                        .settle_child(a_row, *vertical)
+                        .or(b.settle_child(b_row, *vertical));
+                    (
+                        Some(Self::Split {
+                            key: *key,
+                            vertical: *vertical,
+                            ratio: *ratio,
+                            first: Box::new(a),
+                            second: Box::new(b),
+                        }),
+                        row,
+                    )
+                }
+                // The remaining branch takes this split's place in its row.
+                ((Some(a), _), (None, _)) | ((None, _), (Some(a), _)) => (Some(a), Some(*vertical)),
+                ((None, _), (None, _)) => (None, None),
             },
         }
     }
@@ -283,6 +376,144 @@ mod tests {
         vec![t]
     }
 
+    /// Each pane's share of the group's width and height.
+    fn shares(layout: &Layout) -> Vec<(usize, f32, f32)> {
+        fn walk(layout: &Layout, w: f32, h: f32, out: &mut Vec<(usize, f32, f32)>) {
+            match layout {
+                Layout::Leaf(id) => out.push((*id, w, h)),
+                Layout::Split {
+                    vertical,
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    if *vertical {
+                        walk(first, w, h * ratio, out);
+                        walk(second, w, h * (1. - ratio), out);
+                    } else {
+                        walk(first, w * ratio, h, out);
+                        walk(second, w * (1. - ratio), h, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(layout, 1., 1., &mut out);
+        out.sort_by_key(|(id, ..)| *id);
+        out
+    }
+    fn assert_shares(layout: &Layout, expected: &[(usize, f32, f32)]) {
+        let actual = shares(layout);
+        assert_eq!(actual.len(), expected.len(), "{actual:?}");
+        for ((id, w, h), (eid, ew, eh)) in actual.iter().zip(expected) {
+            assert_eq!(id, eid, "{actual:?}");
+            assert!((w - ew).abs() < 1e-4 && (h - eh).abs() < 1e-4, "{actual:?}");
+        }
+    }
+
+    #[test]
+    fn splitting_shares_the_row_equally_and_closing_rebalances_it() {
+        for vertical in [false, true] {
+            let size = |n: f32| if vertical { (1., 1. / n) } else { (1. / n, 1.) };
+            let mut tree = Layout::Leaf(1);
+            // Ctrl+D always splits the focused, newest pane.
+            for id in 2..=4 {
+                assert!(tree.split(id - 1, id, vertical));
+                let n = id as f32;
+                let (w, h) = size(n);
+                assert_shares(&tree, &(1..=id).map(|i| (i, w, h)).collect::<Vec<_>>());
+            }
+            // Splitting an earlier pane shares the row too.
+            assert!(tree.split(1, 5, vertical));
+            let (w, h) = size(5.);
+            assert_shares(&tree, &(1..=5).map(|i| (i, w, h)).collect::<Vec<_>>());
+            // A manual resize lasts until the row changes again.
+            assert!(tree.resize_split(4, 0.9));
+            for (closed, left) in [(3, [1, 2, 4, 5].as_slice()), (1, &[2, 4, 5]), (5, &[2, 4])] {
+                tree = tree.remove(closed).unwrap();
+                let (w, h) = size(left.len() as f32);
+                assert_shares(&tree, &left.iter().map(|i| (*i, w, h)).collect::<Vec<_>>());
+            }
+            assert_eq!(tree.remove(2), Some(Layout::Leaf(4)));
+        }
+    }
+
+    #[test]
+    fn rebalancing_a_row_keeps_cross_axis_splits() {
+        // 1 | (2 / 3), with the 2/3 divider moved by hand.
+        let mut tree = Layout::Leaf(1);
+        tree.split(1, 2, false);
+        tree.split(2, 3, true);
+        assert!(tree.resize_split(3, 0.7));
+        tree.split(1, 4, false);
+        let third = 1. / 3.;
+        assert_shares(
+            &tree,
+            &[
+                (1, third, 1.),
+                (2, third, 0.7),
+                (3, third, 0.3),
+                (4, third, 1.),
+            ],
+        );
+        // Removing from the column rebalances only that column...
+        tree.split(3, 5, true);
+        assert_shares(
+            &tree,
+            &[
+                (1, third, 1.),
+                (2, third, third),
+                (3, third, third),
+                (4, third, 1.),
+                (5, third, third),
+            ],
+        );
+        assert!(tree.resize_split(3, 0.6));
+        tree = tree.remove(5).unwrap();
+        assert_shares(
+            &tree,
+            &[
+                (1, third, 1.),
+                (2, third, 0.5),
+                (3, third, 0.5),
+                (4, third, 1.),
+            ],
+        );
+        // ...and a column's last pane joins its parent row.
+        tree = tree.remove(2).unwrap();
+        assert_shares(&tree, &[(1, third, 1.), (3, third, 1.), (4, third, 1.)]);
+    }
+
+    #[test]
+    fn moving_panes_rebalances_both_the_source_and_the_destination() {
+        let row = |ids: &[usize]| {
+            let mut tree = Layout::Leaf(ids[0]);
+            for pair in ids.windows(2) {
+                tree.split(pair[0], pair[1], false);
+            }
+            tree
+        };
+        let mut tabs = vec![row(&[1, 2, 3]), row(&[4, 5])];
+        assert!(move_to_edge(&mut tabs, 2, 5, DropEdge::Right));
+        assert_shares(&tabs[0], &[(1, 0.5, 1.), (3, 0.5, 1.)]);
+        let third = 1. / 3.;
+        assert_shares(&tabs[1], &[(2, third, 1.), (4, third, 1.), (5, third, 1.)]);
+        assert!(move_pane_to_tab(&mut tabs, 4, None, true));
+        assert_shares(&tabs[1], &[(2, 0.5, 1.), (5, 0.5, 1.)]);
+        // A dropped group's panes join the destination row as equals.
+        assert!(move_group_to_edge(&mut tabs, 1, 2, DropEdge::Left));
+        assert_eq!(tabs.len(), 2);
+        assert_shares(
+            &tabs[0],
+            &[(1, 0.25, 1.), (2, 0.25, 1.), (3, 0.25, 1.), (5, 0.25, 1.)],
+        );
+        // Dropped across the row, the group keeps sharing its own width.
+        let mut tabs = vec![row(&[1, 2]), Layout::Leaf(3)];
+        assert!(move_group_to_edge(&mut tabs, 1, 3, DropEdge::Bottom));
+        assert_shares(&tabs[0], &[(1, 0.5, 0.5), (2, 0.5, 0.5), (3, 1., 0.5)]);
+    }
+
     #[test]
     fn old_split_layouts_restore_with_equal_sizes() {
         let layout: Layout = serde_json::from_str(
@@ -317,10 +548,22 @@ mod tests {
         assert_eq!(restored, tabs);
         restored.push(Layout::Leaf(4));
         assert!(move_group_to_edge(&mut restored, 1, 4, DropEdge::Right));
+        // The group joins the destination row as equals; its column keeps
+        // the divider that was moved by hand.
+        let third = 1. / 3.;
+        assert_shares(
+            &restored[0],
+            &[
+                (1, third, 1.),
+                (2, third, 0.85),
+                (3, third, 0.15),
+                (4, third, 1.),
+            ],
+        );
         let Layout::Split { second, .. } = &restored[0] else {
             panic!("missing merged split")
         };
-        assert_eq!(second.as_ref(), &tabs[0]);
+        assert_eq!(second.leaves(), tabs[0].leaves());
         let remaining = tabs[0].remove(1).unwrap();
         let Layout::Split { ratio, .. } = remaining else {
             panic!("missing surviving split")

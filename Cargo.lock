@@ -8014,7 +8014,7 @@ dependencies = [
 
 [[package]]
 name = "vyber-terminal"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
