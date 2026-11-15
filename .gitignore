@@ -1,6 +1,7 @@
 /target/
 /dist/
 /.vyber/
+/.worktree/
 *.log
 
 /.vyber-tools/
