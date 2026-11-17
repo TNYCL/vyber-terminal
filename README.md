@@ -193,8 +193,14 @@ Ctrl/Cmd+click opens local paths such as `src/main.rs:42` in the file panel and 
 **Tabs and splits.** Double-click a group to name it; its context menu offers rename, split, and
 close. The arrow beside `+` lists open groups. Split terminal titles have focus/restore and close
 controls; a lone terminal needs no extra header. Drag a title to another pane's edge to move it,
-or beside `+` to give it a separate tab. Group tabs keep their size when selected, and the strip
-scrolls at its edges during a drag. See **All keyboard shortcuts** for closure behavior.
+or beside `+` to give it a separate tab. Drag a group tab outside the window and release to
+move the entire group into a new window; dragging a split terminal's title moves that terminal
+only. Drop onto another Vyber window's tab strip or a pane edge to move it there. Running shells,
+terminal output, open files, unsaved edits, and editor undo history stay with the moved terminals.
+Escape cancels a drag. Moving the last group leaves an empty source window.
+Group tabs keep their size when selected, and the strip scrolls at its edges during a drag.
+Window layouts and positions restore together on the next launch, using new shells as usual.
+See **All keyboard shortcuts** for closure behavior.
 
 **Files and previews.** Overlay mode keeps terminal size unchanged; dock mode moves the terminal
 aside. Drag the panel's left edge or the sidebar to resize them. The tree shows Git status colors
@@ -305,7 +311,7 @@ argument list, to choose another shell:
 | File or directory | Contents |
 | --- | --- |
 | `config.toml` | User settings. |
-| `workspace.json` | Tabs, split layout, folders, open files, and unsaved editor drafts. |
+| `workspace.json` | Window positions, tabs, split layouts, folders, open files, and unsaved editor drafts. |
 | `projects.json` | Projects and source folders. |
 | `git-drafts.json` | Unsent commit messages. |
 | `checkpoints/`, `tasks/`, `recovery/` | Snapshot file content, review metadata, and recovery copies. |
@@ -365,9 +371,10 @@ an entire group is explicit and checks all its terminals. Unsaved editor changes
 and running agent sessions or background jobs require confirmation. Cancel keeps them running.
 
 Closing the last terminal, or exiting its shell, leaves an empty workspace; New tab opens a new
-session. Closed terminals are removed from the saved workspace. Quit checks all terminals and
-saves the remaining layout and drafts. If process inspection is unavailable, closing a live
-terminal requires confirmation.
+session. Closed terminals are removed from the saved workspace. Quit checks running processes
+in every window and saves all remaining layouts and drafts. Closing one window leaves the
+other windows running. If process inspection is unavailable, closing a live terminal requires
+confirmation.
 
 On macOS, closing the window leaves the app running. Dock/Finder relaunch opens a workspace
 window, and New tab and Quit work from the native menu with no window open. Unix process checks

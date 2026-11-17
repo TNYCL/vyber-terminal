@@ -18,6 +18,7 @@ mod processes;
 mod project;
 mod project_dialog;
 mod pty;
+mod runtime;
 mod shell;
 mod split;
 mod tab_state;

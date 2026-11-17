@@ -54,6 +54,7 @@ impl TaskReview {
 }
 /// The process of a Claude Code session, which Claude Code names in a file
 /// of its own for every session it runs.
+#[cfg_attr(test, allow(dead_code))]
 pub fn claude_process(session: &str) -> Option<u32> {
     let dir = dirs::home_dir()?.join(".claude").join("sessions");
     fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
@@ -435,6 +436,7 @@ fn capture_end(review: &mut TaskReview, interrupted: bool) {
     persist(review);
 }
 pub struct Monitor {
+    #[cfg_attr(test, allow(dead_code))]
     pub receiver: mpsc::Receiver<TaskReview>,
     stop: Arc<AtomicBool>,
 }

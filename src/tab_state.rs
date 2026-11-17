@@ -17,7 +17,19 @@ pub struct TabState {
     next: usize,
 }
 
+impl Group {
+    pub(crate) fn members(&self) -> Vec<usize> {
+        self.members.clone()
+    }
+}
+
 impl TabState {
+    pub(crate) fn import(&mut self, mut group: Group) {
+        group.id = self.next;
+        self.next += 1;
+        self.groups.push(group);
+    }
+
     /// Match surviving groups by membership, largest overlap first. When two
     /// groups are joined, the drop destination keeps its name and identity.
     pub fn sync(&mut self, layouts: &[Layout], destination: Option<usize>) {

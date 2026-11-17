@@ -74,7 +74,9 @@ impl Vyber {
                 let position = pointer - offset;
                 if tab.contains(&position) {
                     let anchor = layout.first();
-                    if anchor != drag.id && !(drag.group && layout.contains(drag.id)) {
+                    if drag.source_window != self.window_id
+                        || (anchor != drag.id && !(drag.group && layout.contains(drag.id)))
+                    {
                         self.drop_hint = Some(DropHint::Tab {
                             id: anchor,
                             after: position.x > tab.center().x,
@@ -246,17 +248,14 @@ impl Vyber {
                     this.request_close_group(id, event.position, window, cx);
                 }),
             )
-            .on_drag(
-                TabDrag {
-                    id: anchor,
-                    group: true,
-                    label: name,
-                },
-                |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| drag.clone())
-                },
-            )
+            .on_drag(self.drag_value(anchor, true, name, cx), |drag, _, _, cx| {
+                cx.stop_propagation();
+                let _ = drag.source.update(cx, |this, cx| {
+                    this.tab_drag = Some(drag.clone());
+                    cx.notify();
+                });
+                cx.new(|_| drag.clone())
+            })
             .into_any_element()
     }
 
@@ -339,17 +338,14 @@ impl Vyber {
                     this.close_pane(id, window, cx);
                 }),
             )
-            .on_drag(
-                TabDrag {
-                    id,
-                    group: false,
-                    label: title,
-                },
-                |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| drag.clone())
-                },
-            )
+            .on_drag(self.drag_value(id, false, title, cx), |drag, _, _, cx| {
+                cx.stop_propagation();
+                let _ = drag.source.update(cx, |this, cx| {
+                    this.tab_drag = Some(drag.clone());
+                    cx.notify();
+                });
+                cx.new(|_| drag.clone())
+            })
             .into_any_element()
     }
 

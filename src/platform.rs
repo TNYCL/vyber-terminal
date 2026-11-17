@@ -515,3 +515,111 @@ mod tests {
         assert!(super::command_lines(&[child.id()]).is_empty());
     }
 }
+
+/// Screen points are physical pixels on Windows and logical pixels elsewhere.
+/// Keep the conversion at the native boundary for mixed-DPI monitors.
+pub(crate) fn drag_screen_position(
+    window: &gpui::Window,
+    local: gpui::Point<gpui::Pixels>,
+) -> gpui::Point<gpui::Pixels> {
+    #[cfg(all(windows, not(test)))]
+    if let Some(hwnd) = native_window(window) {
+        use windows::Win32::{Foundation::POINT, Graphics::Gdi::ClientToScreen};
+        let mut position = POINT {
+            x: (f32::from(local.x) * window.scale_factor()) as i32,
+            y: (f32::from(local.y) * window.scale_factor()) as i32,
+        };
+        if unsafe { ClientToScreen(hwnd, &mut position) }.as_bool() {
+            return gpui::point(gpui::px(position.x as f32), gpui::px(position.y as f32));
+        }
+    }
+    window.bounds().origin + local
+}
+
+pub(crate) fn drag_local_position(
+    window: &gpui::Window,
+    screen: gpui::Point<gpui::Pixels>,
+) -> gpui::Point<gpui::Pixels> {
+    #[cfg(all(windows, not(test)))]
+    if let Some(hwnd) = native_window(window) {
+        use windows::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient};
+        let mut position = POINT {
+            x: f32::from(screen.x) as i32,
+            y: f32::from(screen.y) as i32,
+        };
+        if unsafe { ScreenToClient(hwnd, &mut position) }.as_bool() {
+            return gpui::point(
+                gpui::px(position.x as f32 / window.scale_factor()),
+                gpui::px(position.y as f32 / window.scale_factor()),
+            );
+        }
+    }
+    screen - window.bounds().origin
+}
+
+#[cfg(all(windows, not(test)))]
+fn native_window(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => {
+            Some(windows::Win32::Foundation::HWND(handle.hwnd.get() as _))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn drag_window_position(
+    screen: gpui::Point<gpui::Pixels>,
+    _cx: &gpui::App,
+) -> (gpui::Point<gpui::Pixels>, Option<gpui::DisplayId>) {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::Win32::{
+            Foundation::POINT,
+            Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
+            UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+        };
+        let monitor = unsafe {
+            MonitorFromPoint(
+                POINT {
+                    x: f32::from(screen.x) as i32,
+                    y: f32::from(screen.y) as i32,
+                },
+                MONITOR_DEFAULTTONEAREST,
+            )
+        };
+        let (mut x, mut y) = (96, 96);
+        if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.is_ok() {
+            return (
+                screen / (x as f32 / 96.),
+                Some(gpui::DisplayId::new(monitor.0 as u64)),
+            );
+        }
+    }
+    (screen, None)
+}
+
+/// An obscured or minimized workspace must not accept a captured native drop.
+pub(crate) fn drag_hits_window(window: &gpui::Window, screen: gpui::Point<gpui::Pixels>) -> bool {
+    if !window.is_visible() {
+        return false;
+    }
+    #[cfg(all(windows, not(test)))]
+    if let Some(hwnd) = native_window(window) {
+        use windows::Win32::{
+            Foundation::POINT,
+            UI::WindowsAndMessaging::{IsChild, WindowFromPoint},
+        };
+        let hit = unsafe {
+            WindowFromPoint(POINT {
+                x: f32::from(screen.x) as i32,
+                y: f32::from(screen.y) as i32,
+            })
+        };
+        if hit != hwnd && !unsafe { IsChild(hwnd, hit) }.as_bool() {
+            return false;
+        }
+    }
+    gpui::Bounds::new(gpui::Point::default(), window.viewport_size())
+        .contains(&drag_local_position(window, screen))
+}

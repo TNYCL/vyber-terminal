@@ -258,6 +258,7 @@ impl Slide {
 }
 
 pub struct Browser {
+    window: AnyWindowHandle,
     pub root: PathBuf,
     pub visible: bool,
     pub docked: bool,
@@ -347,6 +348,29 @@ impl Drop for Browser {
 }
 
 impl Browser {
+    pub(crate) fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window = window.window_handle();
+        self.filter
+            .update(cx, |input, cx| input.bind_window(window, cx));
+        for doc in &self.docs {
+            doc.editor
+                .update(cx, |input, cx| input.bind_window(window, cx));
+        }
+        for review in [&self.review, &self.parked] {
+            review.bind_window(window, cx);
+        }
+        for input in self.git.messages.values() {
+            input.update(cx, |input, cx| input.bind_window(window, cx));
+        }
+        if let Some(quick) = &self.git.quick {
+            quick
+                .input
+                .update(cx, |input, cx| input.bind_window(window, cx));
+        }
+        self.menu = None;
+        self.folder_menu = None;
+    }
+
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let (document_sender, document_receiver) = mpsc::channel();
@@ -385,17 +409,20 @@ impl Browser {
             }
             cx.notify();
         });
-        cx.spawn_in(window, async move |entity, cx| {
+        cx.spawn(async move |entity, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
-                if entity
-                    .update_in(cx, |view, window, cx| view.poll(window, cx))
-                    .is_err()
-                {
+                let Some(view) = entity.upgrade() else {
                     break;
-                }
+                };
+                cx.update(|cx| {
+                    let window = view.read(cx).window;
+                    let _ = window.update(cx, |_, window, cx| {
+                        view.update(cx, |view, cx| view.poll(window, cx));
+                    });
+                });
             }
         })
         .detach();
@@ -405,6 +432,7 @@ impl Browser {
         subscriptions.extend(review_subscriptions);
         subscriptions.extend(parked_subscriptions);
         Self {
+            window: window.window_handle(),
             root,
             visible: false,
             docked: cx.global::<Config>().panel_mode == PanelMode::Dock,
@@ -629,6 +657,36 @@ impl Browser {
         self.docs
             .iter()
             .any(|d| d.editor.read(cx).focus_handle(cx).is_focused(window))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_edit_document(
+        &self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.docs[self.active_doc].editor.update(cx, |editor, cx| {
+            editor.replace_all(text, window, cx);
+            editor.set_selected_range(1..4, cx);
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn test_document_selection(&self, cx: &App) -> std::ops::Range<usize> {
+        self.docs[self.active_doc].editor.read(cx).selected_range()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_focus_document(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(doc) = self.docs.get(self.active_doc) {
+            doc.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_document_value(&self, cx: &App) -> String {
+        self.docs[self.active_doc]
+            .editor
+            .read(cx)
+            .value()
+            .to_string()
     }
     #[cfg(test)]
     #[cfg_attr(

@@ -1,6 +1,6 @@
 [package]
 name = "vyber-terminal"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "A native terminal workspace with files, previews, and review."
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,8 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_System_Threading", "Wdk_System_Threading"] }
+raw-window-handle = "0.6"
+windows = { version = "0.62.2", features = ["Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Data_Xml_Dom", "UI_Notifications", "Foundation", "Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_System_Threading", "Wdk_System_Threading"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [build-dependencies]
@@ -61,3 +62,7 @@ opt-level = 1
 strip = true
 lto = "thin"
 codegen-units = 8
+
+# Preserve live editor state when a terminal group moves to another window.
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }

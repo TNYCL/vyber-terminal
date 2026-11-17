@@ -2,6 +2,14 @@
 
 Cargo.lock fixes the versions used by this build. License expressions below are package metadata, not a replacement for the original license text.
 
+## Bundled source patch
+
+`vendor/gpui-base` contains GPUI Base 0.7.0 from
+[GPUI Kit](https://github.com/longbridge/gpui-kit), licensed under Apache-2.0.
+Its original license is included at `vendor/gpui-base/LICENSE-APACHE`.
+Vyber modifies the input state's window bindings so live editors can move between
+windows without losing their text, selections, or undo history. See `vendor/README.md`.
+
 ## Bundled icons
 
 `assets/icons` embeds these files in the binary. `scripts/build_file_icons.py` regenerates them.

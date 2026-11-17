@@ -151,6 +151,11 @@ pub(super) struct ReviewState {
 }
 
 impl ReviewState {
+    pub(super) fn bind_window(&self, window: &mut Window, cx: &mut Context<Browser>) {
+        for input in [&self.filter, &self.find, &self.comment_input] {
+            input.update(cx, |input, cx| input.bind_window(window, cx));
+        }
+    }
     pub(super) fn new(
         git: bool,
         window: &mut Window,

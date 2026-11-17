@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 pub struct Notifications {
+    #[cfg_attr(test, allow(dead_code))]
     pub receiver: mpsc::Receiver<usize>,
     sender: mpsc::Sender<usize>,
     last: std::time::Instant,

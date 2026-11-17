@@ -8,23 +8,19 @@ use crate::{
     project_dialog::{ProjectDialog, ProjectDialogEvent},
     split::SplitPane,
     tab_state::TabState,
-    tasks::{Monitor, TaskReview},
+    tasks::TaskReview,
     terminal::{Terminal, TerminalEvent, TurnBadge},
     theme::{self, chip},
-    workspace,
 };
 use gpui::{prelude::*, *};
 use gpui_kit::component::TitleBar;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+mod exit;
 mod tabs;
 mod toolbelt;
+mod transfer;
 use tabs::{RenameTab, TabMenu};
 use toolbelt::{AgentStatus, Toolbelt};
 
@@ -64,14 +60,18 @@ actions!(
 #[action(namespace = vyber, no_json)]
 struct SelectTab(usize);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum WorkspaceLaunch {
     Restore,
     Empty,
+    Saved(SavedState),
 }
 
 #[derive(Clone)]
 struct TabDrag {
+    source: WeakEntity<Vyber>,
+    source_window: WindowId,
+    members: Vec<usize>,
     id: usize,
     group: bool,
     label: String,
@@ -182,9 +182,9 @@ struct Slot {
     attention: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
 }
-#[derive(Serialize, Deserialize, Default)]
-struct SavedState {
-    slots: Vec<SavedSlot>,
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SavedState {
+    pub(crate) slots: Vec<SavedSlot>,
     tabs: Vec<Layout>,
     tab: usize,
     active: usize,
@@ -194,10 +194,14 @@ struct SavedState {
     /// to config.toml on start.
     #[serde(default, skip_serializing)]
     font_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bounds: Option<crate::lifecycle::SavedBounds>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) windows: Vec<SavedState>,
 }
-#[derive(Serialize, Deserialize)]
-struct SavedSlot {
-    id: usize,
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SavedSlot {
+    pub(crate) id: usize,
     root: PathBuf,
     browser: crate::browser::BrowserState,
 }
@@ -214,27 +218,22 @@ pub struct Vyber {
     rename_tab: Option<RenameTab>,
     next: usize,
     focus: FocusHandle,
-    roots: Arc<Mutex<Vec<PathBuf>>>,
-    monitor: Monitor,
-    /// Agent session → the terminal it runs in, learned from its first turn.
-    sessions: HashMap<String, usize>,
+    window_id: WindowId,
+    window_bounds: crate::lifecycle::SavedBounds,
     /// The processes and Claude Code sessions, rescanned every second or two.
     scan: crate::agents::Scan,
     toolbelt: Toolbelt,
     notice: String,
-    notifications: crate::notifications::Notifications,
     last_persist: std::time::Instant,
     zoomed: bool,
     show_shortcuts: bool,
     close_pending: bool,
-    state_path: PathBuf,
-    /// The workspace as last written, so an unchanged one costs no disk access.
-    saved_state: std::cell::RefCell<Option<Vec<u8>>>,
     restoring: bool,
     #[cfg(test)]
     process_snapshot: Option<crate::processes::ProcessSnapshot>,
     drop_hint: Option<DropHint>,
     tab_drag: Option<TabDrag>,
+    drop_regions: transfer::DropRegions,
     panel: Option<PanelMotion>,
     /// The panel's left edge is being dragged.
     resizing_panel: bool,
@@ -308,11 +307,6 @@ impl Vyber {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let roots = Arc::new(Mutex::new(Vec::new()));
-        #[cfg(not(test))]
-        let monitor = Monitor::start(roots.clone());
-        #[cfg(test)]
-        let monitor = Monitor::inactive();
         let mut app = Self {
             slots: HashMap::new(),
             tabs: vec![],
@@ -325,24 +319,21 @@ impl Vyber {
             rename_tab: None,
             next: 0,
             focus: cx.focus_handle(),
-            roots,
-            monitor,
-            sessions: HashMap::new(),
-            scan: Default::default(),
+            window_id: window.window_handle().window_id(),
+            window_bounds: crate::lifecycle::SavedBounds::capture(window),
+            scan: crate::runtime::entity(cx).read(cx).scan.clone(),
             toolbelt: Toolbelt::new(cx.global::<Config>()),
             notice: String::new(),
-            notifications: crate::notifications::Notifications::new(),
             last_persist: std::time::Instant::now(),
             zoomed: false,
             show_shortcuts: false,
             close_pending: false,
-            state_path: workspace::data_dir().join("workspace.json"),
-            saved_state: Default::default(),
             restoring: true,
             #[cfg(test)]
             process_snapshot: None,
             drop_hint: None,
             tab_drag: None,
+            drop_regions: Default::default(),
             panel: None,
             resizing_panel: false,
             resize_interval: None,
@@ -356,22 +347,10 @@ impl Vyber {
             notice_expires: None,
             _subscriptions: vec![],
         };
-        #[cfg(not(test))]
-        let restore_allowed = std::env::args_os().nth(1).is_none();
-        #[cfg(test)]
-        let restore_allowed = true;
-        // An update brings back the workspace it closed, whatever the setting.
-        let updated_from = crate::update::take_relaunched();
-        let saved = if matches!(launch, WorkspaceLaunch::Empty) {
-            Some(SavedState::default())
-        } else if restore_allowed
-            && (updated_from.is_some() || crate::config::Config::load().restore_workspace)
-        {
-            std::fs::read(&app.state_path)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<SavedState>(&b).ok())
-        } else {
-            None
+        let saved = match launch {
+            WorkspaceLaunch::Empty => Some(SavedState::default()),
+            WorkspaceLaunch::Saved(saved) => Some(saved),
+            WorkspaceLaunch::Restore => None,
         };
         let preserve_empty = saved
             .as_ref()
@@ -424,9 +403,6 @@ impl Vyber {
         app.restoring = false;
         app.update_roots(cx);
         app.persist(cx);
-        if updated_from.is_some_and(|from| from != env!("CARGO_PKG_VERSION")) {
-            app.brief_notice(format!("Updated to Vyber {}", env!("CARGO_PKG_VERSION")));
-        }
         if app.slots.is_empty() {
             window.focus(&app.focus, cx);
         }
@@ -446,7 +422,30 @@ impl Vyber {
             }
         });
         app._subscriptions
-            .push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
+            .push(cx.observe_window_bounds(window, |this, window, cx| {
+                this.window_bounds = crate::lifecycle::SavedBounds::capture(window);
+                cx.notify();
+            }));
+        let runtime = crate::runtime::entity(cx);
+        app._subscriptions.push(
+            cx.subscribe_in(&runtime, window, |this, _, event, window, cx| match event {
+                crate::runtime::RuntimeEvent::Review(review, owner) => {
+                    this.apply_review(review, *owner, cx)
+                }
+                crate::runtime::RuntimeEvent::Notification(id) => {
+                    if this.slots.contains_key(id) {
+                        window.activate_window();
+                        this.focus_pane(*id, window, cx);
+                    }
+                }
+                crate::runtime::RuntimeEvent::Scan(scan) => {
+                    this.scan = scan.clone();
+                    if this.refresh_agents(window, cx) || this.toolbelt.shown() {
+                        cx.notify();
+                    }
+                }
+            }),
+        );
         cx.spawn_in(window, async move |entity, cx| {
             loop {
                 cx.background_executor()
@@ -456,41 +455,6 @@ impl Vyber {
                     log::warn!("Workspace poll ended: {e}");
                     break;
                 }
-            }
-        })
-        .detach();
-        // Listing processes takes a moment on macOS, so it runs off the UI
-        // thread: more often while the toolbelt shows them.
-        #[cfg(not(test))]
-        cx.spawn_in(window, async move |entity, cx| {
-            loop {
-                let Ok((shells, interval)) = entity.update(cx, |this, cx| {
-                    let shells = this
-                        .slots
-                        .values()
-                        .filter_map(|s| s.terminal.read(cx).shell)
-                        .collect::<Vec<_>>();
-                    let interval = if this.toolbelt.shown() { 1000 } else { 2000 };
-                    (shells, Duration::from_millis(interval))
-                }) else {
-                    break;
-                };
-                let scan = cx
-                    .background_executor()
-                    .spawn(async move { crate::agents::Scan::capture(&shells) })
-                    .await;
-                if entity
-                    .update_in(cx, |this, window, cx| {
-                        this.scan = scan;
-                        if this.refresh_agents(window, cx) || this.toolbelt.shown() {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                cx.background_executor().timer(interval).await;
             }
         })
         .detach();
@@ -504,14 +468,21 @@ impl Vyber {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = self.next;
-        self.next += 1;
+        if crate::lifecycle::is_closing(cx) {
+            return;
+        }
+        let id = crate::runtime::entity(cx).update(cx, |runtime, cx| {
+            runtime.allocate(self.restoring.then_some(self.next), cx)
+        });
+        self.next = self.next.max(id + 1);
         #[cfg(not(test))]
         let config = crate::config::Config::load();
         #[cfg(not(test))]
         let shell = config.shell.as_deref();
-        #[cfg(test)]
+        #[cfg(all(test, not(windows)))]
         let shell = Some("/bin/sh");
+        #[cfg(all(test, windows))]
+        let shell = None;
         let backend = match Terminal::prepare(id, &root, shell) {
             Ok(backend) => backend,
             Err(error) => {
@@ -522,6 +493,46 @@ impl Vyber {
         };
         let terminal = cx.new(|cx| Terminal::new(id, &root, backend, cx));
         let browser = cx.new(|cx| Browser::new(root.clone(), window, cx));
+        let focus = terminal.read(cx).focus.clone();
+        let subscriptions = self.slot_subscriptions(id, &terminal, &browser, window, cx);
+        self.slots.insert(
+            id,
+            Slot {
+                title: terminal.read(cx).title.clone(),
+                terminal,
+                browser,
+                turn: None,
+                agent: None,
+                tracker: Default::default(),
+                attention: None,
+                _subscriptions: subscriptions,
+            },
+        );
+        if split && !self.tabs.is_empty() {
+            self.tabs[self.tab].split(self.active, id, vertical);
+        } else {
+            self.tabs.push(Layout::Leaf(id));
+            self.tab = self.tabs.len() - 1;
+        }
+        self.active = id;
+        self.zoomed = false;
+        self.tab_state.sync(&self.tabs, None);
+        self.tab_state.focus(id);
+        self.tab_scroll.scroll_to_item(self.tab);
+        self.tab_menu = None;
+        window.focus(&focus, cx);
+        self.update_roots(cx);
+        self.persist(cx);
+        cx.notify();
+    }
+    fn slot_subscriptions(
+        &self,
+        id: usize,
+        terminal: &Entity<Terminal>,
+        browser: &Entity<Browser>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
         let focus = terminal.read(cx).focus.clone();
         let focused = cx.on_focus(&focus, window, move |this, _, cx| {
             this.active = id;
@@ -535,13 +546,13 @@ impl Vyber {
             cx.notify();
         });
         let badge = cx.subscribe(
-            &terminal,
+            terminal,
             move |this, _, event: &TerminalEvent, cx| match event {
                 TerminalEvent::OpenTurn(task) => this.open_turn(id, task.clone(), cx),
             },
         );
         let comments = cx.subscribe_in(
-            &browser,
+            browser,
             window,
             move |this, _, event: &BrowserEvent, window, cx| match event {
                 BrowserEvent::LayoutChanged => cx.notify(),
@@ -574,104 +585,35 @@ impl Vyber {
                 }
             },
         );
-        self.slots.insert(
-            id,
-            Slot {
-                title: terminal.read(cx).title.clone(),
-                terminal,
-                browser,
-                turn: None,
-                agent: None,
-                tracker: Default::default(),
-                attention: None,
-                _subscriptions: vec![focused, badge, comments],
-            },
-        );
-        if split && !self.tabs.is_empty() {
-            self.tabs[self.tab].split(self.active, id, vertical);
-        } else {
-            self.tabs.push(Layout::Leaf(id));
-            self.tab = self.tabs.len() - 1;
-        }
-        self.active = id;
-        self.zoomed = false;
-        self.tab_state.sync(&self.tabs, None);
-        self.tab_state.focus(id);
-        self.tab_scroll.scroll_to_item(self.tab);
-        self.tab_menu = None;
-        window.focus(&focus, cx);
-        self.update_roots(cx);
-        self.persist(cx);
-        cx.notify();
+        vec![focused, badge, comments]
     }
-    fn update_roots(&mut self, cx: &App) {
-        *self.roots.lock().unwrap() = self
+    fn update_roots(&mut self, cx: &mut Context<Self>) {
+        let slots = self
             .slots
-            .values()
-            .map(|s| s.terminal.read(cx).root.clone())
+            .iter()
+            .map(|(id, slot)| (*id, slot.terminal.downgrade()))
             .collect();
-        let slots = &self.slots;
-        self.sessions.retain(|_, id| slots.contains_key(id));
+        crate::runtime::entity(cx)
+            .update(cx, |runtime, cx| runtime.sync(self.window_id, slots, cx));
     }
-    /// The terminal an agent turn runs in, bound on the session's first
-    /// observed turn. Claude Code names each session's process, so a Claude
-    /// session belongs to the terminal whose shell that process runs under.
-    /// Other sessions go to the terminal in their folder where Enter was
-    /// pressed last among those that run the agent or whose typed line
-    /// matches the prompt, a match first.
-    fn turn_terminal(&mut self, review: &TaskReview, cx: &App) -> Option<usize> {
-        if review.session.is_empty() || !review.is_from_terminal() {
-            return None;
+    fn apply_review(&mut self, review: &TaskReview, owner: Option<usize>, cx: &mut Context<Self>) {
+        for slot in self.slots.values() {
+            if crate::tasks::matches_root(&review.root, &slot.browser.read(cx).root) {
+                slot.browser
+                    .update(cx, |b, cx| b.update_task(review.clone(), cx));
+            }
         }
-        if let Some(id) = self.sessions.get(&review.session)
-            && self.slots.contains_key(id)
+        if let Some(slot) = owner.and_then(|id| self.slots.get_mut(&id))
+            && slot
+                .turn
+                .as_ref()
+                .is_none_or(|t| t.id == review.id || (review.active && review.started >= t.started))
         {
-            return Some(*id);
+            slot.turn = Some(review.clone());
+            slot.terminal
+                .update(cx, |t, cx| t.set_badge(Some(turn_badge(review)), cx));
         }
-        let agent = (review.agent == "Claude")
-            .then(|| crate::tasks::claude_process(&review.session))
-            .flatten();
-        if agent.is_none() && (!review.active || review.after.is_some()) {
-            return None;
-        }
-        let processes = crate::platform::Processes::list();
-        let id = if let Some(agent) = agent {
-            self.slots
-                .iter()
-                .find(|(_, slot)| {
-                    let shell = slot.terminal.read(cx).shell;
-                    shell.is_some_and(|shell| processes.descends(agent, shell))
-                })
-                .map(|(id, _)| *id)?
-        } else {
-            let program = review.agent.to_lowercase();
-            let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-            let prompt = normalize(review.label.split_once(" · ").map_or("", |(_, p)| p));
-            let now = std::time::Instant::now();
-            self.slots
-                .iter()
-                .filter_map(|(id, slot)| {
-                    let terminal = slot.terminal.read(cx);
-                    let submitted = terminal.last_submit?;
-                    if now.duration_since(submitted) > Duration::from_secs(45)
-                        || !crate::tasks::matches_root(&review.root, &terminal.root)
-                    {
-                        return None;
-                    }
-                    let runs = terminal
-                        .shell
-                        .is_some_and(|shell| processes.runs(shell, &program));
-                    let typed = normalize(&terminal.last_line);
-                    let matched = typed.len() >= 3
-                        && prompt.len() >= 3
-                        && (prompt.starts_with(&typed) || typed.starts_with(&prompt));
-                    (runs || matched).then_some((matched, runs, submitted, *id))
-                })
-                .max_by_key(|(matched, runs, submitted, _)| (*matched, *runs, *submitted))?
-                .3
-        };
-        self.sessions.insert(review.session.clone(), id);
-        Some(id)
+        cx.notify();
     }
     fn open_turn(&mut self, id: usize, task: String, cx: &mut Context<Self>) {
         let Some(slot) = self.slots.get(&id) else {
@@ -722,7 +664,7 @@ impl Vyber {
                 && !window.is_window_active()
                 && cx.global::<Config>().notifications
             {
-                self.notifications.show(*id, message);
+                crate::runtime::entity(cx).update(cx, |runtime, _| runtime.notify(*id, message));
             }
             let root = slot.terminal.read(cx).root.clone();
             if !slot.browser.read(cx).root_matches(&root) {
@@ -757,44 +699,6 @@ impl Vyber {
                 }
             } else if !self.close_pending {
                 self.close_pane(id, window, cx);
-            }
-        }
-        let reviews: Vec<_> = self.monitor.receiver.try_iter().collect();
-        for review in reviews {
-            for slot in self.slots.values() {
-                let root = &slot.browser.read(cx).root;
-                let path = root.to_string_lossy().replace('\\', "/").to_lowercase();
-                let task_path = review
-                    .root
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_lowercase();
-                if path == task_path || task_path.starts_with(&(path + "/")) {
-                    let review = review.clone();
-                    slot.browser.update(cx, |b, cx| b.update_task(review, cx));
-                }
-            }
-            // A late update of an earlier turn must not replace a newer one,
-            // so two turns never take turns on the badge.
-            if let Some(id) = self.turn_terminal(&review, cx)
-                && let Some(slot) = self.slots.get_mut(&id)
-                && slot.turn.as_ref().is_none_or(|t| {
-                    t.id == review.id || (review.active && review.started >= t.started)
-                })
-            {
-                let badge = turn_badge(&review);
-                slot.turn = Some(review);
-                slot.terminal
-                    .update(cx, |t, cx| t.set_badge(Some(badge), cx));
-            }
-            changed = true;
-        }
-        let notifications: Vec<_> = self.notifications.receiver.try_iter().collect();
-        for id in notifications {
-            if self.slots.contains_key(&id) {
-                window.activate_window();
-                self.focus_pane(id, window, cx);
-                changed = true;
             }
         }
         if self.refresh_agents(window, cx) {
@@ -839,7 +743,7 @@ impl Vyber {
         ));
         self.notice = text;
     }
-    fn persist(&self, cx: &App) {
+    pub(crate) fn persist(&self, cx: &App) {
         if self.restoring {
             return;
         }
@@ -860,21 +764,10 @@ impl Vyber {
             active: self.active,
             tab_state: self.tab_state.clone(),
             font_size: None,
+            bounds: Some(self.window_bounds.clone()),
+            windows: Vec::new(),
         };
-        if let Ok(bytes) = serde_json::to_vec(&state) {
-            let mut saved = self.saved_state.borrow_mut();
-            let saved =
-                saved.get_or_insert_with(|| std::fs::read(&self.state_path).unwrap_or_default());
-            if *saved != bytes {
-                if let Some(dir) = self.state_path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                match std::fs::write(&self.state_path, &bytes) {
-                    Ok(()) => *saved = bytes,
-                    Err(e) => log::warn!("Save workspace: {e}"),
-                }
-            }
-        }
+        crate::lifecycle::save_window(self.window_id, state, cx);
     }
     pub(crate) fn new_terminal(
         &mut self,
@@ -1086,6 +979,14 @@ impl Vyber {
         )
     }
     fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::lifecycle::is_closing(cx) {
+            return;
+        }
+        if matches!(target, CloseTarget::Quit | CloseTarget::Update) {
+            let origin = self.window_id;
+            cx.defer(move |cx| exit::request(target, origin, cx));
+            return;
+        }
         if self.close_pending {
             return;
         }
@@ -1214,6 +1115,7 @@ impl Vyber {
             }
             CloseTarget::Window => {
                 self.remove_terminals(&plan.ids, window, cx);
+                crate::lifecycle::forget_window(self.window_id, cx);
                 window.remove_window();
             }
             CloseTarget::Quit => {
@@ -1249,6 +1151,7 @@ impl Vyber {
     /// quits; the new version starts and restores the workspace.
     fn finish_update(&mut self, cx: &mut Context<Self>) {
         let Some((ready, _)) = self.update.clone() else {
+            crate::lifecycle::set_closing(false, cx);
             return;
         };
         self.persist(cx);
@@ -1277,11 +1180,16 @@ impl Vyber {
                     },
                 };
                 this.updating = false;
+                crate::lifecycle::set_closing(false, cx);
                 this.notice = notice;
                 cx.notify();
             });
         })
         .detach();
+    }
+    pub(crate) fn updated_notice(&mut self, cx: &mut Context<Self>) {
+        self.brief_notice(format!("Updated to Vyber {}", env!("CARGO_PKG_VERSION")));
+        cx.notify();
     }
     pub(crate) fn check_for_updates(
         &mut self,
@@ -1512,6 +1420,10 @@ impl Vyber {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let hint = target.map_or(DropHint::End, |id| DropHint::Tab { id, after });
+        if self.receive_drop(drag, hint, window, cx) {
+            return;
+        }
         let remaining = if drag.group {
             None
         } else {
@@ -1537,52 +1449,55 @@ impl Vyber {
             Some(DropHint::Tab { id: target, after }) if target == id => Some(after),
             _ => None,
         };
-        div()
-            .id(("tab-drop-zone", id))
-            .relative()
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
-                // GPUI sends these capture events to every registered drop zone.
-                if !e.bounds.contains(&e.event.position) {
-                    return;
-                }
-                let drag = e.drag(cx);
-                if drag.id == id
+        self.mark_drop_region(
+            div().id(("tab-drop-zone", id)),
+            transfer::DropRegion::Tab(id),
+        )
+        .relative()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+            // GPUI sends these capture events to every registered drop zone.
+            if !e.bounds.contains(&e.event.position) {
+                return;
+            }
+            let drag = e.drag(cx);
+            if drag.source_window == this.window_id
+                && (drag.id == id
                     || (drag.group
                         && this
                             .tabs
                             .iter()
-                            .any(|t| t.contains(drag.id) && t.contains(id)))
-                {
-                    return;
-                }
-                let after = e.event.position.x > e.bounds.center().x;
-                this.drop_hint = Some(DropHint::Tab { id, after });
-                cx.notify();
-            }))
-            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                if let Some(DropHint::Tab { id: target, after }) = this.drop_hint
-                    && target == id
-                {
-                    this.drop_on_tab(drag, Some(id), after, window, cx);
-                }
-            }))
-            .when(cx.has_active_drag(), |s| {
-                s.when_some(marker, |s, after| {
-                    s.child(
-                        div()
-                            .absolute()
-                            .top(px(3.))
-                            .bottom(px(3.))
-                            .w(px(2.))
-                            .rounded_sm()
-                            .bg(rgb(0x60a5fa))
-                            .when(after, |s| s.right_0())
-                            .when(!after, |s| s.left_0()),
-                    )
-                })
+                            .any(|t| t.contains(drag.id) && t.contains(id))))
+            {
+                return;
+            }
+            let after = e.event.position.x > e.bounds.center().x;
+            this.drop_hint = Some(DropHint::Tab { id, after });
+            cx.notify();
+        }))
+        .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+            if let Some(DropHint::Tab { id: target, after }) = this.drop_hint
+                && target == id
+            {
+                this.drop_on_tab(drag, Some(id), after, window, cx);
+            }
+        }))
+        .when(cx.has_active_drag(), |s| {
+            s.when_some(marker, |s, after| {
+                s.child(
+                    div()
+                        .absolute()
+                        .top(px(3.))
+                        .bottom(px(3.))
+                        .w(px(2.))
+                        .rounded_sm()
+                        .bg(rgb(0x60a5fa))
+                        .when(after, |s| s.right_0())
+                        .when(!after, |s| s.left_0()),
+                )
             })
+        })
     }
     fn pane(&self, id: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(slot) = self.slots.get(&id) else {
@@ -1592,114 +1507,118 @@ impl Vyber {
             Some(DropHint::Pane { id: target, edge }) if target == id => Some(edge),
             _ => None,
         };
-        div()
-            .id(("pane", id))
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(rgb(0x000000))
-            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
-                if !e.bounds.contains(&e.event.position) {
-                    return;
-                }
-                let drag = e.drag(cx);
-                if drag.id == id
+        self.mark_drop_region(
+            div().id(("pane", id)).relative().size_full(),
+            transfer::DropRegion::Pane(id),
+        )
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .bg(rgb(0x000000))
+        .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+            if !e.bounds.contains(&e.event.position) {
+                return;
+            }
+            let drag = e.drag(cx);
+            if drag.source_window == this.window_id
+                && (drag.id == id
                     || (drag.group
                         && this
                             .tabs
                             .iter()
-                            .any(|t| t.contains(drag.id) && t.contains(id)))
-                {
-                    return;
-                }
-                let x = f32::from(e.event.position.x - e.bounds.origin.x)
-                    / f32::from(e.bounds.size.width).max(1.);
-                let y = f32::from(e.event.position.y - e.bounds.origin.y)
-                    / f32::from(e.bounds.size.height).max(1.);
-                this.drop_hint = Some(DropHint::Pane {
-                    id,
-                    edge: DropEdge::at(x, y),
-                });
-                cx.notify();
-            }))
-            .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
-                let Some(DropHint::Pane { id: target, edge }) = this.drop_hint else {
-                    return;
+                            .any(|t| t.contains(drag.id) && t.contains(id))))
+            {
+                return;
+            }
+            let x = f32::from(e.event.position.x - e.bounds.origin.x)
+                / f32::from(e.bounds.size.width).max(1.);
+            let y = f32::from(e.event.position.y - e.bounds.origin.y)
+                / f32::from(e.bounds.size.height).max(1.);
+            this.drop_hint = Some(DropHint::Pane {
+                id,
+                edge: DropEdge::at(x, y),
+            });
+            cx.notify();
+        }))
+        .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| {
+            let Some(DropHint::Pane { id: target, edge }) = this.drop_hint else {
+                return;
+            };
+            if target != id {
+                return;
+            }
+            if this.receive_drop(drag, DropHint::Pane { id, edge }, window, cx) {
+                return;
+            }
+            let moved = if drag.group {
+                layout::move_group_to_edge(&mut this.tabs, drag.id, id, edge)
+            } else {
+                layout::move_to_edge(&mut this.tabs, drag.id, id, edge)
+            };
+            if moved {
+                this.tab_state.sync(&this.tabs, Some(id));
+                this.finish_move(drag.id, window, cx);
+            }
+        }))
+        .when(self.tabs[self.tab].leaves().len() > 1, |s| {
+            s.child(self.pane_title(id, cx))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(slot.terminal.clone()),
+        )
+        .when(cx.has_active_drag(), |s| {
+            s.when_some(hint, |s, edge| {
+                let label = match edge {
+                    DropEdge::Left => "Split left",
+                    DropEdge::Right => "Split right",
+                    DropEdge::Top => "Split above",
+                    DropEdge::Bottom => "Split below",
                 };
-                if target != id {
-                    return;
-                }
-                let moved = if drag.group {
-                    layout::move_group_to_edge(&mut this.tabs, drag.id, id, edge)
-                } else {
-                    layout::move_to_edge(&mut this.tabs, drag.id, id, edge)
-                };
-                if moved {
-                    this.tab_state.sync(&this.tabs, Some(id));
-                    this.finish_move(drag.id, window, cx);
-                }
-            }))
-            .when(self.tabs[self.tab].leaves().len() > 1, |s| {
-                s.child(self.pane_title(id, cx))
+                s.child(
+                    div()
+                        .absolute()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .bg(rgba(0x3b82f633))
+                        .border_2()
+                        .border_color(rgb(0x60a5fa))
+                        .when(edge == DropEdge::Left, |s| {
+                            s.left_0().top_0().bottom_0().w(relative(0.5))
+                        })
+                        .when(edge == DropEdge::Right, |s| {
+                            s.right_0().top_0().bottom_0().w(relative(0.5))
+                        })
+                        .when(edge == DropEdge::Top, |s| {
+                            s.top_0().left_0().right_0().h(relative(0.5))
+                        })
+                        .when(edge == DropEdge::Bottom, |s| {
+                            s.bottom_0().left_0().right_0().h(relative(0.5))
+                        })
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x102746))
+                                .text_size(px(12.))
+                                .text_color(rgb(0xdbeafe))
+                                .child(label),
+                        )
+                        .with_animation(
+                            ("split-preview", id * 4 + edge as usize),
+                            Animation::new(Duration::from_millis(90)),
+                            |el, t| el.opacity(t),
+                        ),
+                )
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(slot.terminal.clone()),
-            )
-            .when(cx.has_active_drag(), |s| {
-                s.when_some(hint, |s, edge| {
-                    let label = match edge {
-                        DropEdge::Left => "Split left",
-                        DropEdge::Right => "Split right",
-                        DropEdge::Top => "Split above",
-                        DropEdge::Bottom => "Split below",
-                    };
-                    s.child(
-                        div()
-                            .absolute()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(rgba(0x3b82f633))
-                            .border_2()
-                            .border_color(rgb(0x60a5fa))
-                            .when(edge == DropEdge::Left, |s| {
-                                s.left_0().top_0().bottom_0().w(relative(0.5))
-                            })
-                            .when(edge == DropEdge::Right, |s| {
-                                s.right_0().top_0().bottom_0().w(relative(0.5))
-                            })
-                            .when(edge == DropEdge::Top, |s| {
-                                s.top_0().left_0().right_0().h(relative(0.5))
-                            })
-                            .when(edge == DropEdge::Bottom, |s| {
-                                s.bottom_0().left_0().right_0().h(relative(0.5))
-                            })
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x102746))
-                                    .text_size(px(12.))
-                                    .text_color(rgb(0xdbeafe))
-                                    .child(label),
-                            )
-                            .with_animation(
-                                ("split-preview", id * 4 + edge as usize),
-                                Animation::new(Duration::from_millis(90)),
-                                |el, t| el.opacity(t),
-                            ),
-                    )
-                })
-            })
-            .into_any_element()
+        })
+        .into_any_element()
     }
     fn layout(&self, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         match layout {
@@ -1736,6 +1655,7 @@ impl Render for Vyber {
         } else {
             self.scroll_dragged_tabs(window);
         }
+        self.drop_regions.borrow_mut().clear();
         let layout = self
             .tabs
             .get(self.tab)
@@ -2110,6 +2030,7 @@ impl Render for Vyber {
             .font_family(crate::theme::ui_font())
             .text_size(px(12.))
             .track_focus(&self.focus)
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_drag_outside))
             .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, window, cx| {
                 // Modifier events follow keyboard focus. Also refresh the
                 // hovered terminal while the file panel owns that focus.
@@ -2239,33 +2160,37 @@ impl Render for Vyber {
                                     })),
                             )
                             .child(
-                                div()
-                                    .id("tab-strip-tail")
-                                    .flex_1()
-                                    .h_full()
-                                    .min_w(px(24.))
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .when(cx.has_active_drag(), |s| s.occlude())
-                                    .when(self.drop_hint == Some(DropHint::End), |s| {
-                                        s.bg(rgb(0x12273d))
-                                            .border_l_2()
-                                            .border_color(rgb(0x60a5fa))
-                                            .text_color(rgb(0x93c5fd))
-                                            .child("New tab")
-                                    })
-                                    .on_drag_move(cx.listener(
-                                        |this, e: &DragMoveEvent<TabDrag>, _, cx| {
-                                            if e.bounds.contains(&e.event.position) {
-                                                this.drop_hint = Some(DropHint::End);
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                                    .on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+                                self.mark_drop_region(
+                                    div().id("tab-strip-tail"),
+                                    transfer::DropRegion::End,
+                                )
+                                .flex_1()
+                                .h_full()
+                                .min_w(px(24.))
+                                .flex()
+                                .items_center()
+                                .px_2()
+                                .when(cx.has_active_drag(), |s| s.occlude())
+                                .when(self.drop_hint == Some(DropHint::End), |s| {
+                                    s.bg(rgb(0x12273d))
+                                        .border_l_2()
+                                        .border_color(rgb(0x60a5fa))
+                                        .text_color(rgb(0x93c5fd))
+                                        .child("New tab")
+                                })
+                                .on_drag_move(cx.listener(
+                                    |this, e: &DragMoveEvent<TabDrag>, _, cx| {
+                                        if e.bounds.contains(&e.event.position) {
+                                            this.drop_hint = Some(DropHint::End);
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .on_drop(cx.listener(
+                                    |this, drag: &TabDrag, window, cx| {
                                         this.drop_on_tab(drag, None, true, window, cx);
-                                    })),
+                                    },
+                                )),
                             )
                             .children(update)
                             .child(
@@ -2585,3 +2510,7 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 #[path = "app_tests.rs"]
 mod interaction_tests;
+
+#[cfg(test)]
+#[path = "app/window_tests.rs"]
+mod window_tests;
