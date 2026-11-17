@@ -235,6 +235,13 @@ impl Focusable for Terminal {
 }
 
 impl Terminal {
+    pub(crate) fn bind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = &self.search_input {
+            input.update(cx, |input, cx| input.bind_window(window, cx));
+        }
+        self.pointer_inside = false;
+        self.hovered_link = None;
+    }
     pub fn prepare(id: usize, root: &Path, shell: Option<&str>) -> anyhow::Result<Backend> {
         let (sender, events) = mpsc::channel();
         let dirty = Arc::new(AtomicBool::new(true));
